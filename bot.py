@@ -22,6 +22,8 @@ from telegram.ext import (
 )
 import google.generativeai as genai
 from PIL import Image
+from google.generativeai.types import Part, Blob  # Перемещено наверх
+import base64  # Перемещено наверх
 
 
 # --- ЧТЕНИЕ НАСТРОЕК ---
@@ -121,7 +123,7 @@ def save_message_to_db(
     cursor = conn.cursor()
     content = message.text or message.caption or ""
     if not is_bot and content.lower().startswith(TRIGGER_WORD.lower()):
-        content = content[len(TRIGGER_WORD) :]
+        content = content[len(TRIGGER_WORD):]
 
     media_type, mime_type, file_id, file_name = None, None, None, None
 
@@ -192,7 +194,7 @@ def save_message_to_db(
         ),
     )
     conn.commit()
-    logger.info(f"Сохранено сообщение {message.message_id} в БД.")
+    logger.info("Сохранено сообщение %s в БД.", message.message_id)  # lazy logging
     return file_id, mime_type, file_name
 
 
@@ -284,12 +286,12 @@ async def download_media_file(application: Application, file_id: str, file_path:
     if os.path.exists(file_path):
         return
     try:
-        logger.info(f"Загрузка файла {file_id} в {file_path}...")
+        logger.info("Загрузка файла %s в %s...", file_id, file_path)  # lazy logging
         tg_file = await application.bot.get_file(file_id)
         await tg_file.download_to_drive(file_path)
-        logger.info(f"Файл успешно загружен: {file_path}")
-    except Exception as e:
-        logger.error(f"Ошибка загрузки файла {file_id}: {e}")
+        logger.info("Файл успешно загружен: %s", file_path)  # lazy logging
+    except (OSError, IOError) as e:
+        logger.error("Ошибка загрузки файла %s: %s", file_id, e)  # lazy logging
 
 
 # --- БЛОК ИНТЕГРАЦИИ С GEMINI ---
@@ -309,7 +311,7 @@ async def generate_gemini_response(
         str: Сгенерированный ответ.
     """
     history = []
-    logger.info(f"Подготовка {len(context_messages)} сообщений контекста для Gemini.")
+    logger.info("Подготовка %d сообщений контекста для Gemini.", len(context_messages))  # lazy logging
 
     for msg in context_messages:
         parts = []
@@ -329,17 +331,11 @@ async def generate_gemini_response(
                         img = Image.open(media_path)
                         parts.append(img)
                     elif "video" in msg.get("mime_type"):
-                        # Проверка размера файла (менее 20 МБ)
                         file_size = os.path.getsize(media_path)
-                        if file_size < 20 * 1024 * 1024:  # 20 МБ в байтах
+                        if file_size < 20 * 1024 * 1024:
                             with open(media_path, "rb") as video_file:
                                 video_bytes = video_file.read()
-                                # Добавляем видео к сообщению
-                                # Используем корректный импорт для текущей версии API
                                 try:
-                                    # Для новых версий API
-                                    from google.generativeai.types import Part, Blob
-
                                     video_part = Part(
                                         inline_data=Blob(
                                             data=video_bytes,
@@ -348,12 +344,7 @@ async def generate_gemini_response(
                                     )
                                     parts.append(video_part)
                                 except ImportError:
-                                    # Для более старых версий API
-                                    import base64
-
-                                    video_b64 = base64.b64encode(video_bytes).decode(
-                                        "utf-8"
-                                    )
+                                    video_b64 = base64.b64encode(video_bytes).decode("utf-8")
                                     parts.append(
                                         {
                                             "mime_type": msg.get("mime_type"),
@@ -362,15 +353,18 @@ async def generate_gemini_response(
                                     )
                         else:
                             logger.warning(
-                                f"Видео {media_path} слишком большое"
-                                / " ({file_size / 1024 / 1024:.2f} МБ), пропускаем"
+                                "Видео %s слишком большое (%.2f МБ), пропускаем",
+                                media_path,
+                                file_size / 1024 / 1024,
                             )
                             parts.append(
                                 "[Видео слишком большое для обработки - пропущено]"
                             )
-                except Exception as e:
+                except (OSError, IOError) as e:
                     logger.error(
-                        f"Не удалось прочитать медиафайл {media_path} для контекста: {e}"
+                        "Не удалось прочитать медиафайл %s для контекста: %s",
+                        media_path,
+                        e,
                     )
 
         if parts:
@@ -381,7 +375,6 @@ async def generate_gemini_response(
         logger.warning("Контекст для Gemini пуст. Отмена запроса.")
         return "Не могу обработать пустой запрос."
 
-    # Создаем новый чат с полной историей
     system_prompt = """
     [System prompt] Все сообщения до этого являются контекстом для дальнейшего взаимодействия. 
     в квадратных скобках написан никнейк текушего пользователя. Ты не должен писать [karachur_bot]
@@ -394,7 +387,6 @@ async def generate_gemini_response(
     )
 
     logger.info("Отправка запроса в Gemini...")
-    # Отправляем последнее сообщение как новый промпт
     response = await chat.send_message_async(history[-1]["parts"])
     return response.text
 
@@ -420,24 +412,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_conn = context.bot_data["db_conn"]
     is_trigger = message.text and message.text.lower().startswith(TRIGGER_WORD.lower())
 
-    # Сохраняем сообщение
     file_id, mime_type, file_name = save_message_to_db(db_conn, message, is_bot=False)
     if file_id:
         file_path = get_media_path(file_id, mime_type, file_name)
         if file_path:
             await download_media_file(context.application, file_id, file_path)
 
-    # Логика реакции бота
     if is_trigger:
         context_messages = get_context(db_conn)
-
         gemini_client = context.bot_data["gemini_client"]
         try:
             response_text = await generate_gemini_response(
                 gemini_client, context_messages
             )
-        except Exception as e:
-            logger.error(f"Ошибка при вызове Gemini API: {e}")
+        except (genai.types.GenerativeModelError, OSError, IOError) as e:
+            logger.error("Ошибка при вызове Gemini API: %s", e)
             response_text = f"Произошла ошибка при обращении к нейросети: {e}"
 
         bot_reply = await message.reply_text(f"[karachur_bot]: {response_text}")
