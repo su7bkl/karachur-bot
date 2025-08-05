@@ -1,0 +1,43 @@
+# Database files
+*.db
+*.sqlite3
+*.sqlite
+
+# Configuration files with sensitive information
+config.cfg
+!config.cfg.example
+
+# Media files directory
+media/*
+!media/.gitkeep
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# OS specific files
+.DS_Store
+Thumbs.db
