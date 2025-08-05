@@ -13,7 +13,7 @@ Karachur Bot — это Telegram-бот для групповых чатов с 
 ## Установка и настройка
 
 ### Предварительные требования
-- Python 3.11+
+- Python 3.10+
 - Telegram Bot Token (получить у [@BotFather](https://t.me/BotFather))
 - Google Gemini API Key (получить на [Google AI Studio](https://makersuite.google.com/))
 
@@ -44,10 +44,10 @@ Karachur Bot — это Telegram-бот для групповых чатов с 
    pip install -r requirements.txt
    ```
    > Используются следующие зависимости:
-   > - python-telegram-bot>=21.0.0
-   > - google-generativeai>=0.5.0
-   > - Pillow>=10.1.0
-   > - python-dotenv>=1.0.0
+   > - python-telegram-bot==21.0.0
+   > - google-generativeai==0.5.0
+   > - Pillow==10.1.0
+   > - python-dotenv==1.0.0
 
 4. **Настройка конфигурации:**
    - Скопируйте файл примера конфигурации:
