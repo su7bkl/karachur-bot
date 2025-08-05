@@ -8,6 +8,7 @@
 
 import logging
 import os
+import base64
 import sqlite3
 import configparser
 from datetime import datetime
@@ -333,13 +334,15 @@ async def generate_gemini_response(
                         if file_size < 20 * 1024 * 1024:
                             with open(media_path, "rb") as video_file:
                                 video_bytes = video_file.read()
-                                # Используем base64 для совместимости с текущей версией API
-                                import base64
-                                video_b64 = base64.b64encode(video_bytes).decode('utf-8')
-                                parts.append({
-                                    "mime_type": msg.get('mime_type'),
-                                    "data": video_b64
-                                })
+                                video_b64 = base64.b64encode(video_bytes).decode(
+                                    "utf-8"
+                                )
+                                parts.append(
+                                    {
+                                        "mime_type": msg.get("mime_type"),
+                                        "data": video_b64,
+                                    }
+                                )
                         else:
                             logger.warning(
                                 "Видео %s слишком большое (%.2f МБ), пропускаем",
