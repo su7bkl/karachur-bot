@@ -112,7 +112,8 @@ def save_message_to_db(
     Args:
         conn (sqlite3.Connection): Соединение с базой данных.
         message (Message): Объект сообщения Telegram.
-        is_bot (bool, optional): Флаг, указывающий, является ли сообщение от бота. По умолчанию False.
+        is_bot (bool, optional): Флаг, указывающий, является ли сообщение от бота.
+        По умолчанию False.
 
     Returns:
         tuple: (file_id, mime_type, file_name) - информация о медиа-файле, если он присутствует.
@@ -361,7 +362,8 @@ async def generate_gemini_response(
                                     )
                         else:
                             logger.warning(
-                                f"Видео {media_path} слишком большое ({file_size / 1024 / 1024:.2f} МБ), пропускаем"
+                                f"Видео {media_path} слишком большое"
+                                / " ({file_size / 1024 / 1024:.2f} МБ), пропускаем"
                             )
                             parts.append(
                                 "[Видео слишком большое для обработки - пропущено]"
