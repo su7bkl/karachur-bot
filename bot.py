@@ -420,7 +420,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response_text = await generate_gemini_response(
                 gemini_client, context_messages
             )
-        except Exception as e:  # Исправлено: убран несуществующий GenerativeModelError
+        except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error("Ошибка при вызове Gemini API: %s", e)
             response_text = f"Произошла ошибка при обращении к нейросети: {e}"
 
