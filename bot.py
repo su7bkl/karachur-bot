@@ -425,7 +425,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error("Ошибка при вызове Gemini API: %s", e)
             response_text = f"Произошла ошибка при обращении к нейросети: {e}"
 
-        bot_reply = await message.reply_text(f"[karachur_bot]: {response_text}")
+        bot_reply = await message.reply_text(response_text)
         save_message_to_db(db_conn, bot_reply, is_bot=True)
 
 
