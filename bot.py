@@ -126,6 +126,8 @@ def save_message_to_db(
     content = message.text or message.caption or ""
     if not is_bot and content.lower().startswith(TRIGGER_WORD.lower()):
         content = content[len(TRIGGER_WORD) :]
+    elif is_bot:
+        content = content[len("[karachur_bot]: ") :]
 
     media_type, mime_type, file_id, file_name = None, None, None, None
 
@@ -402,7 +404,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     db_conn = context.bot_data["db_conn"]
-    is_trigger = message.text and message.text.lower().startswith(TRIGGER_WORD.lower())
+    is_trigger = (
+        message.text and message.text.lower().startswith(TRIGGER_WORD.lower())
+    ) or (message.caption and message.caption.lower().startswith(TRIGGER_WORD.lower()))
 
     file_id, mime_type, file_name = save_message_to_db(db_conn, message, is_bot=False)
     if file_id:
@@ -421,8 +425,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error("Ошибка при вызове Gemini API: %s", e)
             response_text = f"Произошла ошибка при обращении к нейросети: {e}"
 
-        await message.reply_text(f"[karachur_bot]: {response_text}")
-        save_message_to_db(db_conn, response_text, is_bot=True)
+        bot_reply = await message.reply_text(f"[karachur_bot]: {response_text}")
+        save_message_to_db(db_conn, bot_reply, is_bot=True)
 
 
 # --- ТОЧКА ВХОДА ---
