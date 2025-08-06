@@ -126,8 +126,6 @@ def save_message_to_db(
     content = message.text or message.caption or ""
     if not is_bot and content.lower().startswith(TRIGGER_WORD.lower()):
         content = content[len(TRIGGER_WORD) :]
-    elif is_bot:
-        content = content[len("[karachur_bot]: ") :]
 
     media_type, mime_type, file_id, file_name = None, None, None, None
 
