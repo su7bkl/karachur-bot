@@ -57,11 +57,11 @@ Karachur Bot — это Telegram-бот для групповых чатов с 
    - Отредактируйте `config.cfg`, добавив ваш Telegram Bot Token и Gemini API Key:
      ```
      [SETTINGS]
-     BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
-     GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"
-     DB_FILE = "messages.db"
-     MEDIA_DIR = "media"
-     TRIGGER_WORD = "Карачур"
+     BOT_TOKEN = YOUR_BOT_TOKEN_HERE
+     GEMINI_API_KEY = YOUR_GEMINI_API_KEY_HERE
+     DB_FILE = messages.db
+     MEDIA_DIR = media
+     TRIGGER_WORD = Карачур
      ```
 
 5. **Создание директории для медиафайлов:**
