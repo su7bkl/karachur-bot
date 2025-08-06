@@ -346,7 +346,7 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
                                 file=media_path
                             )
                         time.sleep(
-                            0.6 * (file_size / (1024 * 1024))
+                            FILE_UPLOAD_DELAY_PER_MB * (file_size / (1024 * 1024))
                         )  # Задержка для больших файлов
                         parts.append(
                             genai.types.Part(
