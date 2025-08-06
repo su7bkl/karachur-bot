@@ -55,6 +55,7 @@ def load_config(config_path="config.cfg"):
 
 
 # Загружаем настройки
+FILE_UPLOAD_DELAY_PER_MB = 0.6
 CONFIG = load_config()
 BOT_TOKEN = CONFIG["BOT_TOKEN"]
 GEMINI_API_KEY = CONFIG["GEMINI_API_KEY"]
