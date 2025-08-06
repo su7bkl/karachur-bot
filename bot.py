@@ -329,7 +329,6 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
             media_path = ".\\" + get_media_path(
                 msg["file_id"], msg["mime_type"], msg.get("file_name")
             )
-            print(media_path)
             if media_path and os.path.exists(media_path):
                 try:
                     file_size = os.path.getsize(media_path)
@@ -397,7 +396,6 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
 
     # Генерируем ответ с новым API
     response = client.models.generate_content(model=MODEL, contents=contents)
-    print(response.text)
     return response.text
 
 
