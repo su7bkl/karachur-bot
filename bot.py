@@ -8,7 +8,6 @@
 
 import logging
 import os
-import base64
 import sqlite3
 import configparser
 from datetime import datetime
@@ -20,7 +19,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-import google.generativeai as genai
+from google import genai
 from PIL import Image
 
 
@@ -221,6 +220,8 @@ def get_context(conn: sqlite3.Connection):
 
 # --- БЛОК УТИЛИТ ДЛЯ МЕДИА ---
 
+uploaded_files = {}
+
 
 def get_extension_from_mime(mime: str | None) -> str:
     """
@@ -252,7 +253,7 @@ def get_extension_from_mime(mime: str | None) -> str:
 
 
 def get_media_path(
-    file_id: str, mime_type: str | None, original_name: str | None = None
+    file_id: str, mime_type: str | None, original_name: str | None
 ) -> str | None:
     """
     Формирует путь к файлу для сохранения медиа.
@@ -298,10 +299,10 @@ async def download_media_file(application: Application, file_id: str, file_path:
 
 # --- БЛОК ИНТЕГРАЦИИ С GEMINI ---
 
+uploaded_files = {}
 
-async def generate_gemini_response(
-    client: genai.GenerativeModel, context_messages: list
-):
+
+async def generate_gemini_response(client: genai.Client, context_messages: list):
     """
     Генерирует ответ с использованием модели Google Gemini AI на основе контекста сообщений.
 
@@ -320,42 +321,42 @@ async def generate_gemini_response(
         parts = []
         author = msg.get("username") or ("Bot" if msg.get("is_bot") else "unknown")
         if msg.get("content"):
-            parts.append(f"[{author}]: {msg.get('content')}")
+            parts.append(genai.types.Part(text=f"[{author}]: {msg.get('content')}"))
         else:
-            parts.append(f"[{author}]")
+            parts.append(genai.types.Part(text=f"[{author}]"))
 
         if msg.get("file_id") and msg.get("mime_type"):
-            media_path = get_media_path(
+            media_path = ".\\" + get_media_path(
                 msg["file_id"], msg["mime_type"], msg.get("file_name")
             )
+            print(media_path)
             if media_path and os.path.exists(media_path):
                 try:
-                    if "image" in msg.get("mime_type"):
-                        img = Image.open(media_path)
-                        parts.append(img)
-                    elif "video" in msg.get("mime_type"):
-                        file_size = os.path.getsize(media_path)
-                        if file_size < 20 * 1024 * 1024:
-                            with open(media_path, "rb") as video_file:
-                                video_bytes = video_file.read()
-                                video_b64 = base64.b64encode(video_bytes).decode(
-                                    "utf-8"
-                                )
-                                parts.append(
-                                    {
-                                        "mime_type": msg.get("mime_type"),
-                                        "data": video_b64,
-                                    }
-                                )
-                        else:
-                            logger.warning(
-                                "Видео %s слишком большое (%.2f МБ), пропускаем",
-                                media_path,
-                                file_size / 1024 / 1024,
+                    file_size = os.path.getsize(media_path)
+                    if file_size < 20 * 1024 * 1024:  # 20 МБ
+                        if media_path not in uploaded_files:
+                            uploaded_files[media_path] = client.files.upload(
+                                file=media_path
                             )
-                            parts.append(
-                                "[Видео слишком большое для обработки - пропущено]"
+                        parts.append(
+                            genai.types.Part(
+                                file_data=genai.types.FileData(
+                                    file_uri=uploaded_files[media_path].uri,
+                                    mime_type=uploaded_files[media_path].mime_type,
+                                )
                             )
+                        )
+                    else:
+                        logger.warning(
+                            "Файл %s слишком большой (%.2f МБ), пропускаем",
+                            media_path,
+                            file_size / 1024 / 1024,
+                        )
+                        parts.append(
+                            genai.types.Part(
+                                text="[Файл слишком большой для обработки - пропущено]"
+                            )
+                        )
                 except (OSError, IOError) as e:
                     logger.error(
                         "Не удалось прочитать медиафайл %s для контекста: %s",
@@ -374,12 +375,29 @@ async def generate_gemini_response(
         logger.warning("Контекст для Gemini пуст. Отмена запроса.")
         return "Не могу обработать пустой запрос."
 
-    chat = client.start_chat(
-        history=history[:-1] + [{"role": "user", "parts": [SYSTEM_PROMPT]}]
+    # Создаем содержимое для генерации
+    contents = []
+
+    # Добавляем историю сообщений
+    for entry in history[:-1]:
+        contents.append(
+            genai.types.ContentDict(role=entry["role"], parts=entry["parts"])
+        )
+
+    # Добавляем системный промпт
+    contents.append(
+        genai.types.ContentDict(
+            role="user", parts=[genai.types.PartDict(text=SYSTEM_PROMPT)]
+        )
     )
 
+    contents.append(genai.types.ContentDict(role="user", parts=history[-1]["parts"]))
+
     logger.info("Отправка запроса в Gemini...")
-    response = await chat.send_message_async(history[-1]["parts"])
+
+    # Генерируем ответ с новым API
+    response = client.models.generate_content(model=MODEL, contents=contents)
+    print(response.text)
     return response.text
 
 
@@ -441,13 +459,14 @@ def main():
         )
 
     db_connection = init_db()
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_client = genai.GenerativeModel(MODEL)
+
+    # Новый способ конфигурации клиента
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.bot_data["db_conn"] = db_connection
-    application.bot_data["gemini_client"] = gemini_client
+    application.bot_data["gemini_client"] = client
 
     application.add_handler(
         MessageHandler(filters.ALL & ~filters.COMMAND, handle_message)
