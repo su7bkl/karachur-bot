@@ -52,8 +52,7 @@ Karachur Bot — это Telegram-бот для групповых чатов с 
    ```
    > Используются следующие зависимости:
    > - python-telegram-bot>=21.0.0
-   > - google-generativeai>=0.5.0
-   > - Pillow>=10.1.0
+   > - google-genai>=0.7.0
    > - python-dotenv>=1.0.0
 
 4. **Настройка конфигурации:**
@@ -92,14 +91,8 @@ Karachur Bot — это Telegram-бот для групповых чатов с 
 - `DB_FILE` - путь к файлу базы данных SQLite
 - `MEDIA_DIR` - директория для сохранения медиафайлов
 - `TRIGGER_WORD` - триггерное слово для активации бота
-- `MODEL` - модель Gemini (например, `gemini-2.5-pro`, `gemini-2.5-flash-lite`)
+- `MODEL` - модель Gemini (например, `gemini-2.5-pro`, `gemini-2.5-flash`)
 - `SYSTEM_PROMPT` - системный промпт для настройки поведения ИИ
-
-### Поддерживаемые модели Gemini
-
-- `gemini-2.5-pro` - самая мощная модель (рекомендуется)
-- `gemini-2.5-flash-lite` - быстрая и экономичная модель
-- `gemini-1.5-pro` - предыдущее поколение
 
 ## Использование
 

@@ -20,7 +20,6 @@ from telegram.ext import (
     filters,
 )
 from google import genai
-from PIL import Image
 
 
 # --- ЧТЕНИЕ НАСТРОЕК ---
