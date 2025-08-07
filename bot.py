@@ -11,6 +11,7 @@ import os
 import sqlite3
 import configparser
 from datetime import datetime
+import time
 
 from telegram import Update, Message
 from telegram.ext import (
@@ -54,6 +55,7 @@ def load_config(config_path="config.cfg"):
 
 
 # Загружаем настройки
+FILE_UPLOAD_DELAY_PER_MB = 0.6
 CONFIG = load_config()
 BOT_TOKEN = CONFIG["BOT_TOKEN"]
 GEMINI_API_KEY = CONFIG["GEMINI_API_KEY"]
@@ -162,9 +164,17 @@ def save_message_to_db(
             message.audio.file_name,
         )
     elif message.voice:
-        media_type, file_id, mime_type = "voice", message.voice.file_id, "audio/ogg"
+        media_type, file_id, mime_type = "audio", message.voice.file_id, "audio/ogg"
+        content = f"[Голосовое сообщение by {message.from_user.username}]"
+    elif message.video_note:
+        media_type, file_id, mime_type = (
+            "video",
+            message.video_note.file_id,
+            "video/mp4",
+        )
+        content = f"[Видео сообщение by {message.from_user.username}]"
 
-    timestamp = datetime.utcfromtimestamp(message.date.timestamp()).isoformat()
+    timestamp = datetime.fromtimestamp(message.date.timestamp()).isoformat()
     reply_to_id = (
         message.reply_to_message.message_id if message.reply_to_message else None
     )
@@ -336,6 +346,9 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
                             uploaded_files[media_path] = client.files.upload(
                                 file=media_path
                             )
+                        time.sleep(
+                            FILE_UPLOAD_DELAY_PER_MB * (file_size / (1024 * 1024))
+                        )  # Задержка для больших файлов
                         parts.append(
                             genai.types.Part(
                                 file_data=genai.types.FileData(
