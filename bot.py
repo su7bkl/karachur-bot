@@ -346,9 +346,9 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
                             uploaded_files[media_path] = client.files.upload(
                                 file=media_path
                             )
-                        time.sleep(
-                            FILE_UPLOAD_DELAY_PER_MB * (file_size / (1024 * 1024))
-                        )  # Задержка для больших файлов
+                            time.sleep(
+                                FILE_UPLOAD_DELAY_PER_MB * (file_size / (1024 * 1024))
+                            )  # Задержка для больших файлов
                         parts.append(
                             genai.types.Part(
                                 file_data=genai.types.FileData(
@@ -389,12 +389,6 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
     # Создаем содержимое для генерации
     contents = []
 
-    # Добавляем историю сообщений
-    for entry in history[:-1]:
-        contents.append(
-            genai.types.ContentDict(role=entry["role"], parts=entry["parts"])
-        )
-
     # Добавляем системный промпт
     contents.append(
         genai.types.ContentDict(
@@ -402,6 +396,14 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
         )
     )
 
+
+    # Добавляем историю сообщений
+    for entry in history[:-1]:
+        contents.append(
+            genai.types.ContentDict(role=entry["role"], parts=entry["parts"])
+        )
+
+    
     contents.append(genai.types.ContentDict(role="user", parts=history[-1]["parts"]))
 
     logger.info("Отправка запроса в Gemini...")
