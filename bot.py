@@ -310,8 +310,6 @@ async def download_media_file(application: Application, file_id: str, file_path:
 
 # --- БЛОК ИНТЕГРАЦИИ С GEMINI ---
 
-uploaded_files = {}
-
 
 async def generate_gemini_response(client: genai.Client, context_messages: list):
     """
@@ -337,20 +335,21 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
             parts.append(genai.types.Part(text=f"[{author}]"))
 
         if msg.get("file_id") and msg.get("mime_type"):
-            media_path = ".\\" + get_media_path(
+            raw_path = get_media_path(
                 msg["file_id"], msg["mime_type"], msg.get("file_name")
             )
+            media_path = os.path.abspath(raw_path) if raw_path else None
             if media_path and os.path.exists(media_path):
                 try:
                     file_size = os.path.getsize(media_path)
-                    if file_size < 20 * 1024 * 1024:  # 20 МБ
+                    if file_size < 20 * 1024 * 1024:
                         if media_path not in uploaded_files:
                             uploaded_files[media_path] = client.files.upload(
                                 file=media_path
                             )
                             time.sleep(
                                 FILE_UPLOAD_DELAY_PER_MB * (file_size / (1024 * 1024))
-                            )  # Задержка для больших файлов
+                            )
                         parts.append(
                             genai.types.Part(
                                 file_data=genai.types.FileData(
