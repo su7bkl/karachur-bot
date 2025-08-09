@@ -404,7 +404,6 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
             genai.types.ContentDict(role=entry["role"], parts=entry["parts"])
         )
 
-    
     contents.append(genai.types.ContentDict(role="user", parts=history[-1]["parts"]))
 
     logger.info("Отправка запроса в Gemini...")
