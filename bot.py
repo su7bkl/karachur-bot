@@ -14,7 +14,6 @@ from datetime import datetime
 import time
 
 from telegram import Update, Message
-from markdown_converter import markdown_to_telegram_html
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -22,6 +21,8 @@ from telegram.ext import (
     filters,
 )
 from google import genai
+
+from markdown_converter import markdown_to_telegram_html
 
 
 # --- ЧТЕНИЕ НАСТРОЕК ---
@@ -397,7 +398,6 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
         )
     )
 
-
     # Добавляем историю сообщений
     for entry in history[:-1]:
         contents.append(
@@ -453,7 +453,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error("Ошибка при вызове Gemini API: %s", e)
             response_text = f"Произошла ошибка при обращении к нейросети: {e}"
 
-        bot_reply = await message.reply_text(markdown_to_telegram_html(response_text), parse_mode='HTML')
+        bot_reply = await message.reply_text(
+            markdown_to_telegram_html(response_text), parse_mode="HTML"
+        )
         save_message_to_db(db_conn, bot_reply, is_bot=True)
 
 
