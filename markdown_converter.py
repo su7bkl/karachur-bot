@@ -1,3 +1,16 @@
+"""Конвертер Markdown → упрощённый HTML для Telegram.
+
+Функции:
+- markdown_to_telegram_html(md): превращает Markdown в HTML, совместимый с ограниченным набором тегов Telegram.
+- clean_for_telegram(soup): очищает дерево от неподдерживаемых тегов и небезопасных атрибутов.
+
+Особенности:
+- Списки (<ul>/<ol>) разворачиваются в текст с маркерами (•) или нумерацией.
+- Параграфы <p> заменяются на двойные переводы строк.
+- Поддерживаются только теги: b, i, u, s, a, code, pre, br, tg-spoiler.
+- Атрибуты сохраняются только для ссылок (href).
+"""
+
 from markdown import markdown
 from bs4 import BeautifulSoup
 
@@ -39,7 +52,7 @@ def markdown_to_telegram_html(md: str) -> str:
 
     # Преобразуем списки в текст
     for ul in soup.find_all(['ul', 'ol']):
-        is_ordered = (ul.name == 'ol')
+        is_ordered = ul.name == 'ol'
         idx = 1
         lines = []
         for li in ul.find_all('li', recursive=False):
