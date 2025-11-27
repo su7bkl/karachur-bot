@@ -435,22 +435,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message.text and message.text.lower().startswith(TRIGGER_WORD.lower())
     ) or (message.caption and message.caption.lower().startswith(TRIGGER_WORD.lower()))
 
-    triggered_by_voice = bool(message.voice)
-
     file_id, mime_type, file_name = save_message_to_db(db_conn, message, is_bot=False)
     if file_id:
         file_path = get_media_path(file_id, mime_type, file_name)
         if file_path:
             await download_media_file(context.application, file_id, file_path)
 
-    if triggered_by_text or triggered_by_voice:
+    if triggered_by_text or bool(message.voice):
         context_messages = get_context(db_conn)
         gemini_client = context.bot_data["gemini_client"]
 
-        if triggered_by_voice and not triggered_by_text:
+        if bool(message.voice) and not triggered_by_text:
             if context_messages and context_messages[-1].get('message_id') == message.message_id:
                 current_content = context_messages[-1].get('content', '')
-                context_messages[-1]['content'] = f"Напиши расшифровку голосового сообщения. {current_content}"
+                context_messages[-1]['content'] = \
+                    f"Напиши расшифровку голосового сообщения. {current_content}"
 
         try:
             response_text = await generate_gemini_response(
