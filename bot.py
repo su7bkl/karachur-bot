@@ -446,6 +446,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         gemini_client = context.bot_data["gemini_client"]
 
         if bool(message.voice) and not triggered_by_text:
+            context_messages = context_messages[-1:]
             if context_messages and context_messages[-1].get('message_id') == message.message_id:
                 current_content = context_messages[-1].get('content', '')
                 context_messages[-1]['content'] = \
