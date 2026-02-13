@@ -504,6 +504,8 @@ async def handle_message(  # pylint: disable=too-many-locals
     ):
         return
 
+    err = False
+
     db_conn = context.bot_data["db_conn"]
     triggered_by_text = (
         message.text and message.text.lower().startswith(TRIGGER_WORD.lower())
