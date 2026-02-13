@@ -179,7 +179,7 @@ def save_message_to_db(
         user_prompt = (
             message.from_user.full_name
             if message.from_user.full_name
-            else message.from_user.id
+            else str(message.from_user.id)
         )
         if message.from_user.username:
             user_prompt += f" aka {message.from_user.username}"
