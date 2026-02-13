@@ -175,7 +175,22 @@ def save_message_to_db(
         message.reply_to_message.message_id if message.reply_to_message else None
     )
     user_id = message.from_user.id if message.from_user else None
-    username = message.from_user.username if message.from_user else "Bot"
+    if message.from_user:
+        user_prompt = (
+            message.from_user.full_name
+            if message.from_user.full_name
+            else str(message.from_user.id)
+        )
+        if message.from_user.username:
+            user_prompt += f" aka {message.from_user.username}"
+        date = (
+            str(message.date)
+            if not message.edit_date
+            else str(message.date) + "/edited:" + str(message.edit_date)
+        )
+        user_prompt += f" date:{date}"
+    else:
+        user_prompt = "Bot"
 
     cursor.execute(
         """
@@ -188,7 +203,7 @@ def save_message_to_db(
             message.message_id,
             message.chat_id,
             user_id,
-            username,
+            user_prompt,
             content,
             media_type,
             mime_type,
