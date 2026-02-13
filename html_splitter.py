@@ -95,7 +95,7 @@ def split_html_message(  # pylint: disable=too-many-locals  disable=too-many-bra
     # Пример: ('a', '<a href="google.com">')
     tag_stack = []
 
-    for token in tokens: # pylint: disable=too-many-nested-blocks
+    for token in tokens:  # pylint: disable=too-many-nested-blocks
         if not token:
             continue
 
