@@ -19,14 +19,9 @@ import re
 # Теги, поддерживаемые Telegram (остальные будут игнорироваться в стеке, но останутся в тексте)
 ALLOWED_TAGS = {
     "b",
-    "strong",
     "i",
-    "em",
     "u",
-    "ins",
     "s",
-    "strike",
-    "del",
     "a",
     "code",
     "pre",
