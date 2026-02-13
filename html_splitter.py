@@ -5,7 +5,10 @@
 соблюдая лимиты Telegram и целостность тегов.
 
 Особенности:
-    - Поддерживает только разрешенные в Telegram теги (b, i, u, s, a, code, pre, tg-spoiler).
+    - Поддерживает только теги, разрешенные в Telegram Bot API:
+      b, i, u, s, a, code, pre, tg-spoiler.
+    - Автоматически нормализует HTML-теги к Telegram-совместимым:
+      strong→b, em→i, ins→u, del/strike→s.
     - "Умное" разделение текста: старается не разрывать слова, делит по переносам строк или
     - пробелам.
     - Сохраняет атрибуты тегов (href в <a>, class в <code>) при переносе на следующую часть.
@@ -18,21 +21,26 @@
 
 import re
 
-# Теги, поддерживаемые Telegram (остальные будут игнорироваться в стеке, но останутся в тексте)
+# Теги, поддерживаемые Telegram Bot API
 ALLOWED_TAGS = {
     "b",
-    "strong",
     "i",
-    "em",
     "u",
-    "ins",
     "s",
-    "strike",
-    "del",
     "a",
     "code",
     "pre",
     "tg-spoiler",
+}
+
+# Маппинг HTML-тегов на Telegram-совместимые теги
+# Эти теги будут автоматически преобразованы в процессе обработки
+TAG_NORMALIZATION = {
+    "strong": "b",
+    "em": "i",
+    "ins": "u",
+    "del": "s",
+    "strike": "s",
 }
 
 # Теги, которые не требуют закрытия или работают как разрывы
@@ -49,6 +57,42 @@ def get_opening_str(stack):
     return "".join(full_tag for _, full_tag in stack)
 
 
+def normalize_tag(token):
+    """
+    Нормализует HTML-тег к Telegram-совместимому формату.
+
+    Преобразует теги вроде <strong>, <em>, <ins>, <del>, <strike>
+    в их Telegram-эквиваленты: <b>, <i>, <u>, <s>.
+
+    Args:
+        token: HTML-тег в виде строки (например, "<strong>", "</em>")
+
+    Returns:
+        Нормализованный тег (например, "<b>", "</i>")
+    """
+    clean = token.strip("<> ")
+    is_closing = clean.startswith("/")
+
+    if is_closing:
+        clean = clean[1:]
+
+    # Берем первое слово (имя тега)
+    tag_name = clean.split()[0].lower()
+
+    # Если тег нужно нормализовать
+    normalized_name = TAG_NORMALIZATION.get(tag_name)
+    if normalized_name:
+        # Сохраняем остальные атрибуты, если они есть
+        rest_of_tag = clean[len(tag_name):]
+
+        if is_closing:
+            return f"</{normalized_name}>"
+
+        return f"<{normalized_name}{rest_of_tag}>"
+
+    return token
+
+
 def extract_tag_info(token):
     """Возвращает (имя_тега, is_closing, is_void)."""
     clean = token.strip("<> ")
@@ -58,9 +102,36 @@ def extract_tag_info(token):
 
     # Берем первое слово (имя тега)
     tag_name = clean.split()[0].lower()
+
+    # Нормализуем имя тега, если нужно
+    tag_name = TAG_NORMALIZATION.get(tag_name, tag_name)
+
     is_void = tag_name in VOID_TAGS or clean.endswith("/")
 
     return tag_name, is_closing, is_void
+
+
+def normalize_html(html: str) -> str:
+    """
+    Нормализует HTML-теги к Telegram-совместимому формату.
+
+    Args:
+        html: Исходная HTML-строка
+
+    Returns:
+        HTML-строка с нормализованными тегами
+    """
+    # Разбиваем на теги и текст
+    tokens = re.split(r"(<[^>]+>)", html)
+    normalized_tokens = []
+
+    for token in tokens:
+        if token.startswith("<"):
+            normalized_tokens.append(normalize_tag(token))
+        else:
+            normalized_tokens.append(token)
+
+    return "".join(normalized_tokens)
 
 
 def split_html_message(  # pylint: disable=too-many-locals,too-many-branches
@@ -83,6 +154,9 @@ def split_html_message(  # pylint: disable=too-many-locals,too-many-branches
     Возвращает:
         Список строк (чанков).
     """
+    # Сначала нормализуем все теги к Telegram-совместимому формату
+    html = normalize_html(html)
+
     if len(html) <= max_chars:
         return [html]
 
@@ -101,6 +175,7 @@ def split_html_message(  # pylint: disable=too-many-locals,too-many-branches
 
         # --- Логика обработки ТЕГОВ ---
         if token.startswith("<"):
+            # HTML уже нормализован на входе в функцию
             tag_name, is_closing, is_void = extract_tag_info(token)
 
             # Рассчитываем длину закрывающего хвоста
