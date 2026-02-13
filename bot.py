@@ -183,10 +183,12 @@ def save_message_to_db(
         )
         if message.from_user.username:
             user_prompt += f" aka {message.from_user.username}"
-        user_prompt += f" date:{str(message.date) if \
-                                 not message.edit_date else \
-                                   str(message.date) + "/edited:" \
-                                     + str(message.edit_date)}"
+        date = (
+            str(message.date)
+            if not message.edit_date
+            else str(message.date) + "/edited:" + str(message.edit_date)
+        )
+        user_prompt += f" date:{date}"
     else:
         user_prompt = "Bot"
 
