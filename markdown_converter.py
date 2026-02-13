@@ -12,8 +12,8 @@
 - Атрибуты сохраняются только для ссылок (href).
 """
 
-from markdown import markdown
 from bs4 import BeautifulSoup
+from markdown import markdown
 
 ALLOWED_TAGS = {"b", "i", "u", "s", "a", "code", "pre", "br", "tg-spoiler"}
 TELEGRAM_TAG_MAP = {

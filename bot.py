@@ -6,22 +6,18 @@
 в SQLite базе данных и может работать с различными типами медиа-файлов.
 """
 
+import configparser
 import logging
 import os
 import sqlite3
-import configparser
-from datetime import datetime
 import time
+from datetime import datetime
 
-from telegram import Update, Message
-from telegram.ext import (
-    Application,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
 from google import genai
+from telegram import Message, Update
+from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
+from html_splitter import split_html_message
 from markdown_converter import markdown_to_telegram_html
 
 
@@ -86,8 +82,7 @@ def init_db():
     os.makedirs(MEDIA_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     cursor = conn.cursor()
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             message_id INTEGER UNIQUE,
@@ -103,8 +98,7 @@ def init_db():
             reply_to_message_id INTEGER,
             is_bot BOOLEAN DEFAULT 0
         )
-    """
-    )
+    """)
     conn.commit()
     return conn
 
@@ -277,7 +271,7 @@ def get_media_path(
     Returns:
         str | None: Путь к файлу или None, если файл не может быть сохранен.
     """
-    if original_name:
+    if original_name and original_name.isascii():
         safe_name = "".join(
             c for c in original_name if c.isalnum() or c in (" ", ".", "_", "-")
         ).strip()
@@ -311,6 +305,60 @@ async def download_media_file(application: Application, file_id: str, file_path:
 # --- БЛОК ИНТЕГРАЦИИ С GEMINI ---
 
 
+def check_file_validity(client: genai.Client, media_path: str):
+    """
+    Проверяет валидность файла
+
+    :param client: клиент ИИ
+    :type client: genai.Client
+    :param media_path: путь к файлу
+    :type media_path: str
+    """
+    if media_path in uploaded_files:
+        try:
+            remote_file = client.files.get(name=uploaded_files[media_path].name)
+            if remote_file.state.name != "ACTIVE":
+                logger.info(
+                    "Файл %s в состоянии %s, требуется перевыгрузка",
+                    media_path,
+                    remote_file.state.name,
+                )
+                del uploaded_files[media_path]
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "Не удалось проверить статус файла %s, перевыгружаем: %s",
+                media_path,
+                e,
+            )
+            del uploaded_files[media_path]
+
+
+def upload_file(client: genai.Client, media_path):
+    """
+    Загружает файл
+
+    :param client: клиент ИИ
+    :type client: genai.Client
+    :param media_path: путь к файлу
+    :type media_path: str
+    """
+    uploaded_file = client.files.upload(file=media_path)
+
+    # Цикл ожидания перехода в рабочее состояние
+    while uploaded_file.state.name == "PROCESSING":
+        time.sleep(2)
+        uploaded_file = client.files.get(name=uploaded_file.name)
+
+    if uploaded_file.state.name == "ACTIVE":
+        uploaded_files[media_path] = uploaded_file
+    else:
+        logger.error(
+            "Файл %s после загрузки перешел в состояние %s",
+            media_path,
+            uploaded_file.state.name,
+        )
+
+
 async def generate_gemini_response(client: genai.Client, context_messages: list):
     """
     Генерирует ответ с использованием модели Google Gemini AI на основе контекста сообщений.
@@ -326,6 +374,7 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
     logger.info("Подготовка %d сообщений контекста для Gemini.", len(context_messages))
 
     # --- Декомпозиция: вынесем обработку одного сообщения в отдельную функцию ---
+
     def process_context_message(msg):
         parts = []
         author = msg.get("username") or ("Bot" if msg.get("is_bot") else "unknown")
@@ -343,21 +392,29 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
                 try:
                     file_size = os.path.getsize(media_path)
                     if file_size < 20 * 1024 * 1024:
+                        # Проверяем, есть ли файл в кэше и валиден ли он
+                        check_file_validity(client, media_path)
+
+                        # Загрузка, если файла нет в кэше (или он был удален выше)
                         if media_path not in uploaded_files:
-                            uploaded_files[media_path] = client.files.upload(
-                                file=media_path
-                            )
-                            time.sleep(
-                                FILE_UPLOAD_DELAY_PER_MB * (file_size / (1024 * 1024))
-                            )
-                        parts.append(
-                            genai.types.Part(
-                                file_data=genai.types.FileData(
-                                    file_uri=uploaded_files[media_path].uri,
-                                    mime_type=uploaded_files[media_path].mime_type,
+                            upload_file(client, media_path)
+
+                        # Если файл успешно загружен и активен
+                        if media_path in uploaded_files:
+                            parts.append(
+                                genai.types.Part(
+                                    file_data=genai.types.FileData(
+                                        file_uri=uploaded_files[media_path].uri,
+                                        mime_type=uploaded_files[media_path].mime_type,
+                                    )
                                 )
                             )
-                        )
+                        else:
+                            parts.append(
+                                genai.types.Part(
+                                    text="[Ошибка обработки файла - не удалось активировать]"
+                                )
+                            )
                     else:
                         logger.warning(
                             "Файл %s слишком большой (%.2f МБ), пропускаем",
@@ -369,9 +426,9 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
                                 text="[Файл слишком большой для обработки - пропущено]"
                             )
                         )
-                except (OSError, IOError) as e:
+                except Exception as e:  # pylint: disable=broad-exception-caught
                     logger.error(
-                        "Не удалось прочитать медиафайл %s для контекста: %s",
+                        "Ошибка при работе с медиафайлом %s: %s",
                         media_path,
                         e,
                     )
@@ -415,7 +472,9 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
 # --- ГЛАВНЫЙ ОБРАЗОВАТЕЛЬ TELEGRAM ---
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(  # pylint: disable=too-many-locals
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
     """
     Главный обработчик сообщений Telegram.
 
@@ -447,10 +506,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if bool(message.voice) and not triggered_by_text:
             context_messages = context_messages[-1:]
-            if context_messages and context_messages[-1].get('message_id') == message.message_id:
-                current_content = context_messages[-1].get('content', '')
-                context_messages[-1]['content'] = \
-                    f"Напиши расшифровку голосового сообщения. {current_content}"
+            if (
+                context_messages
+                and context_messages[-1].get("message_id") == message.message_id
+            ):
+                current_content = context_messages[-1].get("content", "")
+                context_messages[-1][
+                    "content"
+                ] = f"Напиши расшифровку голосового сообщения. {current_content}"
 
         try:
             response_text = await generate_gemini_response(
@@ -460,10 +523,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error("Ошибка при вызове Gemini API: %s", e)
             response_text = f"Произошла ошибка при обращении к нейросети: {e}"
 
-        bot_reply = await message.reply_text(
-            markdown_to_telegram_html(response_text), parse_mode="HTML"
+        message_chunks = split_html_message(
+            markdown_to_telegram_html(response_text), 3900
         )
-        save_message_to_db(db_conn, bot_reply, is_bot=True)
+
+        for chunk in message_chunks:
+            if not chunk.strip():
+                continue
+            bot_reply = await message.reply_text(chunk, parse_mode="HTML")
+            if len(message_chunks) > 4:
+                time.sleep(10)
+            save_message_to_db(db_conn, bot_reply, is_bot=True)
 
 
 # --- ТОЧКА ВХОДА ---
