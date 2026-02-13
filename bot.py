@@ -426,11 +426,7 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
                                 text="[Файл слишком большой для обработки - пропущено]"
                             )
                         )
-                except (  # pylint: disable=broad-exception-caught
-                    OSError,
-                    IOError,
-                    Exception,
-                ) as e:
+                except Exception as e:  # pylint: disable=broad-exception-caught
                     logger.error(
                         "Ошибка при работе с медиафайлом %s: %s",
                         media_path,
