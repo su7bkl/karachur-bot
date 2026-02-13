@@ -82,8 +82,7 @@ def init_db():
     os.makedirs(MEDIA_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     cursor = conn.cursor()
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             message_id INTEGER UNIQUE,
@@ -99,8 +98,7 @@ def init_db():
             reply_to_message_id INTEGER,
             is_bot BOOLEAN DEFAULT 0
         )
-    """
-    )
+    """)
     conn.commit()
     return conn
 
@@ -342,27 +340,43 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
                         # Проверяем, есть ли файл в кэше и валиден ли он
                         if media_path in uploaded_files:
                             try:
-                                remote_file = client.files.get(name=uploaded_files[media_path].name)
+                                remote_file = client.files.get(
+                                    name=uploaded_files[media_path].name
+                                )
                                 if remote_file.state.name != "ACTIVE":
-                                    logger.info("Файл %s в состоянии %s, требуется перевыгрузка", media_path, remote_file.state.name)
+                                    logger.info(
+                                        "Файл %s в состоянии %s, требуется перевыгрузка",
+                                        media_path,
+                                        remote_file.state.name,
+                                    )
                                     del uploaded_files[media_path]
                             except Exception as e:
-                                logger.warning("Не удалось проверить статус файла %s, перевыгружаем: %s", media_path, e)
+                                logger.warning(
+                                    "Не удалось проверить статус файла %s, перевыгружаем: %s",
+                                    media_path,
+                                    e,
+                                )
                                 del uploaded_files[media_path]
 
                         # Загрузка, если файла нет в кэше (или он был удален выше)
                         if media_path not in uploaded_files:
                             uploaded_file = client.files.upload(file=media_path)
-                            
+
                             # Цикл ожидания перехода в рабочее состояние
                             while uploaded_file.state.name == "PROCESSING":
                                 time.sleep(2)
-                                uploaded_file = client.files.get(name=uploaded_file.name)
-                            
+                                uploaded_file = client.files.get(
+                                    name=uploaded_file.name
+                                )
+
                             if uploaded_file.state.name == "ACTIVE":
                                 uploaded_files[media_path] = uploaded_file
                             else:
-                                logger.error("Файл %s после загрузки перешел в состояние %s", media_path, uploaded_file.state.name)
+                                logger.error(
+                                    "Файл %s после загрузки перешел в состояние %s",
+                                    media_path,
+                                    uploaded_file.state.name,
+                                )
 
                         # Если файл успешно загружен и активен
                         if media_path in uploaded_files:
@@ -468,10 +482,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         gemini_client = context.bot_data["gemini_client"]
 
         if bool(message.voice) and not triggered_by_text:
-            if context_messages and context_messages[-1].get('message_id') == message.message_id:
-                current_content = context_messages[-1].get('content', '')
-                context_messages[-1]['content'] = \
-                    f"Напиши расшифровку голосового сообщения. {current_content}"
+            if (
+                context_messages
+                and context_messages[-1].get("message_id") == message.message_id
+            ):
+                current_content = context_messages[-1].get("content", "")
+                context_messages[-1][
+                    "content"
+                ] = f"Напиши расшифровку голосового сообщения. {current_content}"
 
         try:
             response_text = await generate_gemini_response(
