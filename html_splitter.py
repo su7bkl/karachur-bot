@@ -1,180 +1,215 @@
 """
-Модуль для разделения больших HTML-сообщений на части.
+Модуль для разделения больших HTML-сообщений для Telegram.
 
-Предоставляет функцию split_html_message(), которая разбивает HTML-строку на фрагменты
-заданной максимальной длины, сохраняя корректную вложенность тегов.
-На границах разделения все открытые теги автоматически закрываются в текущем фрагменте
-и повторно открываются в следующем.
+Предоставляет функцию split_html_message(), которая разбивает HTML-строку на фрагменты,
+соблюдая лимиты Telegram и целостность тегов.
 
 Особенности:
-    - Корректно обрабатывает вложенные теги любой глубины
-    - Поддерживает атрибуты тегов
-    - Игнорирует самозакрывающиеся теги и <br>
-    - Разбивает длинные текстовые блоки без тегов
-    - Оставляет буфер для служебных тегов (по умолчанию 4000 символов)
+    - Поддерживает только разрешенные в Telegram теги (b, i, u, s, a, code, pre, tg-spoiler).
+    - "Умное" разделение текста: старается не разрывать слова, делит по переносам строк или
+    - пробелам.
+    - Сохраняет атрибуты тегов (href в <a>, class в <code>) при переносе на следующую часть.
+    - Игнорирует регистр тегов.
 
 Пример использования:
-    >>> from html_splitter import split_html_message
-    >>>
-    >>> long_html = "<div><p>Очень длинный текст...</p><span>Ещё текст</span></div>"
-    >>> parts = split_html_message(long_html, max_chars=100)
-    >>> for i, part in enumerate(parts, 1):
-    ...     print(f"Часть {i}:\\n{part}\\n")
+    >>> html = "<b>Жирный</b> и <pre>код</pre>"
+    >>> parts = split_html_message(html, max_chars=200)
 """
 
 import re
 
+# Теги, поддерживаемые Telegram (остальные будут игнорироваться в стеке, но останутся в тексте)
+ALLOWED_TAGS = {
+    "b",
+    "strong",
+    "i",
+    "em",
+    "u",
+    "ins",
+    "s",
+    "strike",
+    "del",
+    "a",
+    "code",
+    "pre",
+    "tg-spoiler",
+}
 
-def split_html_message(
-    html: str, max_chars: int = 4000, min_chunk_size: int = 200
+# Теги, которые не требуют закрытия или работают как разрывы
+VOID_TAGS = {"br"}
+
+
+def get_closing_str(stack):
+    """Генерирует строку закрывающих тегов для текущего стека."""
+    return "".join(f"</{tag_name}>" for tag_name, _ in reversed(stack))
+
+
+def get_opening_str(stack):
+    """Генерирует строку открывающих тегов для начала следующего чанка."""
+    return "".join(full_tag for _, full_tag in stack)
+
+
+def extract_tag_info(token):
+    """Возвращает (имя_тега, is_closing, is_void)."""
+    clean = token.strip("<> ")
+    is_closing = clean.startswith("/")
+    if is_closing:
+        clean = clean[1:]
+
+    # Берем первое слово (имя тега)
+    tag_name = clean.split()[0].lower()
+    is_void = tag_name in VOID_TAGS or clean.endswith("/")
+
+    return tag_name, is_closing, is_void
+
+
+def split_html_message(  # pylint: disable=too-many-locals  disable=too-many-branches
+    html: str, max_chars: int = 4096
 ) -> list[str]:
     """
-    Разбивает HTML-сообщение на части, обеспечивая корректное закрытие
-    и повторное открытие тегов на границах разделения.
+    Разбивает HTML-сообщение на части не длиннее max_chars.
+
+    Алгоритм:
+    1. Токенизирует HTML.
+    2. Накапливает токены в буфер.
+    3. Если добавление токена (плюс необходимые закрывающие теги) превысит лимит:
+       - Если это тег: закрываем текущий чанк, открываем новый.
+       - Если это текст: ищем пробел/перенос для мягкого разрыва, переносим остаток.
 
     Параметры:
-        html: Исходная HTML-строка для разделения.
-        max_chars: Максимальная длина одной части.
-        min_chunk_size: Минимальный желаемый размер текста при разделении.
-                        Предотвращает создание крошечных текстовых "огрызков".
+        html: Исходная строка
+        max_chars: Максимальная длина одного сообщения (по умолчанию 4096 для Telegram)
 
     Возвращает:
-        Список строк, содержащих корректно оформленные HTML-фрагменты.
+        Список строк (чанков).
     """
     if len(html) <= max_chars:
         return [html]
 
+    # Разбиваем на теги и текст. Группировка () сохраняет разделители в списке.
     tokens = re.split(r"(<[^>]+>)", html)
+
     chunks = []
     current_chunk = ""
+    # Стек хранит кортежи: (имя_тега, полный_текст_открывающего_тега)
+    # Пример: ('a', '<a href="google.com">')
     tag_stack = []
 
-    # Список стандартных самозакрывающихся тегов HTML5
-    VOID_ELEMENTS = {
-        "area",
-        "base",
-        "br",
-        "col",
-        "embed",
-        "hr",
-        "img",
-        "input",
-        "link",
-        "meta",
-        "param",
-        "source",
-        "track",
-        "wbr",
-    }
-
-    def get_tag_name(tag_token: str) -> str:
-        """Извлекает имя тега в нижнем регистре."""
-        match = re.search(r"</?([^\s/>]+)", tag_token)
-        return match.group(1).lower() if match else ""
-
-    def get_closing_tags(stack: list[str]) -> str:
-        """Генерирует строку с закрывающими тегами для текущего стека."""
-        return "".join([f"</{get_tag_name(t)}>" for t in reversed(stack)])
-
-    def close_and_start_new_chunk():
-        """Закрывает текущий чанк, сохраняет его и начинает новый с открытыми тегами."""
-        nonlocal current_chunk
-        closing_tags = get_closing_tags(tag_stack)
-        chunks.append(current_chunk + closing_tags)
-        current_chunk = "".join(tag_stack)
-
-    for token in tokens:
+    for token in tokens: # pylint: disable=too-many-nested-blocks
         if not token:
             continue
 
+        # --- Логика обработки ТЕГОВ ---
         if token.startswith("<"):
-            tag_name = get_tag_name(token)
-            is_closing = token.startswith("</")
-            is_self_closing = token.endswith("/>") or tag_name in VOID_ELEMENTS
+            tag_name, is_closing, is_void = extract_tag_info(token)
 
-            # Имитируем стек, чтобы понять будущую длину
-            temp_stack = tag_stack.copy()
-            if is_closing:
-                if temp_stack and get_tag_name(temp_stack[-1]) == tag_name:
-                    temp_stack.pop()
-            elif not is_self_closing:
-                temp_stack.append(token)
+            # Рассчитываем длину закрывающего хвоста
+            closing_markup = get_closing_str(tag_stack)
 
-            future_closing = get_closing_tags(temp_stack)
-            predicted_len = len(current_chunk) + len(token) + len(future_closing)
-            open_tags_len = len("".join(tag_stack))
-
-            # Если добавление тега превысит лимит, закрываем чанк ДО его добавления.
-            # Но если текущий чанк слишком мал (< min_chunk_size), мы разрешаем
-            # ему слегка превысить max_chars, чтобы не плодить пустые чанки.
-            if predicted_len > max_chars and len(current_chunk) >= min_chunk_size:
-                if (
-                    len(current_chunk) > open_tags_len
-                ):  # Убеждаемся, что в чанке есть контент
-                    close_and_start_new_chunk()
+            # Проверяем, влезает ли тег в текущий чанк
+            if len(current_chunk) + len(token) + len(closing_markup) > max_chars:
+                # Тег не влезает. Закрываем текущий чанк.
+                chunks.append(current_chunk + closing_markup)
+                # Начинаем новый.
+                current_chunk = get_opening_str(tag_stack)
+                # Если даже в новый пустой чанк тег не влезает (экстремально мало места)
+                # то это патология, но мы добавим его, чтобы не потерять контент.
 
             current_chunk += token
-            tag_stack = temp_stack
 
-        else:
-            # Обработка текстового блока
-            closing_tags = get_closing_tags(tag_stack)
+            # Обновляем стек, если тег структурный и разрешенный
+            if tag_name in ALLOWED_TAGS:
+                if is_closing:
+                    # Пытаемся закрыть последний соответствующий тег
+                    # Ищем с конца, чтобы закрыть ближайший (хотя HTML должен быть валидным)
+                    for tg in range(len(tag_stack) - 1, -1, -1):
+                        if tag_stack[tg][0] == tag_name:
+                            tag_stack.pop(tg)
+                            break
+                elif not is_void:
+                    # Открывающий тег - добавляем в стек
+                    tag_stack.append((tag_name, token))
 
-            while len(current_chunk) + len(token) + len(closing_tags) > max_chars:
-                available_space = max_chars - len(current_chunk) - len(closing_tags)
-                open_tags_len = len("".join(tag_stack))
+            continue
 
-                # Если места осталось мало (меньше минимального чанка) и чанк уже содержит текст,
-                # лучше закрыть этот чанк пораньше и перенести слово целиком в следующий.
-                if available_space <= 0 or (
-                    available_space < min_chunk_size
-                    and len(current_chunk) > open_tags_len
-                ):
-                    close_and_start_new_chunk()
-                    closing_tags = get_closing_tags(tag_stack)
-                    continue
+        # --- Логика обработки ТЕКСТА ---
+        text = token
+        while text:
+            closing_markup = get_closing_str(tag_stack)
+            # Сколько места осталось для чистого текста
+            available_space = max_chars - len(current_chunk) - len(closing_markup)
 
-                # Ищем оптимальное место для разрезания текста (по пробелу/переносу строки)
-                split_idx = available_space
-                if len(token) > available_space:
-                    last_space = max(
-                        token.rfind(" ", 0, available_space + 1),
-                        token.rfind("\n", 0, available_space + 1),
-                    )
-                    if last_space > 0:
-                        split_idx = last_space
+            if len(text) <= available_space:
+                current_chunk += text
+                text = ""  # Весь текст добавлен
+            else:
+                # Текст не влезает целиком. Нужно резать.
+                # Ищем лучшее место для разреза в пределах available_space
 
-                    # Защита от разрезания HTML-сущностей (например, &nbsp;)
-                    entity_amp = token.rfind("&", max(0, split_idx - 10), split_idx)
-                    entity_semi = token.rfind(";", max(0, split_idx - 10), split_idx)
-                    if (
-                        entity_amp > entity_semi
-                    ):  # Значит сущность открылась, но не закрылась
-                        split_idx = entity_amp
+                # Срез, который теоретически влезает
+                candidate = text[:available_space]
 
-                current_chunk += token[:split_idx]
-                token = token[split_idx:].lstrip(
-                    " \n"
-                )  # Убираем ведущие пробелы у остатка
+                # Приоритет 1: Перенос строки (ищем последний \n)
+                split_idx = candidate.rfind("\n")
 
-                close_and_start_new_chunk()
-                closing_tags = get_closing_tags(tag_stack)
+                # Приоритет 2: Пробел (если нет переноса, ищем последний пробел)
+                if split_idx == -1:
+                    split_idx = candidate.rfind(" ")
 
-            if token:
-                current_chunk += token
+                # Если вообще нет разделителей (очень длинное слово), режем жестко
+                if split_idx == -1:
+                    # Но если available_space слишком мал (меньше 10 символов),
+                    # лучше сразу перенести всё слово на новый чанк, если чанк не пустой
+                    if available_space < 10 and len(current_chunk) > len(
+                        get_opening_str(tag_stack)
+                    ):
+                        split_idx = -1  # Сигнал "закрывай текущий чанк"
+                    else:
+                        split_idx = available_space
+                else:
+                    # Включаем разделитель в текущий кусок (или +1 если хотим выкинуть?)
+                    # Обычно пробел оставляют в конце строки или убирают.
+                    # text[:split_idx] берет до пробела.
+                    # Чтобы пробел остался на этой строке: split_idx + 1
+                    split_idx += 1
 
-    # Сохраняем оставшийся кусок, если в нем есть хоть что-то кроме пустых тегов
-    open_tags_len = len("".join(tag_stack))
-    if len(current_chunk) > open_tags_len:
-        chunks.append(current_chunk + get_closing_tags(tag_stack))
+                if split_idx > 0:
+                    # Добавляем часть текста
+                    current_chunk += text[:split_idx]
+                    text = text[split_idx:]
 
-    return chunks
+                # Закрываем чанк
+                chunks.append(current_chunk + closing_markup)
+
+                # Начинаем новый чанк
+                current_chunk = get_opening_str(tag_stack)
+
+    # Добавляем последний чанк, если есть
+    if current_chunk:
+        chunks.append(current_chunk + get_closing_str(tag_stack))
+
+    # Фильтрация пустых чанков (иногда возникают из-за переносов)
+    return [c for c in chunks if c and c != get_opening_str([])]
 
 
 if __name__ == "__main__":
-    test_html = "<div><p>Очень длинный текст, который должен быть красиво и правильно разбит на части без потери смысла и тегов...</p><span>Ещё текст</span></div>"
+    # Пример, демонстрирующий "умное" разбиение и сохранение тегов
+    LONG_TEXT = (
+        "<b>Заголовок</b>\n"
+        "В этом тексте мы проверим, как функция справляется с "
+        "<pre><code class='python'>вложенными тегами</code></pre> "
+        "и длинными строками, которые не должны разрываться посередине слова, "
+        "если это возможно. "
+        "Также проверим <a href='https://google.com'>ссылку,"
+        " которая может попасть на границу</a> разрыва."
+    )
 
-    print("--- Тест на разбиение текста ---")
-    parts = split_html_message(test_html, max_chars=120, min_chunk_size=30)
+    # Используем маленький лимит (200), чтобы форсировать разделение
+    print(f"Исходная длина: {len(LONG_TEXT)} символов.\n")
+
+    parts = split_html_message(LONG_TEXT, max_chars=200)
+
     for i, part in enumerate(parts, 1):
-        print(f"Часть {i} (длина {len(part)}):\n{part}\n")
+        print(f"--- Чанк {i} (длина {len(part)}) ---")
+        print(part)
+        print("-" * 30)
