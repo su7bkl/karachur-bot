@@ -509,6 +509,7 @@ async def handle_message(  # pylint: disable=too-many-locals
         gemini_client = context.bot_data["gemini_client"]
 
         if bool(message.voice) and not triggered_by_text:
+            context_messages = context_messages[-1:]
             if (
                 context_messages
                 and context_messages[-1].get("message_id") == message.message_id
