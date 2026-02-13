@@ -34,7 +34,7 @@ ALLOWED_TAGS = {
 }
 
 # Маппинг HTML-тегов на Telegram-совместимые теги
-# Эти теги будут автоматически преобразованы в процессе обработки
+# Эти теги будут автоматически преобразованы функцией normalize_html() перед обработкой
 TAG_NORMALIZATION = {
     "strong": "b",
     "em": "i",
@@ -102,9 +102,6 @@ def extract_tag_info(token):
 
     # Берем первое слово (имя тега)
     tag_name = clean.split()[0].lower()
-
-    # Нормализуем имя тега, если нужно
-    tag_name = TAG_NORMALIZATION.get(tag_name, tag_name)
 
     is_void = tag_name in VOID_TAGS or clean.endswith("/")
 
