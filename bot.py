@@ -504,6 +504,8 @@ async def handle_message(  # pylint: disable=too-many-locals
     ):
         return
 
+    err = False
+
     db_conn = context.bot_data["db_conn"]
     triggered_by_text = (
         message.text and message.text.lower().startswith(TRIGGER_WORD.lower())
@@ -537,6 +539,7 @@ async def handle_message(  # pylint: disable=too-many-locals
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error("Ошибка при вызове Gemini API: %s", e)
             response_text = f"Произошла ошибка при обращении к нейросети: {e}"
+            err = True
 
         message_chunks = split_html_message(
             markdown_to_telegram_html(response_text), 3900
@@ -548,7 +551,8 @@ async def handle_message(  # pylint: disable=too-many-locals
             bot_reply = await message.reply_text(chunk, parse_mode="HTML")
             if len(message_chunks) > 4:
                 time.sleep(10)
-            save_message_to_db(db_conn, bot_reply, is_bot=True)
+            if not err:
+                save_message_to_db(db_conn, bot_reply, is_bot=True)
 
 
 # --- ТОЧКА ВХОДА ---
