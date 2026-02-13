@@ -63,7 +63,7 @@ def extract_tag_info(token):
     return tag_name, is_closing, is_void
 
 
-def split_html_message(  # pylint: disable=too-many-locals  disable=too-many-branches
+def split_html_message(  # pylint: disable=too-many-locals,too-many-branches
     html: str, max_chars: int = 4096
 ) -> list[str]:
     """
