@@ -14,7 +14,7 @@ import random
 import re
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from google import genai
 from telegram import Message, Update
@@ -86,6 +86,14 @@ GENERATING_PLACEHOLDER = "⏳ Генерирую ответ..."
 # В чат уходит полный текст ошибки, а в контекст модели - только эта короткая пометка.
 ERROR_CONTEXT_NOTE = "ошибка gemini api"
 
+# --- СЛУЖЕБНЫЙ ПРЕФИКС АВТОРА ---
+# Каждая реплика уходит в модель с пометкой вида "[Имя aka ник date:...]: ".
+# Свои прошлые ответы модель видит с такой же пометкой и копирует ее в новый ответ.
+# Лечим не запретом, а затравкой: пометку для будущей реплики бот пишет сам, модели
+# остается только продолжить строку обычным текстом.
+# Страховка на случай, если модель все же начнет ответ с копии пометки.
+AUTHOR_TAG_PATTERN = re.compile(r"^\s*\[[^\]\n]*?date:[^\]\n]*\]\s*:?[ \t]*")
+
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -124,6 +132,56 @@ def init_db():
     """)
     conn.commit()
     return conn
+
+
+def build_author_tag(name: str, username: str | None, date: str) -> str:
+    """
+    Собирает служебную подпись автора реплики: "Имя aka ник date:...".
+
+    Единая точка сборки нужна, чтобы подпись сохраненного сообщения и подпись-затравка
+    для ответа бота гарантированно совпадали по формату.
+
+    :param name: отображаемое имя автора
+    :type name: str
+    :param username: ник в Telegram без "@" или None, если ника нет
+    :type username: str | None
+    :param date: дата реплики в том же виде, в каком ее хранит БД
+    :type date: str
+    :return: служебная подпись без квадратных скобок
+    :rtype: str
+    """
+    tag = name
+    if username:
+        tag += f" aka {username}"
+    return f"{tag} date:{date}"
+
+
+def build_reply_prefix(bot) -> str:
+    """
+    Готовит затравку - начало будущей реплики бота в формате контекста.
+
+    Эту строку мы подставляем последним сообщением роли "model", поэтому модель не
+    придумывает служебный префикс заново, а просто продолжает его обычным текстом.
+
+    :param bot: объект бота Telegram, у которого уже известны имя и ник
+    :return: префикс вида "[Имя aka ник date:...]: "
+    :rtype: str
+    """
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    return f"[{build_author_tag(bot.full_name, bot.username, str(now))}]: "
+
+
+def strip_author_tag(text: str) -> str:
+    """
+    Срезает служебный префикс автора, если модель все же продублировала его.
+
+    :param text: текст ответа модели
+    :type text: str
+    :return: текст без ведущей служебной пометки
+    :rtype: str
+    """
+    cleaned, replaced = AUTHOR_TAG_PATTERN.subn("", text, count=1)
+    return cleaned.lstrip() if replaced else text
 
 
 def save_message_to_db(
@@ -207,19 +265,16 @@ def save_message_to_db(
     )
     user_id = message.from_user.id if message.from_user else None
     if message.from_user:
-        user_prompt = (
-            message.from_user.full_name
-            if message.from_user.full_name
-            else str(message.from_user.id)
-        )
-        if message.from_user.username:
-            user_prompt += f" aka {message.from_user.username}"
         date = (
             str(message.date)
             if not message.edit_date
             else str(message.date) + "/edited:" + str(message.edit_date)
         )
-        user_prompt += f" date:{date}"
+        user_prompt = build_author_tag(
+            message.from_user.full_name or str(message.from_user.id),
+            message.from_user.username,
+            date,
+        )
     else:
         user_prompt = "Bot"
 
@@ -562,13 +617,16 @@ async def generate_with_retries(client: genai.Client, contents: list) -> str:
     )
 
 
-async def generate_gemini_response(client: genai.Client, context_messages: list):
+async def generate_gemini_response(
+    client: genai.Client, context_messages: list, reply_prefix: str
+):
     """
     Генерирует ответ с использованием модели Google Gemini AI на основе контекста сообщений.
 
     Args:
         client (genai.GenerativeModel): Клиент Google Gemini AI.
         context_messages (list): Список сообщений контекста.
+        reply_prefix (str): Затравка - служебный префикс будущей реплики бота.
 
     Returns:
         str: Сгенерированный ответ.
@@ -665,10 +723,20 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
 
     contents.append(genai.types.ContentDict(role="user", parts=history[-1]["parts"]))
 
+    # Затравка: незакрытая реплика бота, которую модель должна продолжить. Служебный
+    # префикс уже написан нами и в ответ модели не попадает, так что копировать его
+    # в начало текста ей больше незачем.
+    contents.append(
+        genai.types.ContentDict(
+            role="model", parts=[genai.types.PartDict(text=reply_prefix)]
+        )
+    )
+
     logger.info("Отправка запроса в Gemini...")
 
     # Генерируем ответ с новым API, повторяя попытки при сбоях
-    return await generate_with_retries(client, contents)
+    response_text = await generate_with_retries(client, contents)
+    return strip_author_tag(response_text)
 
 
 # --- ГЛАВНЫЙ ОБРАЗОВАТЕЛЬ TELEGRAM ---
@@ -819,7 +887,7 @@ async def handle_message(  # pylint: disable=too-many-locals
 
         try:
             response_text = await generate_gemini_response(
-                gemini_client, context_messages
+                gemini_client, context_messages, build_reply_prefix(context.bot)
             )
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error("Ошибка при вызове Gemini API: %s", e)
