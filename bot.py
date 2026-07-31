@@ -18,6 +18,7 @@ from datetime import datetime
 
 from google import genai
 from telegram import Message, Update
+from telegram.error import TelegramError
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from html_splitter import split_html_message
@@ -79,6 +80,12 @@ RETRY_DELAY_PATTERN = re.compile(
     r"retry[-_]?delay[\"']?\s*[:=]\s*[\"']?(\d+(?:\.\d+)?)s", re.IGNORECASE
 )
 
+# --- СЛУЖЕБНЫЕ СООБЩЕНИЯ ---
+# Заглушка, которую бот шлет сразу и потом заменяет готовым ответом.
+GENERATING_PLACEHOLDER = "⏳ Генерирую ответ..."
+# В чат уходит полный текст ошибки, а в контекст модели - только эта короткая пометка.
+ERROR_CONTEXT_NOTE = "ошибка gemini api"
+
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -120,7 +127,10 @@ def init_db():
 
 
 def save_message_to_db(
-    conn: sqlite3.Connection, message: Message, is_bot: bool = False
+    conn: sqlite3.Connection,
+    message: Message,
+    is_bot: bool = False,
+    content_override: str | None = None,
 ):
     """
     Сохраняет сообщение в базу данных.
@@ -130,6 +140,8 @@ def save_message_to_db(
         message (Message): Объект сообщения Telegram.
         is_bot (bool, optional): Флаг, указывающий, является ли сообщение от бота.
         По умолчанию False.
+        content_override (str | None, optional): Текст, который попадет в контекст вместо
+        реального текста сообщения. Нужен, чтобы простыня с ошибкой API не засоряла историю.
 
     Returns:
         tuple: (file_id, mime_type, file_name) - информация о медиа-файле, если он присутствует.
@@ -185,6 +197,9 @@ def save_message_to_db(
             "video/mp4",
         )
         content = f"[Видео сообщение by {message.from_user.username}]"
+
+    if content_override is not None:
+        content = content_override
 
     timestamp = datetime.fromtimestamp(message.date.timestamp()).isoformat()
     reply_to_id = (
@@ -511,7 +526,10 @@ async def generate_with_retries(client: genai.Client, contents: list) -> str:
                 logger.error(
                     "Неустранимая ошибка Gemini (код %s): %s", get_error_code(e), e
                 )
-                raise
+                raise GeminiRetryError(
+                    f"Неустранимая ошибка API на попытке {attempt} из {MAX_RETRIES} "
+                    f"(код {get_error_code(e)}): {e}"
+                ) from e
             failure = e
             last_reason = f"ошибка API {get_error_code(e)}: {e}"
         else:
@@ -524,7 +542,10 @@ async def generate_with_retries(client: genai.Client, contents: list) -> str:
                 return text
             if not can_retry:
                 logger.error("Повтор бесполезен: %s", reason)
-                raise GeminiRetryError(reason)
+                raise GeminiRetryError(
+                    f"Повтор бесполезен, остановились на попытке {attempt} "
+                    f"из {MAX_RETRIES}: {reason}"
+                )
             last_reason = reason
 
         logger.warning(
@@ -653,6 +674,102 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
 # --- ГЛАВНЫЙ ОБРАЗОВАТЕЛЬ TELEGRAM ---
 
 
+async def send_placeholder(message: Message) -> Message | None:
+    """
+    Отправляет сообщение-заглушку о начале генерации.
+
+    :param message: сообщение пользователя, на которое отвечаем
+    :type message: Message
+    :return: отправленное сообщение или None, если отправить не удалось
+    :rtype: Message | None
+    """
+    try:
+        return await message.reply_text(GENERATING_PLACEHOLDER)
+    except TelegramError as e:
+        logger.warning("Не удалось отправить заглушку: %s", e)
+        return None
+
+
+async def replace_placeholder(
+    placeholder: Message | None, original: Message, text: str
+) -> Message:
+    """
+    Заменяет текст заглушки готовым ответом.
+
+    Если отредактировать не вышло (заглушку удалили, истек срок правки), убираем ее
+    и отвечаем обычным сообщением.
+
+    :param placeholder: сообщение-заглушка или None, если ее не удалось отправить
+    :type placeholder: Message | None
+    :param original: сообщение пользователя, на которое отвечаем
+    :type original: Message
+    :param text: готовый текст ответа
+    :type text: str
+    :return: сообщение бота с итоговым текстом
+    :rtype: Message
+    """
+    if placeholder is not None:
+        try:
+            edited = await placeholder.edit_text(text, parse_mode="HTML")
+            # edit_text возвращает bool, если правим не свое сообщение - тогда берем исходное.
+            return edited if isinstance(edited, Message) else placeholder
+        except TelegramError as e:
+            logger.warning("Не удалось отредактировать заглушку: %s", e)
+            try:
+                await placeholder.delete()
+            except TelegramError as delete_error:
+                logger.warning("Не удалось удалить заглушку: %s", delete_error)
+
+    return await original.reply_text(text, parse_mode="HTML")
+
+
+async def deliver_response(
+    db_conn: sqlite3.Connection,
+    message: Message,
+    placeholder: Message | None,
+    response_text: str,
+    err: bool,
+):
+    """
+    Отправляет готовый текст в чат и кладет его в контекст.
+
+    Первый кусок заменяет заглушку, остальные уходят отдельными ответами.
+
+    :param db_conn: соединение с базой данных
+    :type db_conn: sqlite3.Connection
+    :param message: сообщение пользователя, на которое отвечаем
+    :type message: Message
+    :param placeholder: сообщение-заглушка или None, если ее не удалось отправить
+    :type placeholder: Message | None
+    :param response_text: текст ответа модели или описание ошибки
+    :type response_text: str
+    :param err: True, если вместо ответа модели отправляем ошибку
+    :type err: bool
+    """
+    message_chunks = [
+        chunk
+        for chunk in split_html_message(markdown_to_telegram_html(response_text), 3900)
+        if chunk.strip()
+    ] or [response_text]
+
+    for index, chunk in enumerate(message_chunks):
+        if index == 0:
+            bot_reply = await replace_placeholder(placeholder, message, chunk)
+        else:
+            bot_reply = await message.reply_text(chunk, parse_mode="HTML")
+
+        if len(message_chunks) > 4:
+            time.sleep(10)
+
+        # Ответ модели сохраняем как есть, ошибку - одной короткой пометкой и один раз.
+        if not err:
+            save_message_to_db(db_conn, bot_reply, is_bot=True)
+        elif index == 0:
+            save_message_to_db(
+                db_conn, bot_reply, is_bot=True, content_override=ERROR_CONTEXT_NOTE
+            )
+
+
 async def handle_message(  # pylint: disable=too-many-locals
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
@@ -698,27 +815,19 @@ async def handle_message(  # pylint: disable=too-many-locals
                     "content"
                 ] = f"Напиши расшифровку голосового сообщения. {current_content}"
 
+        placeholder = await send_placeholder(message)
+
         try:
             response_text = await generate_gemini_response(
                 gemini_client, context_messages
             )
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error("Ошибка при вызове Gemini API: %s", e)
+            # В чат уходит полный текст ошибки вместе с числом попыток.
             response_text = f"Произошла ошибка при обращении к нейросети: {e}"
             err = True
 
-        message_chunks = split_html_message(
-            markdown_to_telegram_html(response_text), 3900
-        )
-
-        for chunk in message_chunks:
-            if not chunk.strip():
-                continue
-            bot_reply = await message.reply_text(chunk, parse_mode="HTML")
-            if len(message_chunks) > 4:
-                time.sleep(10)
-            if not err:
-                save_message_to_db(db_conn, bot_reply, is_bot=True)
+        await deliver_response(db_conn, message, placeholder, response_text, err)
 
 
 # --- ТОЧКА ВХОДА ---
