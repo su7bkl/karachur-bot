@@ -6,9 +6,12 @@
 в SQLite базе данных и может работать с различными типами медиа-файлов.
 """
 
+import asyncio
 import configparser
 import logging
 import os
+import random
+import re
 import sqlite3
 import time
 from datetime import datetime
@@ -62,6 +65,19 @@ MEDIA_DIR = CONFIG["MEDIA_DIR"]
 TRIGGER_WORD = CONFIG["TRIGGER_WORD"]
 SYSTEM_PROMPT = CONFIG["SYSTEM_PROMPT"]
 MODEL = CONFIG["MODEL"]
+
+# --- НАСТРОЙКИ ПОВТОРНЫХ ПОПЫТОК ---
+# Сколько раз пробуем получить от модели корректный текст, прежде чем сдаться.
+MAX_RETRIES = 15
+# Пауза растет экспоненциально (2, 4, 8, ...) до потолка. Суммарно ~18 минут.
+RETRY_BASE_DELAY = 2.0
+RETRY_MAX_DELAY = 120.0
+# Ошибки, которые сами не пройдут: кривой запрос, битый ключ, нет прав, нет модели.
+NON_RETRYABLE_CODES = frozenset({400, 401, 403, 404})
+# В деталях ошибки 429 Gemini присылает рекомендованную паузу: "retryDelay": "27s".
+RETRY_DELAY_PATTERN = re.compile(
+    r"retry[-_]?delay[\"']?\s*[:=]\s*[\"']?(\d+(?:\.\d+)?)s", re.IGNORECASE
+)
 
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(
@@ -374,6 +390,157 @@ def upload_file(client: genai.Client, media_path):
         )
 
 
+class GeminiRetryError(Exception):
+    """Не удалось получить корректный ответ от Gemini за отведенное число попыток."""
+
+
+def get_error_code(exc: Exception) -> int | None:
+    """
+    Определяет HTTP-код ошибки Gemini API.
+
+    :param exc: пойманное исключение
+    :type exc: Exception
+    :return: код ответа или None, если определить не удалось (например, обрыв связи)
+    :rtype: int | None
+    """
+    for attr in ("code", "status_code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    # В разных версиях SDK текст ошибки начинается с кода: "429 RESOURCE_EXHAUSTED ..."
+    match = re.match(r"\s*(\d{3})\b", str(exc))
+    return int(match.group(1)) if match else None
+
+
+def is_retryable_error(exc: Exception) -> bool:
+    """
+    Решает, имеет ли смысл повторять запрос после этой ошибки.
+
+    :param exc: пойманное исключение
+    :type exc: Exception
+    :return: True, если ошибка похожа на временную
+    :rtype: bool
+    """
+    code = get_error_code(exc)
+    if code is None:
+        # Таймауты и обрывы связи кода не имеют - их повторяем.
+        return True
+    return code not in NON_RETRYABLE_CODES
+
+
+def get_backoff_delay(attempt: int, exc: Exception | None = None) -> float:
+    """
+    Считает паузу перед следующей попыткой.
+
+    :param attempt: номер только что провалившейся попытки (начиная с единицы)
+    :type attempt: int
+    :param exc: исключение, если попытка упала с ошибкой API
+    :type exc: Exception | None
+    :return: длительность паузы в секундах
+    :rtype: float
+    """
+    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+    if exc is not None:
+        # Если API сам сказал, сколько ждать (429), слушаемся его.
+        match = RETRY_DELAY_PATTERN.search(str(exc))
+        if match:
+            delay = float(match.group(1))
+    delay = min(delay, RETRY_MAX_DELAY)
+    # Джиттер, чтобы повторы не выстраивались в ровную сетку.
+    return delay + random.uniform(0, delay * 0.1)
+
+
+def extract_response_text(response) -> tuple[str | None, str, bool]:
+    """
+    Достает текст из ответа Gemini и объясняет, если текста нет.
+
+    :param response: ответ метода generate_content
+    :return: (текст или None, описание проблемы, стоит ли повторять запрос)
+    :rtype: tuple[str | None, str, bool]
+    """
+    feedback = getattr(response, "prompt_feedback", None)
+    block_reason = getattr(feedback, "block_reason", None) if feedback else None
+    if block_reason:
+        # Блокировка самого запроса детерминирована - повтор ничего не изменит.
+        return None, f"запрос заблокирован фильтрами ({block_reason})", False
+
+    try:
+        text = response.text
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        return None, f"не удалось прочитать текст ответа: {e}", True
+
+    if text and text.strip():
+        return text, "", True
+
+    candidates = getattr(response, "candidates", None) or []
+    finish = getattr(candidates[0], "finish_reason", None) if candidates else None
+    return None, f"модель вернула пустой текст (finish_reason={finish})", True
+
+
+async def generate_with_retries(client: genai.Client, contents: list) -> str:
+    """
+    Запрашивает ответ у Gemini, повторяя попытки при сбоях и пустых ответах.
+
+    Повторяет до MAX_RETRIES раз с экспоненциально растущей паузой. Не повторяет
+    ошибки, которые сами не исправятся (неверный ключ, недоступная модель,
+    некорректный запрос), и блокировку запроса фильтрами безопасности.
+
+    :param client: клиент ИИ
+    :type client: genai.Client
+    :param contents: подготовленное содержимое запроса
+    :type contents: list
+    :return: текст ответа модели
+    :rtype: str
+    :raises GeminiRetryError: если попытки исчерпаны
+    """
+    last_reason = "причина неизвестна"
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        failure = None
+        try:
+            # Вызов синхронный, уводим его в поток, чтобы не морозить event loop.
+            response = await asyncio.to_thread(
+                client.models.generate_content, model=MODEL, contents=contents
+            )
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            if not is_retryable_error(e):
+                logger.error(
+                    "Неустранимая ошибка Gemini (код %s): %s", get_error_code(e), e
+                )
+                raise
+            failure = e
+            last_reason = f"ошибка API {get_error_code(e)}: {e}"
+        else:
+            text, reason, can_retry = extract_response_text(response)
+            if text:
+                if attempt > 1:
+                    logger.info(
+                        "Ответ получен с попытки %d из %d.", attempt, MAX_RETRIES
+                    )
+                return text
+            if not can_retry:
+                logger.error("Повтор бесполезен: %s", reason)
+                raise GeminiRetryError(reason)
+            last_reason = reason
+
+        logger.warning(
+            "Попытка %d из %d не удалась: %s", attempt, MAX_RETRIES, last_reason
+        )
+
+        if attempt < MAX_RETRIES:
+            delay = get_backoff_delay(attempt, failure)
+            logger.info("Повтор через %.1f с.", delay)
+            await asyncio.sleep(delay)
+
+    raise GeminiRetryError(
+        f"Не удалось получить ответ за {MAX_RETRIES} попыток. Последняя причина: {last_reason}"
+    )
+
+
 async def generate_gemini_response(client: genai.Client, context_messages: list):
     """
     Генерирует ответ с использованием модели Google Gemini AI на основе контекста сообщений.
@@ -479,9 +646,8 @@ async def generate_gemini_response(client: genai.Client, context_messages: list)
 
     logger.info("Отправка запроса в Gemini...")
 
-    # Генерируем ответ с новым API
-    response = client.models.generate_content(model=MODEL, contents=contents)
-    return response.text
+    # Генерируем ответ с новым API, повторяя попытки при сбоях
+    return await generate_with_retries(client, contents)
 
 
 # --- ГЛАВНЫЙ ОБРАЗОВАТЕЛЬ TELEGRAM ---
