@@ -723,6 +723,53 @@ async def replace_placeholder(
     return await original.reply_text(text, parse_mode="HTML")
 
 
+async def deliver_response(
+    db_conn: sqlite3.Connection,
+    message: Message,
+    placeholder: Message | None,
+    response_text: str,
+    err: bool,
+):
+    """
+    Отправляет готовый текст в чат и кладет его в контекст.
+
+    Первый кусок заменяет заглушку, остальные уходят отдельными ответами.
+
+    :param db_conn: соединение с базой данных
+    :type db_conn: sqlite3.Connection
+    :param message: сообщение пользователя, на которое отвечаем
+    :type message: Message
+    :param placeholder: сообщение-заглушка или None, если ее не удалось отправить
+    :type placeholder: Message | None
+    :param response_text: текст ответа модели или описание ошибки
+    :type response_text: str
+    :param err: True, если вместо ответа модели отправляем ошибку
+    :type err: bool
+    """
+    message_chunks = [
+        chunk
+        for chunk in split_html_message(markdown_to_telegram_html(response_text), 3900)
+        if chunk.strip()
+    ] or [response_text]
+
+    for index, chunk in enumerate(message_chunks):
+        if index == 0:
+            bot_reply = await replace_placeholder(placeholder, message, chunk)
+        else:
+            bot_reply = await message.reply_text(chunk, parse_mode="HTML")
+
+        if len(message_chunks) > 4:
+            time.sleep(10)
+
+        # Ответ модели сохраняем как есть, ошибку - одной короткой пометкой и один раз.
+        if not err:
+            save_message_to_db(db_conn, bot_reply, is_bot=True)
+        elif index == 0:
+            save_message_to_db(
+                db_conn, bot_reply, is_bot=True, content_override=ERROR_CONTEXT_NOTE
+            )
+
+
 async def handle_message(  # pylint: disable=too-many-locals
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
@@ -780,32 +827,7 @@ async def handle_message(  # pylint: disable=too-many-locals
             response_text = f"Произошла ошибка при обращении к нейросети: {e}"
             err = True
 
-        message_chunks = [
-            chunk
-            for chunk in split_html_message(
-                markdown_to_telegram_html(response_text), 3900
-            )
-            if chunk.strip()
-        ] or [response_text]
-
-        for index, chunk in enumerate(message_chunks):
-            if index == 0:
-                bot_reply = await replace_placeholder(placeholder, message, chunk)
-            else:
-                bot_reply = await message.reply_text(chunk, parse_mode="HTML")
-            if len(message_chunks) > 4:
-                time.sleep(10)
-            # Ошибку кладем в контекст одной короткой пометкой, ответ модели - как есть.
-            if err:
-                if index == 0:
-                    save_message_to_db(
-                        db_conn,
-                        bot_reply,
-                        is_bot=True,
-                        content_override=ERROR_CONTEXT_NOTE,
-                    )
-            else:
-                save_message_to_db(db_conn, bot_reply, is_bot=True)
+        await deliver_response(db_conn, message, placeholder, response_text, err)
 
 
 # --- ТОЧКА ВХОДА ---
