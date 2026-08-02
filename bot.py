@@ -20,7 +20,7 @@ import time
 from datetime import datetime, timezone
 
 from google import genai
-from telegram import Message, Update
+from telegram import Message, Update, User
 from telegram.error import TelegramError
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
@@ -237,19 +237,20 @@ def build_author_tag(name: str, username: str | None, date: str) -> str:
     return f"{tag} date:{date}"
 
 
-def build_reply_prefix(bot) -> str:
+def build_reply_prefix(bot_user: User) -> str:
     """
     Готовит затравку - начало будущей реплики бота в формате контекста.
 
     Эту строку мы подставляем последним сообщением роли "model", поэтому модель не
     придумывает служебный префикс заново, а просто продолжает его обычным текстом.
 
-    :param bot: объект бота Telegram, у которого уже известны имя и ник
+    :param bot_user: учетная запись бота - у Bot нет full_name, он есть только у User
+    :type bot_user: User
     :return: префикс вида "[Имя aka ник date:...]: "
     :rtype: str
     """
     now = datetime.now(timezone.utc).replace(microsecond=0)
-    return f"[{build_author_tag(bot.full_name, bot.username, str(now))}]: "
+    return f"[{build_author_tag(bot_user.full_name, bot_user.username, str(now))}]: "
 
 
 def strip_author_tag(text: str) -> str:
@@ -1308,7 +1309,8 @@ async def handle_message(  # pylint: disable=too-many-locals
                 db_conn,
                 context_messages,
                 summary,
-                build_reply_prefix(context.bot),
+                # context.bot.bot - закешированный get_me(), лишнего запроса к API нет.
+                build_reply_prefix(context.bot.bot),
             )
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error("Ошибка при вызове Gemini API: %s", e)
