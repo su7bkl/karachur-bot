@@ -397,8 +397,6 @@ def save_message_to_db(  # pylint: disable=too-many-locals
     """
     cursor = conn.cursor()
     content = message.text or message.caption or ""
-    if not is_bot and content.lower().startswith(TRIGGER_WORD.lower()):
-        content = content[len(TRIGGER_WORD) :]
 
     media_type, mime_type, file_id, file_name = None, None, None, None
 
