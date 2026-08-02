@@ -6,6 +6,9 @@
 в SQLite базе данных и может работать с различными типами медиа-файлов.
 """
 
+# Модуль перерос порог pylint. Разносить его на пакеты - отдельная задача, пока живем так.
+# pylint: disable=too-many-lines
+
 import asyncio
 import configparser
 import logging
@@ -51,6 +54,10 @@ def load_config(config_path="config.cfg"):
         "TRIGGER_WORD": config.get("SETTINGS", "TRIGGER_WORD"),
         "SYSTEM_PROMPT": config.get("SETTINGS", "SYSTEM_PROMPT"),
         "MODEL": config.get("SETTINGS", "MODEL"),
+        # Необязательный параметр: у старых конфигов его нет, поэтому с запасным значением.
+        "MAX_CONTEXT_TOKENS": config.getint(
+            "SETTINGS", "MAX_CONTEXT_TOKENS", fallback=200_000
+        ),
     }
 
     return settings
@@ -66,6 +73,7 @@ MEDIA_DIR = CONFIG["MEDIA_DIR"]
 TRIGGER_WORD = CONFIG["TRIGGER_WORD"]
 SYSTEM_PROMPT = CONFIG["SYSTEM_PROMPT"]
 MODEL = CONFIG["MODEL"]
+MAX_CONTEXT_TOKENS = CONFIG["MAX_CONTEXT_TOKENS"]
 
 # --- НАСТРОЙКИ ПОВТОРНЫХ ПОПЫТОК ---
 # Сколько раз пробуем получить от модели корректный текст, прежде чем сдаться.
@@ -80,11 +88,44 @@ RETRY_DELAY_PATTERN = re.compile(
     r"retry[-_]?delay[\"']?\s*[:=]\s*[\"']?(\d+(?:\.\d+)?)s", re.IGNORECASE
 )
 
+# --- НАСТРОЙКИ СЖАТИЯ КОНТЕКСТА ---
+# Когда история перестает влезать в MAX_CONTEXT_TOKENS, самая старая ее часть уходит
+# модели на пересказ, а пересказ занимает ее место в контексте следующих запросов.
+# Сжимаем с запасом: если целиться ровно в лимит, сжатие будет срабатывать почти на
+# каждое сообщение. Доля от лимита, в которую хотим уложиться после сжатия.
+CONTEXT_TARGET_RATIO = 0.5
+# Столько последних сообщений остаются в контексте дословно при любом сжатии.
+KEEP_RECENT_MESSAGES = 10
+# Больше этого числа проходов сжатия за один ответ не делаем.
+MAX_COMPRESSION_ROUNDS = 3
+# Точный подсчет токенов - лишний запрос к API, поэтому сначала прикидываем размер на
+# глаз и зовем count_tokens, только если грубая оценка подобралась к этой доле лимита.
+TOKEN_CHECK_RATIO = 0.5
+# Кириллица в токенайзере Gemini дает примерно 2-3 символа на токен, берем нижнюю границу.
+CHARS_PER_TOKEN = 2.0
+# Медиа в оценке считаем по верхней границе: недооценка дороже лишнего точного подсчета.
+MEDIA_TOKEN_ESTIMATE = 2000
+
 # --- СЛУЖЕБНЫЕ СООБЩЕНИЯ ---
 # Заглушка, которую бот шлет сразу и потом заменяет готовым ответом.
 GENERATING_PLACEHOLDER = "⏳ Генерирую ответ..."
 # В чат уходит полный текст ошибки, а в контекст модели - только эта короткая пометка.
 ERROR_CONTEXT_NOTE = "ошибка gemini api"
+# Заголовок, под которым сжатая история уходит в контекст следующих запросов.
+SUMMARY_HEADER = "[Сжатый пересказ более ранней части чата]"
+# Задача на сжатие. Уходит первой репликой, чтобы история читалась уже с ней в голове.
+SUMMARY_INSTRUCTION = (
+    "[Служебная задача] Дальше идет начало истории группового чата, которое надо сжать, "
+    "чтобы освободить место в контексте. Перескажи ее связным текстом на русском языке. "
+    "Сохрани: кто участвовал и чем запомнился, о чем договорились, факты об участниках и "
+    "чате, клички, шутки и отсылки, которые всплывают в разговоре, содержание присланных "
+    "файлов и картинок, незакрытые вопросы и обещания. Опусти пустую болтовню и "
+    'приветствия. Пиши по существу, без вступлений вроде "вот пересказ". Не отвечай на '
+    "реплики из истории и не обращайся к участникам: это служебная выжимка для тебя же, "
+    "а не сообщение в чат."
+)
+# Финальная реплика запроса на сжатие: историю уже показали, осталось попросить результат.
+SUMMARY_REQUEST = "Сделай пересказ показанной истории по служебной задаче выше."
 
 # --- СЛУЖЕБНЫЙ ПРЕФИКС АВТОРА ---
 # Каждая реплика уходит в модель с пометкой вида "[Имя aka ник date:...]: ".
@@ -127,11 +168,36 @@ def init_db():
             file_name TEXT,
             timestamp TEXT,
             reply_to_message_id INTEGER,
-            is_bot BOOLEAN DEFAULT 0
+            is_bot BOOLEAN DEFAULT 0,
+            summarized INTEGER DEFAULT 0
         )
     """)
+    # Пересказы сжатых кусков истории. Сами сообщения остаются в messages, но в контекст
+    # больше не попадают: их заменяет последний пересказ.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS context_summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            summary TEXT,
+            covered_messages INTEGER,
+            created_at TEXT
+        )
+    """)
+    add_summarized_column(cursor)
     conn.commit()
     return conn
+
+
+def add_summarized_column(cursor: sqlite3.Cursor):
+    """
+    Дописывает колонку summarized в базы, созданные до появления сжатия.
+
+    :param cursor: курсор открытой базы
+    :type cursor: sqlite3.Cursor
+    """
+    columns = {row[1] for row in cursor.execute("PRAGMA table_info(messages)")}
+    if "summarized" not in columns:
+        cursor.execute("ALTER TABLE messages ADD COLUMN summarized INTEGER DEFAULT 0")
+        logger.info("В таблицу messages добавлена колонка summarized.")
 
 
 def build_author_tag(name: str, username: str | None, date: str) -> str:
@@ -305,23 +371,75 @@ def save_message_to_db(
     return file_id, mime_type, file_name
 
 
-def get_context(conn: sqlite3.Connection):
+def get_latest_summary(conn: sqlite3.Connection) -> str | None:
     """
-    Получает все сообщения из базы данных, отсортированные по времени.
+    Возвращает последний пересказ сжатой части истории.
+
+    Каждый следующий пересказ вбирает в себя предыдущий, поэтому актуален всегда
+    только самый свежий.
+
+    :param conn: соединение с базой данных
+    :type conn: sqlite3.Connection
+    :return: текст пересказа или None, если сжатия еще не было
+    :rtype: str | None
+    """
+    cursor = conn.cursor()
+    cursor.execute("SELECT summary FROM context_summaries ORDER BY id DESC LIMIT 1")
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def save_summary(conn: sqlite3.Connection, summary: str, message_ids: list):
+    """
+    Сохраняет пересказ и помечает вошедшие в него сообщения как сжатые.
+
+    Помечаем поименно, а не по времени последнего сжатого сообщения: сдвиг часов или
+    сообщение, пришедшее с запозданием, увели бы границу по времени не туда, и кусок
+    истории молча выпал бы из контекста.
+
+    :param conn: соединение с базой данных
+    :type conn: sqlite3.Connection
+    :param summary: текст пересказа
+    :type summary: str
+    :param message_ids: message_id сообщений, вошедших в пересказ
+    :type message_ids: list
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO context_summaries (summary, covered_messages, created_at)
+        VALUES (?, ?, ?)
+    """,
+        (summary, len(message_ids), datetime.now(timezone.utc).isoformat()),
+    )
+    cursor.executemany(
+        "UPDATE messages SET summarized = 1 WHERE message_id = ?",
+        [(message_id,) for message_id in message_ids],
+    )
+    conn.commit()
+    logger.info("Сохранен пересказ %d сообщений.", len(message_ids))
+
+
+def get_context(conn: sqlite3.Connection) -> tuple[str | None, list]:
+    """
+    Получает контекст для модели: пересказ старой части истории и сообщения после нее.
+
+    Пока сжатия не было, пересказ пуст и возвращается вся история.
 
     Args:
         conn (sqlite3.Connection): Соединение с базой данных.
 
     Returns:
-        list: Список словарей, содержащих информацию о сообщениях.
+        tuple: (текст пересказа или None, список словарей с информацией о сообщениях).
     """
     cursor = conn.cursor()
-    query = """
-        SELECT * FROM messages ORDER BY timestamp ASC
-    """
-    cursor.execute(query)
+    cursor.execute("""
+        SELECT * FROM messages WHERE summarized = 0
+        ORDER BY timestamp ASC, message_id ASC
+    """)
     columns = [description[0] for description in cursor.description]
-    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    messages = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    return get_latest_summary(conn), messages
 
 
 # --- БЛОК УТИЛИТ ДЛЯ МЕДИА ---
@@ -617,103 +735,126 @@ async def generate_with_retries(client: genai.Client, contents: list) -> str:
     )
 
 
-async def generate_gemini_response(
-    client: genai.Client, context_messages: list, reply_prefix: str
-):
+def build_message_parts(client: genai.Client, msg: dict) -> list:
     """
-    Генерирует ответ с использованием модели Google Gemini AI на основе контекста сообщений.
+    Превращает одно сообщение из БД в части запроса к модели.
 
-    Args:
-        client (genai.GenerativeModel): Клиент Google Gemini AI.
-        context_messages (list): Список сообщений контекста.
-        reply_prefix (str): Затравка - служебный префикс будущей реплики бота.
-
-    Returns:
-        str: Сгенерированный ответ.
+    :param client: клиент ИИ
+    :type client: genai.Client
+    :param msg: строка таблицы messages в виде словаря
+    :type msg: dict
+    :return: список частей (текст плюс медиа, если оно есть)
+    :rtype: list
     """
-    history = []
-    logger.info("Подготовка %d сообщений контекста для Gemini.", len(context_messages))
+    parts = []
+    author = msg.get("username") or ("Bot" if msg.get("is_bot") else "unknown")
+    if msg.get("content"):
+        parts.append(genai.types.Part(text=f"[{author}]: {msg.get('content')}"))
+    else:
+        parts.append(genai.types.Part(text=f"[{author}]"))
 
-    # --- Декомпозиция: вынесем обработку одного сообщения в отдельную функцию ---
+    if msg.get("file_id") and msg.get("mime_type"):
+        raw_path = get_media_path(
+            msg["file_id"], msg["mime_type"], msg.get("file_name")
+        )
+        media_path = os.path.abspath(raw_path) if raw_path else None
+        if media_path and os.path.exists(media_path):
+            try:
+                file_size = os.path.getsize(media_path)
+                if file_size < 20 * 1024 * 1024:
+                    # Проверяем, есть ли файл в кэше и валиден ли он
+                    check_file_validity(client, media_path)
 
-    def process_context_message(msg):
-        parts = []
-        author = msg.get("username") or ("Bot" if msg.get("is_bot") else "unknown")
-        if msg.get("content"):
-            parts.append(genai.types.Part(text=f"[{author}]: {msg.get('content')}"))
-        else:
-            parts.append(genai.types.Part(text=f"[{author}]"))
+                    # Загрузка, если файла нет в кэше (или он был удален выше)
+                    if media_path not in uploaded_files:
+                        upload_file(client, media_path)
 
-        if msg.get("file_id") and msg.get("mime_type"):
-            raw_path = get_media_path(
-                msg["file_id"], msg["mime_type"], msg.get("file_name")
-            )
-            media_path = os.path.abspath(raw_path) if raw_path else None
-            if media_path and os.path.exists(media_path):
-                try:
-                    file_size = os.path.getsize(media_path)
-                    if file_size < 20 * 1024 * 1024:
-                        # Проверяем, есть ли файл в кэше и валиден ли он
-                        check_file_validity(client, media_path)
-
-                        # Загрузка, если файла нет в кэше (или он был удален выше)
-                        if media_path not in uploaded_files:
-                            upload_file(client, media_path)
-
-                        # Если файл успешно загружен и активен
-                        if media_path in uploaded_files:
-                            parts.append(
-                                genai.types.Part(
-                                    file_data=genai.types.FileData(
-                                        file_uri=uploaded_files[media_path].uri,
-                                        mime_type=uploaded_files[media_path].mime_type,
-                                    )
-                                )
-                            )
-                        else:
-                            parts.append(
-                                genai.types.Part(
-                                    text="[Ошибка обработки файла - не удалось активировать]"
-                                )
-                            )
-                    else:
-                        logger.warning(
-                            "Файл %s слишком большой (%.2f МБ), пропускаем",
-                            media_path,
-                            file_size / 1024 / 1024,
-                        )
+                    # Если файл успешно загружен и активен
+                    if media_path in uploaded_files:
                         parts.append(
                             genai.types.Part(
-                                text="[Файл слишком большой для обработки - пропущено]"
+                                file_data=genai.types.FileData(
+                                    file_uri=uploaded_files[media_path].uri,
+                                    mime_type=uploaded_files[media_path].mime_type,
+                                )
                             )
                         )
-                except Exception as e:  # pylint: disable=broad-exception-caught
-                    logger.error(
-                        "Ошибка при работе с медиафайлом %s: %s",
+                    else:
+                        parts.append(
+                            genai.types.Part(
+                                text="[Ошибка обработки файла - не удалось активировать]"
+                            )
+                        )
+                else:
+                    logger.warning(
+                        "Файл %s слишком большой (%.2f МБ), пропускаем",
                         media_path,
-                        e,
+                        file_size / 1024 / 1024,
                     )
-        return parts
+                    parts.append(
+                        genai.types.Part(
+                            text="[Файл слишком большой для обработки - пропущено]"
+                        )
+                    )
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                logger.error(
+                    "Ошибка при работе с медиафайлом %s: %s",
+                    media_path,
+                    e,
+                )
+    return parts
 
+
+def build_history(client: genai.Client, context_messages: list) -> list:
+    """
+    Готовит историю переписки в виде реплик для модели.
+
+    Рядом с ролью и частями кладем исходную строку БД: по ней сжатие потом определяет,
+    на каком сообщении провести границу.
+
+    :param client: клиент ИИ
+    :type client: genai.Client
+    :param context_messages: список сообщений контекста
+    :type context_messages: list
+    :return: список словарей вида {"role", "parts", "source"}
+    :rtype: list
+    """
+    history = []
     for msg in context_messages:
-        parts = process_context_message(msg)
+        parts = build_message_parts(client, msg)
         if parts:
             role = "model" if msg.get("is_bot") else "user"
-            history.append({"role": role, "parts": parts})
+            history.append({"role": role, "parts": parts, "source": msg})
+    return history
 
-    if not history:
-        logger.warning("Контекст для Gemini пуст. Отмена запроса.")
-        return "Не могу обработать пустой запрос."
 
-    # Создаем содержимое для генерации
-    contents = []
+def build_contents(history: list, summary: str | None, reply_prefix: str) -> list:
+    """
+    Собирает итоговый запрос: системный промпт, пересказ, история и затравка.
 
-    # Добавляем системный промпт
-    contents.append(
+    :param history: история переписки от build_history (непустая)
+    :type history: list
+    :param summary: пересказ сжатой части истории или None
+    :type summary: str | None
+    :param reply_prefix: затравка - служебный префикс будущей реплики бота
+    :type reply_prefix: str
+    :return: содержимое запроса к модели
+    :rtype: list
+    """
+    contents = [
         genai.types.ContentDict(
             role="user", parts=[genai.types.PartDict(text=SYSTEM_PROMPT)]
         )
-    )
+    ]
+
+    # Сжатая часть истории идет перед дословными сообщениями, в хронологическом порядке.
+    if summary:
+        contents.append(
+            genai.types.ContentDict(
+                role="user",
+                parts=[genai.types.PartDict(text=f"{SUMMARY_HEADER}\n{summary}")],
+            )
+        )
 
     # Добавляем историю сообщений
     for entry in history[:-1]:
@@ -731,6 +872,258 @@ async def generate_gemini_response(
             role="model", parts=[genai.types.PartDict(text=reply_prefix)]
         )
     )
+
+    return contents
+
+
+# --- БЛОК СЖАТИЯ КОНТЕКСТА ---
+
+
+def estimate_entry_tokens(entry: dict) -> float:
+    """
+    Грубо оценивает размер одной реплики в токенах.
+
+    :param entry: реплика из build_history
+    :type entry: dict
+    :return: примерное число токенов
+    :rtype: float
+    """
+    total = 0.0
+    for part in entry["parts"]:
+        text = getattr(part, "text", None)
+        total += len(text) / CHARS_PER_TOKEN if text else MEDIA_TOKEN_ESTIMATE
+    return total
+
+
+def estimate_context_tokens(history: list, summary: str | None) -> float:
+    """
+    Грубо оценивает размер всего контекста, чтобы не дергать API на каждое сообщение.
+
+    :param history: история переписки от build_history
+    :type history: list
+    :param summary: пересказ сжатой части истории или None
+    :type summary: str | None
+    :return: примерное число токенов
+    :rtype: float
+    """
+    total = len(SYSTEM_PROMPT) / CHARS_PER_TOKEN
+    if summary:
+        total += len(summary) / CHARS_PER_TOKEN
+    return total + sum(estimate_entry_tokens(entry) for entry in history)
+
+
+async def count_context_tokens(client: genai.Client, contents: list) -> int | None:
+    """
+    Считает точный размер запроса токенайзером Gemini.
+
+    :param client: клиент ИИ
+    :type client: genai.Client
+    :param contents: подготовленное содержимое запроса
+    :type contents: list
+    :return: число токенов или None, если посчитать не вышло
+    :rtype: int | None
+    """
+    try:
+        # Вызов синхронный, уводим его в поток, чтобы не морозить event loop.
+        response = await asyncio.to_thread(
+            client.models.count_tokens, model=MODEL, contents=contents
+        )
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.warning("Не удалось посчитать токены контекста: %s", e)
+        return None
+    return getattr(response, "total_tokens", None)
+
+
+def choose_cut_index(history: list, total_tokens: int) -> int:
+    """
+    Решает, сколько самых старых реплик отправить в пересказ.
+
+    Отрезаем не половину наугад, а столько, чтобы остаток уложился в целевую долю
+    лимита. Вес реплик берем оценочный: точные размеры кусков нам взять неоткуда,
+    а промах компенсирует повторный проход сжатия.
+
+    :param history: история переписки от build_history
+    :type history: list
+    :param total_tokens: точный размер контекста, который не влез в лимит
+    :type total_tokens: int
+    :return: сколько реплик с начала истории надо сжать (0 - сжимать нечего)
+    :rtype: int
+    """
+    weights = [estimate_entry_tokens(entry) for entry in history]
+    keep_weight = sum(weights) * (
+        MAX_CONTEXT_TOKENS * CONTEXT_TARGET_RATIO / total_tokens
+    )
+
+    # Идем с конца и набираем хвост, который оставляем дословно.
+    tail_weight = 0.0
+    cut = len(history)
+    for index in range(len(history) - 1, -1, -1):
+        if tail_weight + weights[index] > keep_weight:
+            break
+        tail_weight += weights[index]
+        cut = index
+
+    # Свежие реплики не сжимаем никогда, даже если одна из них весит больше лимита.
+    return min(cut, max(len(history) - KEEP_RECENT_MESSAGES, 0))
+
+
+async def summarize_history(
+    client: genai.Client, entries: list, previous_summary: str | None
+) -> str:
+    """
+    Просит модель пересказать кусок истории одним текстом.
+
+    Предыдущий пересказ идет в запрос вместе с историей, чтобы он не потерялся:
+    новый пересказ заменяет его целиком.
+
+    :param client: клиент ИИ
+    :type client: genai.Client
+    :param entries: реплики, которые надо сжать
+    :type entries: list
+    :param previous_summary: прошлый пересказ или None, если сжимаем впервые
+    :type previous_summary: str | None
+    :return: текст нового пересказа
+    :rtype: str
+    :raises GeminiRetryError: если модель так и не ответила
+    """
+    contents = [
+        genai.types.ContentDict(
+            role="user", parts=[genai.types.PartDict(text=SUMMARY_INSTRUCTION)]
+        )
+    ]
+    if previous_summary:
+        contents.append(
+            genai.types.ContentDict(
+                role="user",
+                parts=[
+                    genai.types.PartDict(text=f"{SUMMARY_HEADER}\n{previous_summary}")
+                ],
+            )
+        )
+    for entry in entries:
+        contents.append(
+            genai.types.ContentDict(role=entry["role"], parts=entry["parts"])
+        )
+    contents.append(
+        genai.types.ContentDict(
+            role="user", parts=[genai.types.PartDict(text=SUMMARY_REQUEST)]
+        )
+    )
+
+    logger.info("Сжимаем %d самых старых сообщений в пересказ...", len(entries))
+    return (await generate_with_retries(client, contents)).strip()
+
+
+async def compress_context(
+    client: genai.Client,
+    conn: sqlite3.Connection,
+    history: list,
+    summary: str | None,
+    reply_prefix: str,
+) -> list:
+    """
+    Ужимает контекст до лимита и возвращает готовое содержимое запроса.
+
+    Пока запрос не влезает в MAX_CONTEXT_TOKENS, самая старая часть истории уходит
+    модели на пересказ, пересказ попадает в БД и занимает ее место. Один проход не
+    всегда доводит до цели (пересказ тоже занимает место), поэтому проходов может
+    быть несколько.
+
+    Сжатие - это оптимизация, а не обязательный шаг: если посчитать токены или
+    получить пересказ не вышло, отправляем контекст как есть и даем разбираться
+    обычному механизму повторов.
+
+    :param client: клиент ИИ
+    :type client: genai.Client
+    :param conn: соединение с базой данных
+    :type conn: sqlite3.Connection
+    :param history: история переписки от build_history (непустая)
+    :type history: list
+    :param summary: пересказ сжатой ранее части истории или None
+    :type summary: str | None
+    :param reply_prefix: затравка - служебный префикс будущей реплики бота
+    :type reply_prefix: str
+    :return: содержимое запроса, влезающее в лимит (или максимально к нему близкое)
+    :rtype: list
+    """
+    contents = build_contents(history, summary, reply_prefix)
+
+    # Дешевая прикидка на входе: обычный чат до лимита не дотягивает, и тратить на него
+    # лишний запрос к API незачем. Дальше по кругу идем уже только с точным подсчетом -
+    # ошибись прикидка, и сжатие остановилось бы, не дойдя до лимита.
+    if estimate_context_tokens(history, summary) < (
+        MAX_CONTEXT_TOKENS * TOKEN_CHECK_RATIO
+    ):
+        return contents
+
+    for _ in range(MAX_COMPRESSION_ROUNDS):
+        total_tokens = await count_context_tokens(client, contents)
+        if total_tokens is None:
+            return contents
+        if total_tokens <= MAX_CONTEXT_TOKENS:
+            logger.info("Контекст: %d токенов из %d.", total_tokens, MAX_CONTEXT_TOKENS)
+            return contents
+
+        cut = choose_cut_index(history, total_tokens)
+        if cut <= 0:
+            logger.warning(
+                "Контекст (%d токенов) больше лимита %d, но сжимать уже нечего.",
+                total_tokens,
+                MAX_CONTEXT_TOKENS,
+            )
+            return contents
+
+        logger.info(
+            "Контекст разросся до %d токенов при лимите %d, сжимаем.",
+            total_tokens,
+            MAX_CONTEXT_TOKENS,
+        )
+        try:
+            summary = await summarize_history(client, history[:cut], summary)
+        except GeminiRetryError as e:
+            logger.error("Не удалось сжать контекст, отправляем как есть: %s", e)
+            return contents
+
+        save_summary(
+            conn, summary, [entry["source"]["message_id"] for entry in history[:cut]]
+        )
+        history = history[cut:]
+        contents = build_contents(history, summary, reply_prefix)
+
+    logger.warning(
+        "Контекст не уложился в лимит за %d проходов.", MAX_COMPRESSION_ROUNDS
+    )
+    return contents
+
+
+async def generate_gemini_response(
+    client: genai.Client,
+    conn: sqlite3.Connection,
+    context_messages: list,
+    summary: str | None,
+    reply_prefix: str,
+):
+    """
+    Генерирует ответ с использованием модели Google Gemini AI на основе контекста сообщений.
+
+    Args:
+        client (genai.GenerativeModel): Клиент Google Gemini AI.
+        conn (sqlite3.Connection): Соединение с БД - нужно, чтобы сохранить пересказ.
+        context_messages (list): Список сообщений контекста.
+        summary (str | None): Пересказ сжатой ранее части истории.
+        reply_prefix (str): Затравка - служебный префикс будущей реплики бота.
+
+    Returns:
+        str: Сгенерированный ответ.
+    """
+    logger.info("Подготовка %d сообщений контекста для Gemini.", len(context_messages))
+    history = build_history(client, context_messages)
+
+    if not history:
+        logger.warning("Контекст для Gemini пуст. Отмена запроса.")
+        return "Не могу обработать пустой запрос."
+
+    contents = await compress_context(client, conn, history, summary, reply_prefix)
 
     logger.info("Отправка запроса в Gemini...")
 
@@ -869,11 +1262,13 @@ async def handle_message(  # pylint: disable=too-many-locals
             await download_media_file(context.application, file_id, file_path)
 
     if triggered_by_text or bool(message.voice):
-        context_messages = get_context(db_conn)
+        summary, context_messages = get_context(db_conn)
         gemini_client = context.bot_data["gemini_client"]
 
         if bool(message.voice) and not triggered_by_text:
+            # Расшифровке чужая история не нужна - ни сообщения, ни пересказ.
             context_messages = context_messages[-1:]
+            summary = None
             if (
                 context_messages
                 and context_messages[-1].get("message_id") == message.message_id
@@ -887,7 +1282,11 @@ async def handle_message(  # pylint: disable=too-many-locals
 
         try:
             response_text = await generate_gemini_response(
-                gemini_client, context_messages, build_reply_prefix(context.bot)
+                gemini_client,
+                db_conn,
+                context_messages,
+                summary,
+                build_reply_prefix(context.bot),
             )
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error("Ошибка при вызове Gemini API: %s", e)
