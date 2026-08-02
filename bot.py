@@ -54,10 +54,11 @@ def load_config(config_path="config.cfg"):
         "TRIGGER_WORD": config.get("SETTINGS", "TRIGGER_WORD"),
         "SYSTEM_PROMPT": config.get("SETTINGS", "SYSTEM_PROMPT"),
         "MODEL": config.get("SETTINGS", "MODEL"),
-        # Необязательный параметр: у старых конфигов его нет, поэтому с запасным значением.
+        # Необязательные параметры: у старых конфигов их нет, поэтому с запасными значениями.
         "MAX_CONTEXT_TOKENS": config.getint(
             "SETTINGS", "MAX_CONTEXT_TOKENS", fallback=200_000
         ),
+        "GOOGLE_SEARCH": config.getboolean("SETTINGS", "GOOGLE_SEARCH", fallback=True),
     }
 
     return settings
@@ -74,6 +75,20 @@ TRIGGER_WORD = CONFIG["TRIGGER_WORD"]
 SYSTEM_PROMPT = CONFIG["SYSTEM_PROMPT"]
 MODEL = CONFIG["MODEL"]
 MAX_CONTEXT_TOKENS = CONFIG["MAX_CONTEXT_TOKENS"]
+GOOGLE_SEARCH = CONFIG["GOOGLE_SEARCH"]
+
+# --- ПОИСК В ГУГЛЕ ---
+# Инструмент поиска модель вызывает сама, на своей стороне: решает, нужны ли ей свежие
+# данные, ищет и отвечает уже с их учетом. Нам возвращается обычный текст.
+# Ставим его только на ответы в чат: пересказу истории искать нечего, там весь материал
+# уже лежит в запросе.
+REPLY_CONFIG = (
+    genai.types.GenerateContentConfig(
+        tools=[genai.types.Tool(google_search=genai.types.GoogleSearch())]
+    )
+    if GOOGLE_SEARCH
+    else None
+)
 
 # --- НАСТРОЙКИ ПОВТОРНЫХ ПОПЫТОК ---
 # Сколько раз пробуем получить от модели корректный текст, прежде чем сдаться.
@@ -669,7 +684,9 @@ def extract_response_text(response) -> tuple[str | None, str, bool]:
     return None, f"модель вернула пустой текст (finish_reason={finish})", True
 
 
-async def generate_with_retries(client: genai.Client, contents: list) -> str:
+async def generate_with_retries(
+    client: genai.Client, contents: list, config=None
+) -> str:
     """
     Запрашивает ответ у Gemini, повторяя попытки при сбоях и пустых ответах.
 
@@ -681,6 +698,8 @@ async def generate_with_retries(client: genai.Client, contents: list) -> str:
     :type client: genai.Client
     :param contents: подготовленное содержимое запроса
     :type contents: list
+    :param config: настройки генерации (инструменты и прочее) или None
+    :type config: genai.types.GenerateContentConfig | None
     :return: текст ответа модели
     :rtype: str
     :raises GeminiRetryError: если попытки исчерпаны
@@ -692,7 +711,10 @@ async def generate_with_retries(client: genai.Client, contents: list) -> str:
         try:
             # Вызов синхронный, уводим его в поток, чтобы не морозить event loop.
             response = await asyncio.to_thread(
-                client.models.generate_content, model=MODEL, contents=contents
+                client.models.generate_content,
+                model=MODEL,
+                contents=contents,
+                config=config,
             )
         except Exception as e:  # pylint: disable=broad-exception-caught
             if not is_retryable_error(e):
@@ -1128,7 +1150,7 @@ async def generate_gemini_response(
     logger.info("Отправка запроса в Gemini...")
 
     # Генерируем ответ с новым API, повторяя попытки при сбоях
-    response_text = await generate_with_retries(client, contents)
+    response_text = await generate_with_retries(client, contents, REPLY_CONFIG)
     return strip_author_tag(response_text)
 
 
@@ -1324,6 +1346,7 @@ def main():
         MessageHandler(filters.ALL & ~filters.COMMAND, handle_message)
     )
 
+    logger.info("Поиск в Гугле %s.", "включен" if GOOGLE_SEARCH else "выключен")
     logger.info("Бот запускается...")
     application.run_polling()
 
