@@ -152,6 +152,24 @@ SUMMARY_REQUEST = "Сделай пересказ показанной истор
 # Страховка на случай, если модель все же начнет ответ с копии пометки.
 AUTHOR_TAG_PATTERN = re.compile(r"^\s*\[[^\]\n]*?date:[^\]\n]*\]\s*:?[ \t]*")
 
+# --- СЛУЖЕБНАЯ ПОМЕТКА ОБ ОТВЕТЕ ---
+# В контексте реплика-ответ оторвана от своего адресата: между ними может лежать сколько
+# угодно чужих сообщений, а сам адресат - уже уйти в пересказ. Поэтому перед текстом такой
+# реплики идет пометка с автором и началом того сообщения, на которое отвечают, и с
+# выделенным фрагментом, если отвечающий процитировал кусок текста. Свои прошлые ответы
+# модель, как и раньше, видит вообще без служебных пометок.
+REPLY_NOTE_LEAD = "В ответ на"
+QUOTE_NOTE_LEAD = "Процитирован фрагмент"
+# Сколько символов сообщения-адресата показываем: пометка должна давать его опознать,
+# а не пересказывать целиком - иначе популярное сообщение размножится по всему контексту.
+REPLY_SNIPPET_LIMIT = 300
+# Цитату Telegram режет на своей стороне (около 1024 символов), порог тут - страховка.
+QUOTE_SNIPPET_LIMIT = 1024
+# Страховка на случай, если модель начнет ответ с копии пометки.
+REPLY_NOTE_PATTERN = re.compile(
+    rf"^\s*\[(?:{REPLY_NOTE_LEAD}|{QUOTE_NOTE_LEAD})[^\n]*\]\s*"
+)
+
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -185,6 +203,7 @@ def init_db():
             file_name TEXT,
             timestamp TEXT,
             reply_to_message_id INTEGER,
+            quote_text TEXT,
             is_bot BOOLEAN DEFAULT 0,
             summarized INTEGER DEFAULT 0
         )
@@ -199,22 +218,30 @@ def init_db():
             created_at TEXT
         )
     """)
-    add_summarized_column(cursor)
+    add_missing_columns(cursor)
     conn.commit()
     return conn
 
 
-def add_summarized_column(cursor: sqlite3.Cursor):
+# Колонки messages, которых нет в базах, созданных прошлыми версиями бота.
+LATE_MESSAGE_COLUMNS = {
+    "summarized": "INTEGER DEFAULT 0",
+    "quote_text": "TEXT",
+}
+
+
+def add_missing_columns(cursor: sqlite3.Cursor):
     """
-    Дописывает колонку summarized в базы, созданные до появления сжатия.
+    Дописывает в messages колонки, появившиеся после создания базы.
 
     :param cursor: курсор открытой базы
     :type cursor: sqlite3.Cursor
     """
     columns = {row[1] for row in cursor.execute("PRAGMA table_info(messages)")}
-    if "summarized" not in columns:
-        cursor.execute("ALTER TABLE messages ADD COLUMN summarized INTEGER DEFAULT 0")
-        logger.info("В таблицу messages добавлена колонка summarized.")
+    for name, definition in LATE_MESSAGE_COLUMNS.items():
+        if name not in columns:
+            cursor.execute(f"ALTER TABLE messages ADD COLUMN {name} {definition}")
+            logger.info("В таблицу messages добавлена колонка %s.", name)
 
 
 def build_author_tag(name: str, username: str | None, date: str) -> str:
@@ -252,7 +279,103 @@ def strip_author_tag(text: str) -> str:
     return cleaned.lstrip() if replaced else text
 
 
-def save_message_to_db(
+def strip_reply_note(text: str) -> str:
+    """
+    Срезает служебную пометку об ответе, если модель все же продублировала ее.
+
+    :param text: текст ответа модели
+    :type text: str
+    :return: текст без ведущей пометки об ответе
+    :rtype: str
+    """
+    cleaned, replaced = REPLY_NOTE_PATTERN.subn("", text, count=1)
+    return cleaned.lstrip() if replaced else text
+
+
+def strip_service_prefixes(text: str) -> str:
+    """
+    Убирает из начала ответа модели служебную разметку контекста.
+
+    :param text: текст ответа модели
+    :type text: str
+    :return: текст без ведущих служебных пометок
+    :rtype: str
+    """
+    return strip_author_tag(strip_reply_note(text))
+
+
+def shorten(text: str, limit: int) -> str:
+    """
+    Сжимает текст в одну строку и обрезает до предела.
+
+    Одна строка нужна, чтобы служебная пометка не разъезжалась на несколько строк и
+    не путалась с настоящим текстом реплики.
+
+    :param text: исходный текст
+    :type text: str
+    :param limit: сколько символов оставить
+    :type limit: int
+    :return: однострочный текст не длиннее предела
+    :rtype: str
+    """
+    single_line = " ".join(text.split())
+    if len(single_line) <= limit:
+        return single_line
+    return single_line[:limit].rstrip() + "…"
+
+
+def describe_reply_target(target: dict | None) -> str:
+    """
+    Описывает сообщение, на которое отвечают: чье оно и с чего начиналось.
+
+    :param target: строка таблицы messages в виде словаря или None, если адресата
+        не нашлось в базе
+    :type target: dict | None
+    :return: описание адресата для служебной пометки
+    :rtype: str
+    """
+    if target is None:
+        # Отвечать могут и на сообщение старше бота: его в базе нет и уже не будет.
+        return "сообщение, которого нет в истории"
+
+    author = (
+        "бота" if target.get("is_bot") else f'"{target.get("username") or "unknown"}"'
+    )
+    snippet = shorten(target.get("content") or "", REPLY_SNIPPET_LIMIT)
+    description = f"сообщение {author}"
+    if snippet:
+        description += f": «{snippet}»"
+    media_type = target.get("media_type")
+    if media_type:
+        description += f" [вложение: {media_type}]"
+    return description
+
+
+def build_reply_note(msg: dict) -> str | None:
+    """
+    Собирает служебную пометку о том, чему отвечает реплика.
+
+    Цитата идет отдельным куском: она показывает, какую именно часть сообщения выделил
+    отвечающий, и приходит даже тогда, когда самого адресата в чате нет (цитата из
+    другого чата приезжает без reply_to_message_id).
+
+    :param msg: строка таблицы messages в виде словаря; адресат должен быть уже подложен
+        в ключ "reply_target" (см. attach_reply_targets)
+    :type msg: dict
+    :return: пометка в квадратных скобках или None, если реплика ни на что не отвечает
+    :rtype: str | None
+    """
+    notes = []
+    if msg.get("reply_to_message_id"):
+        target = describe_reply_target(msg.get("reply_target"))
+        notes.append(f"{REPLY_NOTE_LEAD} {target}")
+    quote = shorten(msg.get("quote_text") or "", QUOTE_SNIPPET_LIMIT)
+    if quote:
+        notes.append(f"{QUOTE_NOTE_LEAD}: «{quote}»")
+    return f"[{'. '.join(notes)}]" if notes else None
+
+
+def save_message_to_db(  # pylint: disable=too-many-locals
     conn: sqlite3.Connection,
     message: Message,
     is_bot: bool = False,
@@ -331,6 +454,9 @@ def save_message_to_db(
     reply_to_id = (
         message.reply_to_message.message_id if message.reply_to_message else None
     )
+    # Фрагмент, который отвечающий выделил в чужом сообщении. Есть и у цитат из других
+    # чатов - там это единственный след того, чему отвечали: reply_to_message_id пуст.
+    quote_text = message.quote.text if message.quote else None
     user_id = message.from_user.id if message.from_user else None
     if message.from_user:
         date = (
@@ -350,8 +476,9 @@ def save_message_to_db(
         """
         INSERT OR REPLACE INTO messages (
             message_id, chat_id, user_id, username, content, media_type,
-            mime_type, file_id, file_name, timestamp, reply_to_message_id, is_bot
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            mime_type, file_id, file_name, timestamp, reply_to_message_id,
+            quote_text, is_bot
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """,
         (
             message.message_id,
@@ -365,6 +492,7 @@ def save_message_to_db(
             file_name,
             timestamp,
             reply_to_id,
+            quote_text,
             is_bot,
         ),
     )
@@ -422,6 +550,43 @@ def save_summary(conn: sqlite3.Connection, summary: str, message_ids: list):
     logger.info("Сохранен пересказ %d сообщений.", len(message_ids))
 
 
+def attach_reply_targets(conn: sqlite3.Connection, messages: list):
+    """
+    Подкладывает к каждой реплике-ответу сообщение, которому она отвечает.
+
+    Ищем по всей таблице, а не по переданному куску истории: адресат мог остаться далеко
+    позади и уже уйти в пересказ, но пометка о нем все равно нужна.
+
+    :param conn: соединение с базой данных
+    :type conn: sqlite3.Connection
+    :param messages: сообщения контекста; в отвечающие добавляется ключ "reply_target"
+        со строкой адресата или None, если такого сообщения в базе нет
+    :type messages: list
+    """
+    target_ids = {
+        msg["reply_to_message_id"] for msg in messages if msg.get("reply_to_message_id")
+    }
+    if not target_ids:
+        return
+
+    cursor = conn.cursor()
+    # В строку запроса подставляем только число "?" - сами идентификаторы идут параметрами.
+    cursor.execute(
+        f"SELECT * FROM messages WHERE message_id IN ({','.join('?' * len(target_ids))})",
+        tuple(target_ids),
+    )
+    columns = [description[0] for description in cursor.description]
+    targets = {}
+    for row in cursor.fetchall():
+        target = dict(zip(columns, row))
+        targets[target["message_id"]] = target
+
+    for msg in messages:
+        reply_to_id = msg.get("reply_to_message_id")
+        if reply_to_id:
+            msg["reply_target"] = targets.get(reply_to_id)
+
+
 def get_context(conn: sqlite3.Connection) -> tuple[str | None, list]:
     """
     Получает контекст для модели: пересказ старой части истории и сообщения после нее.
@@ -432,7 +597,8 @@ def get_context(conn: sqlite3.Connection) -> tuple[str | None, list]:
         conn (sqlite3.Connection): Соединение с базой данных.
 
     Returns:
-        tuple: (текст пересказа или None, список словарей с информацией о сообщениях).
+        tuple: (текст пересказа или None, список словарей с информацией о сообщениях;
+        у реплик-ответов в ключе "reply_target" лежит сообщение, которому они отвечают).
     """
     cursor = conn.cursor()
     cursor.execute("""
@@ -441,6 +607,7 @@ def get_context(conn: sqlite3.Connection) -> tuple[str | None, list]:
     """)
     columns = [description[0] for description in cursor.description]
     messages = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    attach_reply_targets(conn, messages)
     return get_latest_summary(conn), messages
 
 
@@ -758,16 +925,14 @@ def build_message_parts(client: genai.Client, msg: dict) -> list:
     parts = []
     content = msg.get("content")
     if msg.get("is_bot"):
-        # Свои реплики модель получает без служебной пометки, чтобы не копировать ее
+        # Свои реплики модель получает без служебных пометок, чтобы не копировать их
         # в новые ответы: роль "model" и так говорит, чьи это слова.
         parts.append(genai.types.Part(text=content or "[Пустой ответ]"))
     else:
         author = msg.get("username") or "unknown"
-        parts.append(
-            genai.types.Part(
-                text=f"[{author}]: {content}" if content else f"[{author}]"
-            )
-        )
+        text = f"[{author}]: {content}" if content else f"[{author}]"
+        note = build_reply_note(msg)
+        parts.append(genai.types.Part(text=f"{note}\n{text}" if note else text))
 
     if msg.get("file_id") and msg.get("mime_type"):
         raw_path = get_media_path(
@@ -1132,7 +1297,7 @@ async def generate_gemini_response(
 
     # Генерируем ответ с новым API, повторяя попытки при сбоях
     response_text = await generate_with_retries(client, contents, REPLY_CONFIG)
-    return strip_author_tag(response_text)
+    return strip_service_prefixes(response_text)
 
 
 # --- ГЛАВНЫЙ ОБРАЗОВАТЕЛЬ TELEGRAM ---
