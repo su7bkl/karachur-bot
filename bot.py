@@ -20,7 +20,7 @@ import time
 from datetime import datetime, timezone
 
 from google import genai
-from telegram import Message, Update, User
+from telegram import Message, Update
 from telegram.error import TelegramError
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
@@ -143,10 +143,12 @@ SUMMARY_INSTRUCTION = (
 SUMMARY_REQUEST = "Сделай пересказ показанной истории по служебной задаче выше."
 
 # --- СЛУЖЕБНЫЙ ПРЕФИКС АВТОРА ---
-# Каждая реплика уходит в модель с пометкой вида "[Имя aka ник date:...]: ".
-# Свои прошлые ответы модель видит с такой же пометкой и копирует ее в новый ответ.
-# Лечим не запретом, а затравкой: пометку для будущей реплики бот пишет сам, модели
-# остается только продолжить строку обычным текстом.
+# Чужие реплики уходят в модель с пометкой вида "[Имя aka ник date:...]: " - без нее в
+# групповом чате не разобрать, кто что сказал. Свои прошлые ответы модель видит уже без
+# пометки: роль "model" и так говорит, чьи они, а с пометкой модель копировала ее в
+# начало нового ответа. Затравкой - незакрытой репликой роли "model" - эту проблему
+# лечить нельзя: запрос, который заканчивается репликой модели, Gemini отклоняет
+# неустранимой ошибкой 400.
 # Страховка на случай, если модель все же начнет ответ с копии пометки.
 AUTHOR_TAG_PATTERN = re.compile(r"^\s*\[[^\]\n]*?date:[^\]\n]*\]\s*:?[ \t]*")
 
@@ -235,22 +237,6 @@ def build_author_tag(name: str, username: str | None, date: str) -> str:
     if username:
         tag += f" aka {username}"
     return f"{tag} date:{date}"
-
-
-def build_reply_prefix(bot_user: User) -> str:
-    """
-    Готовит затравку - начало будущей реплики бота в формате контекста.
-
-    Эту строку мы подставляем последним сообщением роли "model", поэтому модель не
-    придумывает служебный префикс заново, а просто продолжает его обычным текстом.
-
-    :param bot_user: учетная запись бота - у Bot нет full_name, он есть только у User
-    :type bot_user: User
-    :return: префикс вида "[Имя aka ник date:...]: "
-    :rtype: str
-    """
-    now = datetime.now(timezone.utc).replace(microsecond=0)
-    return f"[{build_author_tag(bot_user.full_name, bot_user.username, str(now))}]: "
 
 
 def strip_author_tag(text: str) -> str:
@@ -770,11 +756,18 @@ def build_message_parts(client: genai.Client, msg: dict) -> list:
     :rtype: list
     """
     parts = []
-    author = msg.get("username") or ("Bot" if msg.get("is_bot") else "unknown")
-    if msg.get("content"):
-        parts.append(genai.types.Part(text=f"[{author}]: {msg.get('content')}"))
+    content = msg.get("content")
+    if msg.get("is_bot"):
+        # Свои реплики модель получает без служебной пометки, чтобы не копировать ее
+        # в новые ответы: роль "model" и так говорит, чьи это слова.
+        parts.append(genai.types.Part(text=content or "[Пустой ответ]"))
     else:
-        parts.append(genai.types.Part(text=f"[{author}]"))
+        author = msg.get("username") or "unknown"
+        parts.append(
+            genai.types.Part(
+                text=f"[{author}]: {content}" if content else f"[{author}]"
+            )
+        )
 
     if msg.get("file_id") and msg.get("mime_type"):
         raw_path = get_media_path(
@@ -851,16 +844,17 @@ def build_history(client: genai.Client, context_messages: list) -> list:
     return history
 
 
-def build_contents(history: list, summary: str | None, reply_prefix: str) -> list:
+def build_contents(history: list, summary: str | None) -> list:
     """
-    Собирает итоговый запрос: системный промпт, пересказ, история и затравка.
+    Собирает итоговый запрос: системный промпт, пересказ и история.
+
+    Последняя реплика запроса всегда пользовательская: запрос, который заканчивается
+    репликой роли "model", Gemini отклоняет неустранимой ошибкой 400.
 
     :param history: история переписки от build_history (непустая)
     :type history: list
     :param summary: пересказ сжатой части истории или None
     :type summary: str | None
-    :param reply_prefix: затравка - служебный префикс будущей реплики бота
-    :type reply_prefix: str
     :return: содержимое запроса к модели
     :rtype: list
     """
@@ -886,15 +880,6 @@ def build_contents(history: list, summary: str | None, reply_prefix: str) -> lis
         )
 
     contents.append(genai.types.ContentDict(role="user", parts=history[-1]["parts"]))
-
-    # Затравка: незакрытая реплика бота, которую модель должна продолжить. Служебный
-    # префикс уже написан нами и в ответ модели не попадает, так что копировать его
-    # в начало текста ей больше незачем.
-    contents.append(
-        genai.types.ContentDict(
-            role="model", parts=[genai.types.PartDict(text=reply_prefix)]
-        )
-    )
 
     return contents
 
@@ -1042,7 +1027,6 @@ async def compress_context(
     conn: sqlite3.Connection,
     history: list,
     summary: str | None,
-    reply_prefix: str,
 ) -> list:
     """
     Ужимает контекст до лимита и возвращает готовое содержимое запроса.
@@ -1064,12 +1048,10 @@ async def compress_context(
     :type history: list
     :param summary: пересказ сжатой ранее части истории или None
     :type summary: str | None
-    :param reply_prefix: затравка - служебный префикс будущей реплики бота
-    :type reply_prefix: str
     :return: содержимое запроса, влезающее в лимит (или максимально к нему близкое)
     :rtype: list
     """
-    contents = build_contents(history, summary, reply_prefix)
+    contents = build_contents(history, summary)
 
     # Дешевая прикидка на входе: обычный чат до лимита не дотягивает, и тратить на него
     # лишний запрос к API незачем. Дальше по кругу идем уже только с точным подсчетом -
@@ -1111,7 +1093,7 @@ async def compress_context(
             conn, summary, [entry["source"]["message_id"] for entry in history[:cut]]
         )
         history = history[cut:]
-        contents = build_contents(history, summary, reply_prefix)
+        contents = build_contents(history, summary)
 
     logger.warning(
         "Контекст не уложился в лимит за %d проходов.", MAX_COMPRESSION_ROUNDS
@@ -1124,7 +1106,6 @@ async def generate_gemini_response(
     conn: sqlite3.Connection,
     context_messages: list,
     summary: str | None,
-    reply_prefix: str,
 ):
     """
     Генерирует ответ с использованием модели Google Gemini AI на основе контекста сообщений.
@@ -1134,7 +1115,6 @@ async def generate_gemini_response(
         conn (sqlite3.Connection): Соединение с БД - нужно, чтобы сохранить пересказ.
         context_messages (list): Список сообщений контекста.
         summary (str | None): Пересказ сжатой ранее части истории.
-        reply_prefix (str): Затравка - служебный префикс будущей реплики бота.
 
     Returns:
         str: Сгенерированный ответ.
@@ -1146,7 +1126,7 @@ async def generate_gemini_response(
         logger.warning("Контекст для Gemini пуст. Отмена запроса.")
         return "Не могу обработать пустой запрос."
 
-    contents = await compress_context(client, conn, history, summary, reply_prefix)
+    contents = await compress_context(client, conn, history, summary)
 
     logger.info("Отправка запроса в Gemini...")
 
@@ -1309,8 +1289,6 @@ async def handle_message(  # pylint: disable=too-many-locals
                 db_conn,
                 context_messages,
                 summary,
-                # context.bot.bot - закешированный get_me(), лишнего запроса к API нет.
-                build_reply_prefix(context.bot.bot),
             )
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error("Ошибка при вызове Gemini API: %s", e)
