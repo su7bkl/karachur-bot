@@ -20,7 +20,15 @@ import time
 from datetime import datetime, timezone
 
 from google import genai
-from telegram import Message, Update
+from telegram import (
+    Message,
+    MessageOrigin,
+    MessageOriginChannel,
+    MessageOriginChat,
+    MessageOriginHiddenUser,
+    MessageOriginUser,
+    Update,
+)
 from telegram.error import TelegramError
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
@@ -152,7 +160,7 @@ SUMMARY_REQUEST = "Сделай пересказ показанной истор
 # Страховка на случай, если модель все же начнет ответ с копии пометки.
 AUTHOR_TAG_PATTERN = re.compile(r"^\s*\[[^\]\n]*?date:[^\]\n]*\]\s*:?[ \t]*")
 
-# --- СЛУЖЕБНАЯ ПОМЕТКА ОБ ОТВЕТЕ ---
+# --- СЛУЖЕБНЫЕ ПОМЕТКИ ПЕРЕД РЕПЛИКОЙ ---
 # В контексте реплика-ответ оторвана от своего адресата: между ними может лежать сколько
 # угодно чужих сообщений, а сам адресат - уже уйти в пересказ. Поэтому перед текстом такой
 # реплики идет пометка с автором и началом того сообщения, на которое отвечают, и с
@@ -160,14 +168,19 @@ AUTHOR_TAG_PATTERN = re.compile(r"^\s*\[[^\]\n]*?date:[^\]\n]*\]\s*:?[ \t]*")
 # модель, как и раньше, видит вообще без служебных пометок.
 REPLY_NOTE_LEAD = "В ответ на"
 QUOTE_NOTE_LEAD = "Процитирован фрагмент"
+# Пересланное сообщение приходит от того, кто нажал "переслать": в from_user стоит он, а в
+# тексте лежат чужие слова. Без пометки модель припишет их переславшему. Настоящий автор
+# лежит в forward_origin, оттуда же берем и время оригинала: message.date у пересланного -
+# это момент пересылки.
+FORWARD_NOTE_LEAD = "Переслано"
 # Сколько символов сообщения-адресата показываем: пометка должна давать его опознать,
 # а не пересказывать целиком - иначе популярное сообщение размножится по всему контексту.
 REPLY_SNIPPET_LIMIT = 300
 # Цитату Telegram режет на своей стороне (около 1024 символов), порог тут - страховка.
 QUOTE_SNIPPET_LIMIT = 1024
 # Страховка на случай, если модель начнет ответ с копии пометки.
-REPLY_NOTE_PATTERN = re.compile(
-    rf"^\s*\[(?:{REPLY_NOTE_LEAD}|{QUOTE_NOTE_LEAD})[^\n]*\]\s*"
+SERVICE_NOTE_PATTERN = re.compile(
+    rf"^\s*\[(?:{FORWARD_NOTE_LEAD}|{REPLY_NOTE_LEAD}|{QUOTE_NOTE_LEAD})[^\n]*\]\s*"
 )
 
 # --- ЛОГИРОВАНИЕ ---
@@ -204,6 +217,7 @@ def init_db():
             timestamp TEXT,
             reply_to_message_id INTEGER,
             quote_text TEXT,
+            forward_origin TEXT,
             is_bot BOOLEAN DEFAULT 0,
             summarized INTEGER DEFAULT 0
         )
@@ -227,6 +241,7 @@ def init_db():
 LATE_MESSAGE_COLUMNS = {
     "summarized": "INTEGER DEFAULT 0",
     "quote_text": "TEXT",
+    "forward_origin": "TEXT",
 }
 
 
@@ -279,16 +294,16 @@ def strip_author_tag(text: str) -> str:
     return cleaned.lstrip() if replaced else text
 
 
-def strip_reply_note(text: str) -> str:
+def strip_service_note(text: str) -> str:
     """
-    Срезает служебную пометку об ответе, если модель все же продублировала ее.
+    Срезает служебную пометку о пересылке или ответе, если модель продублировала ее.
 
     :param text: текст ответа модели
     :type text: str
-    :return: текст без ведущей пометки об ответе
+    :return: текст без ведущей служебной пометки
     :rtype: str
     """
-    cleaned, replaced = REPLY_NOTE_PATTERN.subn("", text, count=1)
+    cleaned, replaced = SERVICE_NOTE_PATTERN.subn("", text, count=1)
     return cleaned.lstrip() if replaced else text
 
 
@@ -301,7 +316,7 @@ def strip_service_prefixes(text: str) -> str:
     :return: текст без ведущих служебных пометок
     :rtype: str
     """
-    return strip_author_tag(strip_reply_note(text))
+    return strip_author_tag(strip_service_note(text))
 
 
 def shorten(text: str, limit: int) -> str:
@@ -343,6 +358,10 @@ def describe_reply_target(target: dict | None) -> str:
     )
     snippet = shorten(target.get("content") or "", REPLY_SNIPPET_LIMIT)
     description = f"сообщение {author}"
+    # У пересланного адресата автор подписи - тот, кто переслал, а слова в нем чужие.
+    forwarded = target.get("forward_origin")
+    if forwarded:
+        description += f" (переслано {forwarded})"
     if snippet:
         description += f": «{snippet}»"
     media_type = target.get("media_type")
@@ -351,9 +370,50 @@ def describe_reply_target(target: dict | None) -> str:
     return description
 
 
-def build_reply_note(msg: dict) -> str | None:
+def describe_forward_origin(origin: MessageOrigin | None) -> str | None:
     """
-    Собирает служебную пометку о том, чему отвечает реплика.
+    Описывает, откуда переслали сообщение и кто написал его на самом деле.
+
+    :param origin: происхождение пересланного сообщения или None, если ничего не пересылали
+    :type origin: MessageOrigin | None
+    :return: описание источника для служебной пометки или None, если пересылки не было
+    :rtype: str | None
+    """
+    if origin is None:
+        return None
+
+    # Время берем из оригинала: в message.date у пересланного лежит момент пересылки.
+    date = str(origin.date)
+
+    if isinstance(origin, MessageOriginUser):
+        user = origin.sender_user
+        tag = build_author_tag(user.full_name or str(user.id), user.username, date)
+        return f'от "{tag}"'
+
+    if isinstance(origin, MessageOriginHiddenUser):
+        # Автор закрыл ссылку на свой аккаунт: от него осталось одно имя без ника.
+        return f'от скрытого пользователя "{build_author_tag(origin.sender_user_name, None, date)}"'
+
+    if isinstance(origin, (MessageOriginChat, MessageOriginChannel)):
+        from_chat = isinstance(origin, MessageOriginChat)
+        chat = origin.sender_chat if from_chat else origin.chat
+        tag = build_author_tag(
+            chat.title or chat.full_name or str(chat.id), chat.username, date
+        )
+        description = f'из {"чата" if from_chat else "канала"} "{tag}"'
+        # В каналах автор поста подписывается отдельно от самого канала.
+        if origin.author_signature:
+            description += f", подпись автора: {origin.author_signature}"
+        return description
+
+    # Telegram может завести новый тип источника: сказать про сам факт пересылки полезнее,
+    # чем промолчать и отдать чужие слова за слова переславшего.
+    return f"из неизвестного источника (date:{date})"
+
+
+def build_service_note(msg: dict) -> str | None:
+    """
+    Собирает служебную пометку перед репликой: откуда она переслана и чему отвечает.
 
     Цитата идет отдельным куском: она показывает, какую именно часть сообщения выделил
     отвечающий, и приходит даже тогда, когда самого адресата в чате нет (цитата из
@@ -362,10 +422,13 @@ def build_reply_note(msg: dict) -> str | None:
     :param msg: строка таблицы messages в виде словаря; адресат должен быть уже подложен
         в ключ "reply_target" (см. attach_reply_targets)
     :type msg: dict
-    :return: пометка в квадратных скобках или None, если реплика ни на что не отвечает
+    :return: пометка в квадратных скобках или None, если помечать нечего
     :rtype: str | None
     """
     notes = []
+    forwarded = msg.get("forward_origin")
+    if forwarded:
+        notes.append(f"{FORWARD_NOTE_LEAD} {forwarded}")
     if msg.get("reply_to_message_id"):
         target = describe_reply_target(msg.get("reply_target"))
         notes.append(f"{REPLY_NOTE_LEAD} {target}")
@@ -455,6 +518,8 @@ def save_message_to_db(  # pylint: disable=too-many-locals
     # Фрагмент, который отвечающий выделил в чужом сообщении. Есть и у цитат из других
     # чатов - там это единственный след того, чему отвечали: reply_to_message_id пуст.
     quote_text = message.quote.text if message.quote else None
+    # Настоящий автор пересланного: в from_user ниже стоит тот, кто нажал "переслать".
+    forward_origin = describe_forward_origin(message.forward_origin)
     user_id = message.from_user.id if message.from_user else None
     if message.from_user:
         date = (
@@ -475,8 +540,8 @@ def save_message_to_db(  # pylint: disable=too-many-locals
         INSERT OR REPLACE INTO messages (
             message_id, chat_id, user_id, username, content, media_type,
             mime_type, file_id, file_name, timestamp, reply_to_message_id,
-            quote_text, is_bot
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            quote_text, forward_origin, is_bot
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """,
         (
             message.message_id,
@@ -491,6 +556,7 @@ def save_message_to_db(  # pylint: disable=too-many-locals
             timestamp,
             reply_to_id,
             quote_text,
+            forward_origin,
             is_bot,
         ),
     )
@@ -929,7 +995,7 @@ def build_message_parts(client: genai.Client, msg: dict) -> list:
     else:
         author = msg.get("username") or "unknown"
         text = f"[{author}]: {content}" if content else f"[{author}]"
-        note = build_reply_note(msg)
+        note = build_service_note(msg)
         parts.append(genai.types.Part(text=f"{note}\n{text}" if note else text))
 
     if msg.get("file_id") and msg.get("mime_type"):
