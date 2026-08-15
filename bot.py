@@ -16,7 +16,6 @@ import random
 import re
 import sqlite3
 import time
-from datetime import datetime, timezone
 
 from google import genai
 from telegram import Message, Update
@@ -33,7 +32,7 @@ import api_keys
 import commands
 from karachur import config, media
 from karachur.session import ChatSession
-from karachur.storage import db, schema
+from karachur.storage import messages, schema, summaries
 from karachur.text import notes
 from karachur.text.html_splitter import split_html_message
 from karachur.text.markdown import markdown_to_telegram_html
@@ -75,266 +74,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# --- БЛОК РАБОТЫ С БАЗОЙ ДАННЫХ ---
-# Схема (создание таблиц, донастройка старых баз, отказ от совсем древних) вынесена в
-# karachur.storage.schema - здесь остается только работа с данными в уже готовых таблицах.
-
-
-def save_message_to_db(  # pylint: disable=too-many-locals
-    conn: sqlite3.Connection,
-    message: Message,
-    is_bot: bool = False,
-    content_override: str | None = None,
-):
-    """
-    Сохраняет сообщение в базу данных.
-
-    Args:
-        conn (sqlite3.Connection): Соединение с базой данных.
-        message (Message): Объект сообщения Telegram.
-        is_bot (bool, optional): Флаг, указывающий, является ли сообщение от бота.
-        По умолчанию False.
-        content_override (str | None, optional): Текст, который попадет в контекст вместо
-        реального текста сообщения. Нужен, чтобы простыня с ошибкой API не засоряла историю.
-
-    Returns:
-        tuple: (file_id, mime_type, file_name) - информация о медиа-файле, если он присутствует.
-    """
-    cursor = conn.cursor()
-    content = message.text or message.caption or ""
-
-    media_type, mime_type, file_id, file_name = None, None, None, None
-
-    if message.photo:
-        media_type, file_id, mime_type = (
-            "photo",
-            message.photo[-1].file_id,
-            "image/jpeg",
-        )
-    elif message.document:
-        media_type, file_id, mime_type, file_name = (
-            "document",
-            message.document.file_id,
-            message.document.mime_type,
-            message.document.file_name,
-        )
-    elif message.sticker:
-        media_type, file_id, mime_type = notes.describe_sticker(message.sticker)
-    elif message.animation:
-        media_type, file_id, mime_type, file_name = (
-            "animation",
-            message.animation.file_id,
-            message.animation.mime_type,
-            message.animation.file_name,
-        )
-    elif message.video:
-        media_type, file_id, mime_type, file_name = (
-            "video",
-            message.video.file_id,
-            message.video.mime_type,
-            message.video.file_name,
-        )
-    elif message.audio:
-        media_type, file_id, mime_type, file_name = (
-            "audio",
-            message.audio.file_id,
-            message.audio.mime_type,
-            message.audio.file_name,
-        )
-    elif message.voice:
-        media_type, file_id, mime_type = "voice", message.voice.file_id, "audio/ogg"
-        content = f"[Голосовое сообщение by {message.from_user.username}]"
-    elif message.video_note:
-        media_type, file_id, mime_type = (
-            "video_note",
-            message.video_note.file_id,
-            "video/mp4",
-        )
-        content = f"[Видео сообщение by {message.from_user.username}]"
-
-    if content_override is not None:
-        content = content_override
-
-    timestamp = datetime.fromtimestamp(message.date.timestamp()).isoformat()
-    reply_to_id = (
-        message.reply_to_message.message_id if message.reply_to_message else None
-    )
-    # Фрагмент, который отвечающий выделил в чужом сообщении. Есть и у цитат из других
-    # чатов - там это единственный след того, чему отвечали: reply_to_message_id пуст.
-    quote_text = message.quote.text if message.quote else None
-    # Настоящий автор пересланного: в from_user ниже стоит тот, кто нажал "переслать".
-    forward_origin = notes.describe_forward_origin(message.forward_origin)
-    user_id = message.from_user.id if message.from_user else None
-    if message.from_user:
-        date = (
-            str(message.date)
-            if not message.edit_date
-            else str(message.date) + "/edited:" + str(message.edit_date)
-        )
-        user_prompt = notes.build_author_tag(
-            message.from_user.full_name or str(message.from_user.id),
-            message.from_user.username,
-            date,
-        )
-    else:
-        user_prompt = "Bot"
-
-    cursor.execute(
-        """
-        INSERT OR REPLACE INTO messages (
-            message_id, chat_id, user_id, username, content, media_type,
-            mime_type, file_id, file_name, timestamp, reply_to_message_id,
-            quote_text, forward_origin, is_bot
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-        (
-            message.message_id,
-            message.chat_id,
-            user_id,
-            user_prompt,
-            content,
-            media_type,
-            mime_type,
-            file_id,
-            file_name,
-            timestamp,
-            reply_to_id,
-            quote_text,
-            forward_origin,
-            is_bot,
-        ),
-    )
-    conn.commit()
-    logger.info("Сохранено сообщение %s в БД.", message.message_id)  # lazy logging
-    return file_id, mime_type, file_name
-
-
-def get_latest_summary(conn: sqlite3.Connection, chat_id: int) -> str | None:
-    """
-    Возвращает последний пересказ сжатой части истории этого чата.
-
-    Каждый следующий пересказ вбирает в себя предыдущий, поэтому актуален всегда
-    только самый свежий.
-
-    :param conn: соединение с базой данных
-    :type conn: sqlite3.Connection
-    :param chat_id: идентификатор чата
-    :type chat_id: int
-    :return: текст пересказа или None, если сжатия еще не было
-    :rtype: str | None
-    """
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT summary FROM context_summaries WHERE chat_id = ? ORDER BY id DESC LIMIT 1",
-        (chat_id,),
-    )
-    row = cursor.fetchone()
-    return row[0] if row else None
-
-
-def save_summary(
-    conn: sqlite3.Connection, chat_id: int, summary: str, message_ids: list
-):
-    """
-    Сохраняет пересказ и помечает вошедшие в него сообщения как сжатые.
-
-    Помечаем поименно, а не по времени последнего сжатого сообщения: сдвиг часов или
-    сообщение, пришедшее с запозданием, увели бы границу по времени не туда, и кусок
-    истории молча выпал бы из контекста.
-
-    :param conn: соединение с базой данных
-    :type conn: sqlite3.Connection
-    :param chat_id: идентификатор чата
-    :type chat_id: int
-    :param summary: текст пересказа
-    :type summary: str
-    :param message_ids: message_id сообщений, вошедших в пересказ
-    :type message_ids: list
-    """
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO context_summaries (chat_id, summary, covered_messages, created_at)
-        VALUES (?, ?, ?, ?)
-    """,
-        (chat_id, summary, len(message_ids), datetime.now(timezone.utc).isoformat()),
-    )
-    # message_id уникален только внутри чата, поэтому помечаем строго свои сообщения.
-    cursor.executemany(
-        "UPDATE messages SET summarized = 1 WHERE chat_id = ? AND message_id = ?",
-        [(chat_id, message_id) for message_id in message_ids],
-    )
-    conn.commit()
-    logger.info("Чат %s: сохранен пересказ %d сообщений.", chat_id, len(message_ids))
-
-
-def attach_reply_targets(conn: sqlite3.Connection, chat_id: int, messages: list):
-    """
-    Подкладывает к каждой реплике-ответу сообщение, которому она отвечает.
-
-    Ищем по всей истории чата, а не по переданному куску: адресат мог остаться далеко
-    позади и уже уйти в пересказ, но пометка о нем все равно нужна. За пределы чата не
-    выходим - там лежат чужие разговоры с такими же номерами сообщений.
-
-    :param conn: соединение с базой данных
-    :type conn: sqlite3.Connection
-    :param chat_id: идентификатор чата
-    :type chat_id: int
-    :param messages: сообщения контекста; в отвечающие добавляется ключ "reply_target"
-        со строкой адресата или None, если такого сообщения в базе нет
-    :type messages: list
-    """
-    target_ids = {
-        msg["reply_to_message_id"] for msg in messages if msg.get("reply_to_message_id")
-    }
-    if not target_ids:
-        return
-
-    cursor = conn.cursor()
-    # В строку запроса подставляем только число "?" - сами идентификаторы идут параметрами.
-    cursor.execute(
-        f"""
-        SELECT * FROM messages
-        WHERE chat_id = ? AND message_id IN ({",".join("?" * len(target_ids))})
-        """,
-        (chat_id, *target_ids),
-    )
-    targets = {target["message_id"]: target for target in db.fetch_dicts(cursor)}
-
-    for msg in messages:
-        reply_to_id = msg.get("reply_to_message_id")
-        if reply_to_id:
-            msg["reply_target"] = targets.get(reply_to_id)
-
-
-def get_context(conn: sqlite3.Connection, chat_id: int) -> tuple[str | None, list]:
-    """
-    Получает контекст чата: пересказ старой части истории и сообщения после нее.
-
-    Пока сжатия не было, пересказ пуст и возвращается вся история чата. Чужие чаты в
-    контекст не попадают: у каждого своя история, свой пересказ и свои ключи.
-
-    Args:
-        conn (sqlite3.Connection): Соединение с базой данных.
-        chat_id (int): Идентификатор чата.
-
-    Returns:
-        tuple: (текст пересказа или None, список словарей с информацией о сообщениях;
-        у реплик-ответов в ключе "reply_target" лежит сообщение, которому они отвечают).
-    """
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT * FROM messages WHERE chat_id = ? AND summarized = 0
-        ORDER BY timestamp ASC, message_id ASC
-    """,
-        (chat_id,),
-    )
-    messages = db.fetch_dicts(cursor)
-    attach_reply_targets(conn, chat_id, messages)
-    return get_latest_summary(conn, chat_id), messages
-
 
 # --- БЛОК УТИЛИТ ДЛЯ МЕДИА ---
 
@@ -424,14 +163,7 @@ async def normalize_media(
 
     # Перекодирование блокирует надолго, уводим его в поток.
     path, mime = await asyncio.to_thread(media.normalize, file_path, mime_type)
-    conn.execute(
-        """
-        UPDATE messages SET media_path = ?, mime_type = ?
-        WHERE chat_id = ? AND message_id = ?
-        """,
-        (path, mime, message.chat_id, message.message_id),
-    )
-    conn.commit()
+    messages.set_media_path(conn, message.chat_id, message.message_id, path, mime)
 
 
 async def download_media_file(application: Application, file_id: str, file_path: str):
@@ -971,7 +703,7 @@ def choose_cut_index(cfg: config.Config, history: list, total_tokens: int) -> in
 async def summarize_history(
     cfg: config.Config,
     pool: api_keys.KeyPool,
-    messages: list,
+    context_messages: list,
     previous_summary: str | None,
 ) -> str:
     """
@@ -984,8 +716,8 @@ async def summarize_history(
     :type cfg: config.Config
     :param pool: пул ключей чата
     :type pool: api_keys.KeyPool
-    :param messages: сообщения, которые надо сжать
-    :type messages: list
+    :param context_messages: сообщения, которые надо сжать
+    :type context_messages: list
     :param previous_summary: прошлый пересказ или None, если сжимаем впервые
     :type previous_summary: str | None
     :return: текст нового пересказа
@@ -995,7 +727,9 @@ async def summarize_history(
 
     async def make_contents(key: dict) -> list:
         """Собирает запрос на пересказ под конкретный ключ."""
-        entries = await asyncio.to_thread(build_history, key, messages, cfg.media_dir)
+        entries = await asyncio.to_thread(
+            build_history, key, context_messages, cfg.media_dir
+        )
         contents = [
             genai.types.ContentDict(
                 role="user", parts=[genai.types.PartDict(text=SUMMARY_INSTRUCTION)]
@@ -1023,7 +757,9 @@ async def summarize_history(
         )
         return contents
 
-    logger.info("Сжимаем %d самых старых сообщений в пересказ...", len(messages))
+    logger.info(
+        "Сжимаем %d самых старых сообщений в пересказ...", len(context_messages)
+    )
     return (await generate_with_retries(cfg, pool, make_contents)).strip()
 
 
@@ -1032,7 +768,7 @@ async def compress_context(  # pylint: disable=too-many-arguments,too-many-posit
     pool: api_keys.KeyPool,
     conn: sqlite3.Connection,
     chat_id: int,
-    messages: list,
+    context_messages: list,
     summary: str | None,
 ) -> tuple[list, str | None]:
     """
@@ -1055,15 +791,17 @@ async def compress_context(  # pylint: disable=too-many-arguments,too-many-posit
     :type conn: sqlite3.Connection
     :param chat_id: идентификатор чата
     :type chat_id: int
-    :param messages: сообщения контекста (непустой список)
-    :type messages: list
+    :param context_messages: сообщения контекста (непустой список)
+    :type context_messages: list
     :param summary: пересказ сжатой ранее части истории или None
     :type summary: str | None
     :return: (оставшиеся дословно сообщения, актуальный пересказ)
     :rtype: tuple[list, str | None]
     """
     key = pool.active()
-    history = await asyncio.to_thread(build_history, key, messages, cfg.media_dir)
+    history = await asyncio.to_thread(
+        build_history, key, context_messages, cfg.media_dir
+    )
 
     # Дешевая прикидка на входе: обычный чат до лимита не дотягивает, и тратить на него
     # лишний запрос к API незачем. Дальше по кругу идем уже только с точным подсчетом -
@@ -1071,7 +809,7 @@ async def compress_context(  # pylint: disable=too-many-arguments,too-many-posit
     if estimate_context_tokens(cfg, history, summary) < (
         cfg.max_context_tokens * cfg.token_check_ratio
     ):
-        return messages, summary
+        return context_messages, summary
 
     for _ in range(cfg.max_compression_rounds):
         # Пересказ мог упереться в квоту и сменить ключ: ссылки на выгруженные файлы
@@ -1080,19 +818,19 @@ async def compress_context(  # pylint: disable=too-many-arguments,too-many-posit
         if current_key["id"] != key["id"]:
             key = current_key
             history = await asyncio.to_thread(
-                build_history, key, messages, cfg.media_dir
+                build_history, key, context_messages, cfg.media_dir
             )
 
         total_tokens = await count_context_tokens(
             pool, key, build_contents(history, summary, cfg.system_prompt)
         )
         if total_tokens is None:
-            return messages, summary
+            return context_messages, summary
         if total_tokens <= cfg.max_context_tokens:
             logger.info(
                 "Контекст: %d токенов из %d.", total_tokens, cfg.max_context_tokens
             )
-            return messages, summary
+            return context_messages, summary
 
         cut = choose_cut_index(cfg, history, total_tokens)
         if cut <= 0:
@@ -1101,7 +839,7 @@ async def compress_context(  # pylint: disable=too-many-arguments,too-many-posit
                 total_tokens,
                 cfg.max_context_tokens,
             )
-            return messages, summary
+            return context_messages, summary
 
         logger.info(
             "Контекст разросся до %d токенов при лимите %d, сжимаем.",
@@ -1113,16 +851,18 @@ async def compress_context(  # pylint: disable=too-many-arguments,too-many-posit
             summary = await summarize_history(cfg, pool, compressed, summary)
         except GeminiRetryError as e:
             logger.error("Не удалось сжать контекст, отправляем как есть: %s", e)
-            return messages, summary
+            return context_messages, summary
 
-        save_summary(conn, chat_id, summary, [msg["message_id"] for msg in compressed])
+        summaries.save_summary(
+            conn, chat_id, summary, [msg["message_id"] for msg in compressed]
+        )
         history = history[cut:]
-        messages = [entry["source"] for entry in history]
+        context_messages = [entry["source"] for entry in history]
 
     logger.warning(
         "Контекст не уложился в лимит за %d проходов.", cfg.max_compression_rounds
     )
-    return messages, summary
+    return context_messages, summary
 
 
 async def generate_gemini_response(
@@ -1161,13 +901,15 @@ async def generate_gemini_response(
         logger.warning("Контекст для Gemini пуст. Отмена запроса.")
         return "Не могу обработать пустой запрос."
 
-    messages, summary = await compress_context(
+    context_messages, summary = await compress_context(
         cfg, pool, conn, chat_id, context_messages, summary
     )
 
     async def make_contents(key: dict) -> list:
         """Собирает запрос под конкретный ключ: медиа выгружается от его имени."""
-        history = await asyncio.to_thread(build_history, key, messages, cfg.media_dir)
+        history = await asyncio.to_thread(
+            build_history, key, context_messages, cfg.media_dir
+        )
         return build_contents(history, summary, cfg.system_prompt)
 
     logger.info("Отправка запроса в Gemini...")
@@ -1269,9 +1011,9 @@ async def deliver_response(
 
         # Ответ модели сохраняем как есть, ошибку - одной короткой пометкой и один раз.
         if not err:
-            save_message_to_db(db_conn, bot_reply, is_bot=True)
+            messages.save_message_to_db(db_conn, bot_reply, is_bot=True)
         elif index == 0:
-            save_message_to_db(
+            messages.save_message_to_db(
                 db_conn, bot_reply, is_bot=True, content_override=ERROR_CONTEXT_NOTE
             )
 
@@ -1313,7 +1055,7 @@ async def answer_chat(
     """
     db_conn = context.bot_data["db_conn"]
     chat_id = message.chat_id
-    summary, context_messages = get_context(db_conn, chat_id)
+    summary, context_messages = messages.get_context(db_conn, chat_id)
 
     if transcribe_only:
         # Расшифровке чужая история не нужна - ни сообщения, ни пересказ.
@@ -1374,7 +1116,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message.text and message.text.lower().startswith(trigger)
     ) or (message.caption and message.caption.lower().startswith(trigger))
 
-    file_id, mime_type, file_name = save_message_to_db(db_conn, message, is_bot=False)
+    file_id, mime_type, file_name = messages.save_message_to_db(
+        db_conn, message, is_bot=False
+    )
     if file_id:
         file_path = get_media_path(cfg.media_dir, file_id, mime_type, file_name)
         if file_path:

@@ -14,7 +14,7 @@ import pytest
 import api_keys
 import bot
 from conftest import CHAT_ONE, KEY_ONE, KEY_TWO
-from karachur.storage import settings
+from karachur.storage import messages, settings, summaries
 
 
 def prepared_pool(conn, *keys, start_with=None, daily_limit=250, model="gemini-test"):
@@ -169,18 +169,18 @@ def test_context_is_compressed_and_saved(cfg, db, gemini, add_message):
     gemini.token_counts = [2000, 400]
     gemini.script(KEY_ONE, "пересказ старой части")
 
-    _, messages = bot.get_context(db, CHAT_ONE)
+    _, context = messages.get_context(db, CHAT_ONE)
     kept, summary = asyncio.run(
-        bot.compress_context(cfg, pool, db, CHAT_ONE, messages, None)
+        bot.compress_context(cfg, pool, db, CHAT_ONE, context, None)
     )
 
     assert summary == "пересказ старой части"
-    assert len(kept) < len(messages)
-    assert bot.get_latest_summary(db, CHAT_ONE) == "пересказ старой части"
+    assert len(kept) < len(context)
+    assert summaries.get_latest_summary(db, CHAT_ONE) == "пересказ старой части"
     compressed = db.execute(
         "SELECT COUNT(*) FROM messages WHERE chat_id = ? AND summarized = 1", (CHAT_ONE,)
     ).fetchone()[0]
-    assert compressed == len(messages) - len(kept)
+    assert compressed == len(context) - len(kept)
 
 
 def test_small_context_is_left_alone(cfg, db, gemini, add_message):
@@ -188,11 +188,11 @@ def test_small_context_is_left_alone(cfg, db, gemini, add_message):
     add_message(CHAT_ONE, 1, "короткое сообщение")
     pool = prepared_pool(db, KEY_ONE, start_with=KEY_ONE)
 
-    _, messages = bot.get_context(db, CHAT_ONE)
+    _, context = messages.get_context(db, CHAT_ONE)
     kept, summary = asyncio.run(
-        bot.compress_context(cfg, pool, db, CHAT_ONE, messages, None)
+        bot.compress_context(cfg, pool, db, CHAT_ONE, context, None)
     )
 
-    assert kept == messages
+    assert kept == context
     assert summary is None
     assert not gemini.calls

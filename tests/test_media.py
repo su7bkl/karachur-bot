@@ -22,6 +22,7 @@ import pytest
 import bot
 from karachur import media
 from karachur.media import ffmpeg
+from karachur.storage import messages
 
 FFMPEG_MISSING = shutil.which("ffmpeg") is None
 needs_ffmpeg = pytest.mark.skipif(FFMPEG_MISSING, reason="в системе нет ffmpeg")
@@ -241,8 +242,8 @@ def test_stored_media_path_wins(db, tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "check_file_validity", lambda c, k, p: used.append(p))
     monkeypatch.setattr(bot, "upload_file", lambda c, k, p: used.append(p))
 
-    _, messages = bot.get_context(db, -100)
-    bot.build_message_parts(None, "ключ", messages[0])
+    _, context = messages.get_context(db, -100)
+    bot.build_message_parts(None, "ключ", context[0])
 
     assert used == [str(converted), str(converted)]
 

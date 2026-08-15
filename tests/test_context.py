@@ -10,9 +10,8 @@ import sqlite3
 
 import pytest
 
-import bot
 from conftest import CHAT_ONE, CHAT_TWO
-from karachur.storage import schema
+from karachur.storage import messages, schema, summaries
 from karachur.text import notes
 
 
@@ -31,9 +30,9 @@ def test_context_is_limited_to_its_chat(db, add_message):
     add_message(CHAT_TWO, 1, "первое сообщение чата Б")
     add_message(CHAT_ONE, 2, "второе сообщение чата А")
 
-    _, messages = bot.get_context(db, CHAT_ONE)
+    _, context = messages.get_context(db, CHAT_ONE)
 
-    assert [msg["content"] for msg in messages] == [
+    assert [msg["content"] for msg in context] == [
         "первое сообщение чата А",
         "второе сообщение чата А",
     ]
@@ -45,8 +44,8 @@ def test_reply_target_comes_from_the_same_chat(db, add_message):
     add_message(CHAT_TWO, 1, "вопрос чата Б")
     add_message(CHAT_TWO, 5, "ответ чата Б", reply_to=1)
 
-    _, messages = bot.get_context(db, CHAT_TWO)
-    target = messages[-1]["reply_target"]
+    _, context = messages.get_context(db, CHAT_TWO)
+    target = context[-1]["reply_target"]
 
     assert target["content"] == "вопрос чата Б"
 
@@ -55,8 +54,8 @@ def test_missing_reply_target_is_described(db, add_message):
     """Ответ на сообщение старше бота помечается как отсутствующее в истории."""
     add_message(CHAT_ONE, 7, "ответ на что-то древнее", reply_to=1)
 
-    _, messages = bot.get_context(db, CHAT_ONE)
-    note = notes.build_service_note(messages[-1]) or ""
+    _, context = messages.get_context(db, CHAT_ONE)
+    note = notes.build_service_note(context[-1]) or ""
 
     assert "которого нет в истории" in note
 
@@ -67,10 +66,10 @@ def test_summary_belongs_to_one_chat(db, add_message):
     add_message(CHAT_ONE, 2, "свежее сообщение чата А")
     add_message(CHAT_TWO, 1, "сообщение чата Б")
 
-    bot.save_summary(db, CHAT_ONE, "пересказ чата А", [1])
+    summaries.save_summary(db, CHAT_ONE, "пересказ чата А", [1])
 
-    summary_one, messages_one = bot.get_context(db, CHAT_ONE)
-    summary_two, messages_two = bot.get_context(db, CHAT_TWO)
+    summary_one, messages_one = messages.get_context(db, CHAT_ONE)
+    summary_two, messages_two = messages.get_context(db, CHAT_TWO)
 
     assert summary_one == "пересказ чата А"
     assert [msg["content"] for msg in messages_one] == ["свежее сообщение чата А"]
@@ -83,7 +82,7 @@ def test_summary_marks_only_its_own_messages(db, add_message):
     add_message(CHAT_ONE, 1, "сообщение чата А")
     add_message(CHAT_TWO, 1, "сообщение чата Б")
 
-    bot.save_summary(db, CHAT_ONE, "пересказ чата А", [1])
+    summaries.save_summary(db, CHAT_ONE, "пересказ чата А", [1])
 
     marked = db.execute(
         "SELECT chat_id FROM messages WHERE summarized = 1"
@@ -95,10 +94,10 @@ def test_summary_marks_only_its_own_messages(db, add_message):
 
 def test_latest_summary_wins(db):
     """Из нескольких пересказов чата берется самый свежий."""
-    bot.save_summary(db, CHAT_ONE, "первый пересказ", [])
-    bot.save_summary(db, CHAT_ONE, "второй пересказ", [])
+    summaries.save_summary(db, CHAT_ONE, "первый пересказ", [])
+    summaries.save_summary(db, CHAT_ONE, "второй пересказ", [])
 
-    assert bot.get_latest_summary(db, CHAT_ONE) == "второй пересказ"
+    assert summaries.get_latest_summary(db, CHAT_ONE) == "второй пересказ"
 
 
 def test_legacy_database_is_rejected(tmp_path):
@@ -140,8 +139,8 @@ def test_attachment_kind_reaches_the_model(db, kind, expected):
     )
     db.commit()
 
-    _, messages = bot.get_context(db, CHAT_ONE)
-    note = notes.build_service_note(messages[0]) or ""
+    _, context = messages.get_context(db, CHAT_ONE)
+    note = notes.build_service_note(context[0]) or ""
 
     assert f"Вложение: {expected}" in note
 
@@ -150,9 +149,9 @@ def test_message_without_attachment_has_no_note(db, add_message):
     """Обычной реплике без вложения помечать нечего."""
     add_message(CHAT_ONE, 1, "просто текст")
 
-    _, messages = bot.get_context(db, CHAT_ONE)
+    _, context = messages.get_context(db, CHAT_ONE)
 
-    assert notes.build_service_note(messages[0]) is None
+    assert notes.build_service_note(context[0]) is None
 
 
 def test_copied_attachment_note_is_stripped():
