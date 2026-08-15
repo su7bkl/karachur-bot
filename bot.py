@@ -178,6 +178,22 @@ QUOTE_NOTE_LEAD = "Процитирован фрагмент"
 # лежит в forward_origin, оттуда же берем и время оригинала: message.date у пересланного -
 # это момент пересылки.
 FORWARD_NOTE_LEAD = "Переслано"
+# Перед моделью все вложения выглядят одинаково: после перекодирования и стикер, и кружок,
+# и гифка приезжают одним и тем же mp4. Пометка возвращает то, что при этом теряется, -
+# чем это было в чате.
+MEDIA_NOTE_LEAD = "Вложение"
+MEDIA_LABELS = {
+    "photo": "фото",
+    "sticker": "стикер",
+    "animated_sticker": "анимированный стикер",
+    "video_sticker": "видео-стикер",
+    "animation": "гифка",
+    "video": "видео",
+    "video_note": "видеосообщение кружком",
+    "voice": "голосовое сообщение",
+    "audio": "аудиозапись",
+    "document": "файл",
+}
 # Сколько символов сообщения-адресата показываем: пометка должна давать его опознать,
 # а не пересказывать целиком - иначе популярное сообщение размножится по всему контексту.
 REPLY_SNIPPET_LIMIT = 300
@@ -185,7 +201,8 @@ REPLY_SNIPPET_LIMIT = 300
 QUOTE_SNIPPET_LIMIT = 1024
 # Страховка на случай, если модель начнет ответ с копии пометки.
 SERVICE_NOTE_PATTERN = re.compile(
-    rf"^\s*\[(?:{FORWARD_NOTE_LEAD}|{REPLY_NOTE_LEAD}|{QUOTE_NOTE_LEAD})[^\n]*\]\s*"
+    rf"^\s*\[(?:{FORWARD_NOTE_LEAD}|{REPLY_NOTE_LEAD}|{QUOTE_NOTE_LEAD}"
+    rf"|{MEDIA_NOTE_LEAD})[^\n]*\]\s*"
 )
 
 # --- ЛОГИРОВАНИЕ ---
@@ -454,6 +471,23 @@ def describe_forward_origin(origin: MessageOrigin | None) -> str | None:
     return f"из неизвестного источника (date:{date})"
 
 
+def describe_sticker(sticker) -> tuple[str, str, str]:
+    """
+    Разбирает стикер: какого он вида и с каким mime его сохранять.
+
+    Вид нужен только для служебной пометки - сам файл отправляется как раньше.
+
+    :param sticker: стикер из сообщения Telegram
+    :return: (вид вложения, file_id, mime)
+    :rtype: tuple[str, str, str]
+    """
+    if sticker.is_animated:
+        return "animated_sticker", sticker.file_id, "video/webm"
+    if sticker.is_video:
+        return "video_sticker", sticker.file_id, "video/webm"
+    return "sticker", sticker.file_id, "image/webp"
+
+
 def build_service_note(msg: dict) -> str | None:
     """
     Собирает служебную пометку перед репликой: откуда она переслана и чему отвечает.
@@ -478,6 +512,9 @@ def build_service_note(msg: dict) -> str | None:
     quote = shorten(msg.get("quote_text") or "", QUOTE_SNIPPET_LIMIT)
     if quote:
         notes.append(f"{QUOTE_NOTE_LEAD}: «{quote}»")
+    label = MEDIA_LABELS.get(msg.get("media_type") or "")
+    if label:
+        notes.append(f"{MEDIA_NOTE_LEAD}: {label}")
     return f"[{'. '.join(notes)}]" if notes else None
 
 
@@ -520,11 +557,13 @@ def save_message_to_db(  # pylint: disable=too-many-locals
             message.document.file_name,
         )
     elif message.sticker:
-        media_type, file_id = "sticker", message.sticker.file_id
-        mime_type = (
-            "image/webp"
-            if not message.sticker.is_animated and not message.sticker.is_video
-            else "video/webm"
+        media_type, file_id, mime_type = describe_sticker(message.sticker)
+    elif message.animation:
+        media_type, file_id, mime_type, file_name = (
+            "animation",
+            message.animation.file_id,
+            message.animation.mime_type,
+            message.animation.file_name,
         )
     elif message.video:
         media_type, file_id, mime_type, file_name = (
@@ -541,11 +580,11 @@ def save_message_to_db(  # pylint: disable=too-many-locals
             message.audio.file_name,
         )
     elif message.voice:
-        media_type, file_id, mime_type = "audio", message.voice.file_id, "audio/ogg"
+        media_type, file_id, mime_type = "voice", message.voice.file_id, "audio/ogg"
         content = f"[Голосовое сообщение by {message.from_user.username}]"
     elif message.video_note:
         media_type, file_id, mime_type = (
-            "video",
+            "video_note",
             message.video_note.file_id,
             "video/mp4",
         )

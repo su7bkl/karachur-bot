@@ -14,7 +14,7 @@
 
 Что во что переводится:
     видео и gif  -> mp4  (H.264 + AAC)
-    аудио и голос -> ogg (переливкой без потерь, если получится)
+    аудио и голос -> ogg/opus (голосовые - переливкой, без пересжатия)
     webp, heic   -> png
     jpeg, png    -> остаются как есть
     pdf, текст и прочее - не трогаем, там перекодировать нечего
@@ -31,6 +31,7 @@ import subprocess
 logger = logging.getLogger(__name__)
 
 FFMPEG = "ffmpeg"
+FFPROBE = "ffprobe"
 # Даже длинное видео на 20 МБ укладывается в минуту, а зависший ffmpeg держал бы чат.
 CONVERSION_TIMEOUT = 180
 
@@ -48,38 +49,74 @@ VIDEO_ARGS = [
     "-b:a", "96k",
     "-movflags", "+faststart",
 ]
-# Голосовые приходят из Telegram в ogg/opus, и Gemini этот формат принимает. Поэтому
-# сначала пробуем просто перелить дорожку в новый контейнер: заголовки пересобираются, а
-# звук остается ровно тем же - для расшифровки речи это заметно лучше повторного сжатия.
-# Переливка не проходит с mp3 и прочим, что в ogg не укладывается: для них - libopus.
-AUDIO_ATTEMPTS = [
-    ["-vn", "-c:a", "copy", "-f", "ogg"],
-    ["-vn", "-c:a", "libopus", "-b:a", "64k", "-f", "ogg"],
-]
+# Аудио сводим к opus в ogg. Голосовые Telegram и так присылает в этом виде, поэтому их
+# просто переливаем в новый контейнер: заголовки пересобираются, а дорожка остается байт
+# в байт прежней - для расшифровки речи это заметно лучше повторного сжатия. Все
+# остальное (mp3, wav, aac из видео) пережимаем в тот же opus.
+AUDIO_COPY = ["-vn", "-c:a", "copy", "-f", "ogg"]
+AUDIO_OPUS = ["-vn", "-c:a", "libopus", "-b:a", "64k", "-f", "ogg"]
 # Из анимированного webp берем первый кадр: смысла в нем ровно на одну картинку.
 IMAGE_ARGS = ["-frames:v", "1"]
 
+def audio_codec(path: str) -> str | None:
+    """
+    Определяет кодек первой аудиодорожки файла.
+
+    :param path: путь к файлу
+    :type path: str
+    :return: имя кодека или None, если определить не вышло
+    :rtype: str | None
+    """
+    command = [
+        FFPROBE, "-loglevel", "error", "-select_streams", "a:0",
+        "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", path,
+    ]
+    try:
+        done = subprocess.run(
+            command, capture_output=True, timeout=CONVERSION_TIMEOUT, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.warning("Не удалось определить кодек %s: %s", path, e)
+        return None
+    return done.stdout.decode("utf-8", "replace").strip() or None
+
+
+def audio_attempts(path: str) -> list[list[str]]:
+    """
+    Выбирает, как поступить с аудио: перелить как есть или пережать в opus.
+
+    :param path: путь к файлу
+    :type path: str
+    :return: способы перекодирования по порядку
+    :rtype: list[list[str]]
+    """
+    if audio_codec(path) == "opus":
+        # Уже opus - пережимать нечего, но если переливка не выйдет, пережмем.
+        return [AUDIO_COPY, AUDIO_OPUS]
+    return [AUDIO_OPUS]
+
+
 # Во что переводить каждый тип. Ключ - начало mime, значение - (расширение, mime,
-# способы). Способов может быть несколько: пробуем по очереди, пока какой-нибудь не выйдет.
+# способы). Способы задаются списком или функцией от пути, если выбор зависит от файла.
 CONVERSIONS = {
     "video/": ("mp4", "video/mp4", [VIDEO_ARGS]),
     "image/gif": ("mp4", "video/mp4", [VIDEO_ARGS]),
-    "audio/": ("ogg", "audio/ogg", AUDIO_ATTEMPTS),
+    "audio/": ("ogg", "audio/ogg", audio_attempts),
     "image/webp": ("png", "image/png", [IMAGE_ARGS]),
     "image/heic": ("png", "image/png", [IMAGE_ARGS]),
     "image/heif": ("png", "image/png", [IMAGE_ARGS]),
 }
 
 
-def conversion_for(mime_type: str | None) -> tuple[str, str, list[list[str]]] | None:
+def conversion_for(mime_type: str | None) -> tuple | None:
     """
     Подбирает правило перекодирования по mime-типу.
 
     :param mime_type: mime исходного файла
     :type mime_type: str | None
     :return: (расширение, новый mime, способы перекодирования) или None, если трогать
-        не надо
-    :rtype: tuple[str, str, list[list[str]]] | None
+        не надо. Способы - список или функция от пути к файлу
+    :rtype: tuple | None
     """
     if not mime_type:
         return None
@@ -146,10 +183,12 @@ def normalize(path: str, mime_type: str | None) -> tuple[str, str | None]:
     if rule is None or not os.path.exists(path):
         return path, mime_type
 
-    extension, new_mime, attempts = rule
+    extension, new_mime, ways = rule
     if shutil.which(FFMPEG) is None:
         logger.warning("ffmpeg не найден, %s уходит модели как есть.", path)
         return path, mime_type
+
+    attempts = ways(path) if callable(ways) else ways
 
     base = os.path.splitext(path)[0]
     target = f"{base}.{extension}"

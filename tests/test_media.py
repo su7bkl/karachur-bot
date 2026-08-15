@@ -264,3 +264,27 @@ def test_normalize_media_records_the_result(db, tmp_path, monkeypatch):
         "SELECT media_path, mime_type FROM messages WHERE message_id = 7"
     ).fetchone()
     assert stored == (str(tmp_path / "и.mp4"), "video/mp4")
+
+
+@needs_ffmpeg
+def test_aac_audio_is_recoded_to_opus(tmp_path):
+    """Аудио в чужом кодеке пережимается в opus, а не переливается как есть."""
+    source = tmp_path / "запись.m4a"
+    make_video(source, ["-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                        "-c:a", "aac"])
+
+    path, mime = media.normalize(str(source), "audio/mp4")
+
+    assert mime == "audio/ogg"
+    assert codec_of(path) == "opus"
+
+
+@needs_ffmpeg
+def test_audio_codec_is_detected(tmp_path):
+    """Кодек дорожки определяется, иначе не выбрать способ перекодирования."""
+    source = tmp_path / "звук.ogg"
+    make_video(source, ["-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                        "-c:a", "libopus"])
+
+    assert media.audio_codec(str(source)) == "opus"
+    assert media.audio_attempts(str(source))[0] == media.AUDIO_COPY
