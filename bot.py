@@ -30,11 +30,16 @@ from telegram.ext import (
 
 import commands
 from karachur import config, media
+
+# Модуль зовется request_contents, а не contents: имя contents тут занято самими
+# собираемыми списками содержимого запроса, и модуль ими бы перекрывался.
+from karachur.gemini import contents as request_contents
 from karachur.gemini import errors
 
-# Модуль зовется key_pool, а не pool: имя pool по всему коду занято самим пулом чата
+# Ровно та же история с пулом: имя pool по всему коду занято самим пулом чата
 # (аргументы обработчиков, поле сессии), и модуль под тем же именем ими бы перекрывался.
 from karachur.gemini import pool as key_pool
+from karachur.media import paths
 from karachur.session import ChatSession
 from karachur.storage import keys as key_store
 from karachur.storage import messages, schema, summaries
@@ -58,8 +63,6 @@ RETRY_DELAY_PATTERN = re.compile(
 GENERATING_PLACEHOLDER = "⏳ Генерирую ответ..."
 # В чат уходит полный текст ошибки, а в контекст модели - только эта короткая пометка.
 ERROR_CONTEXT_NOTE = "ошибка gemini api"
-# Заголовок, под которым сжатая история уходит в контекст следующих запросов.
-SUMMARY_HEADER = "[Сжатый пересказ более ранней части чата]"
 # Задача на сжатие. Уходит первой репликой, чтобы история читалась уже с ней в голове.
 SUMMARY_INSTRUCTION = (
     "[Служебная задача] Дальше идет начало истории группового чата, которое надо сжать, "
@@ -81,68 +84,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- БЛОК УТИЛИТ ДЛЯ МЕДИА ---
-
-# Файлы, выгруженные в Files API. Ключ кэша - пара (ключ Gemini, путь к файлу): выгрузка
-# принадлежит проекту того ключа, которым ее делали, и после ротации ссылка на нее
-# становится чужой. Поэтому для каждого ключа файл выгружается заново.
-uploaded_files = {}
-
-
-def get_extension_from_mime(mime: str | None) -> str:
-    """
-    Определяет расширение файла по его MIME-типу.
-
-    Args:
-        mime (str | None): MIME-тип файла.
-
-    Returns:
-        str: Расширение файла.
-    """
-    if not mime:
-        return "bin"
-    mime_map = {
-        "jpeg": "jpg",
-        "png": "png",
-        "gif": "gif",
-        "webp": "webp",
-        "ogg": "ogg",
-        "mp4": "mp4",
-        "mpeg": "mp3",
-        "pdf": "pdf",
-        "webm": "webm",
-    }
-    for key, value in mime_map.items():
-        if key in mime.lower():
-            return value
-    return mime.split("/")[-1]
-
-
-def get_media_path(
-    media_dir: str, file_id: str, mime_type: str | None, original_name: str | None
-) -> str | None:
-    """
-    Формирует путь к файлу для сохранения медиа.
-
-    :param media_dir: каталог, в котором бот держит скачанные файлы
-    :type media_dir: str
-    :param file_id: идентификатор файла в Telegram
-    :type file_id: str
-    :param mime_type: MIME-тип файла
-    :type mime_type: str | None
-    :param original_name: оригинальное имя файла
-    :type original_name: str | None
-    :return: путь к файлу или None, если файл не может быть сохранен
-    :rtype: str | None
-    """
-    if original_name and original_name.isascii():
-        safe_name = "".join(
-            c for c in original_name if c.isalnum() or c in (" ", ".", "_", "-")
-        ).strip()
-        return os.path.join(media_dir, safe_name)
-    if file_id:
-        ext = get_extension_from_mime(mime_type)
-        return os.path.join(media_dir, f"{file_id}.{ext}")
-    return None
 
 
 async def normalize_media(
@@ -171,86 +112,7 @@ async def normalize_media(
     messages.set_media_path(conn, message.chat_id, message.message_id, path, mime)
 
 
-async def download_media_file(application: Application, file_id: str, file_path: str):
-    """
-    Загружает медиа-файл из Telegram.
-
-    Args:
-        application (Application): Объект приложения Telegram.
-        file_id (str): Идентификатор файла в Telegram.
-        file_path (str): Путь для сохранения файла.
-    """
-    if os.path.exists(file_path):
-        return
-    try:
-        logger.info("Загрузка файла %s в %s...", file_id, file_path)  # lazy logging
-        tg_file = await application.bot.get_file(file_id)
-        await tg_file.download_to_drive(file_path)
-        logger.info("Файл успешно загружен: %s", file_path)  # lazy logging
-    except (OSError, IOError) as e:
-        logger.error("Ошибка загрузки файла %s: %s", file_id, e)  # lazy logging
-
-
 # --- БЛОК ИНТЕГРАЦИИ С GEMINI ---
-
-
-def check_file_validity(client: genai.Client, api_key: str, media_path: str):
-    """
-    Проверяет валидность файла
-
-    :param client: клиент ИИ
-    :type client: genai.Client
-    :param api_key: ключ Gemini, которым файл выгружали
-    :type api_key: str
-    :param media_path: путь к файлу
-    :type media_path: str
-    """
-    cache_key = (api_key, media_path)
-    if cache_key in uploaded_files:
-        try:
-            remote_file = client.files.get(name=uploaded_files[cache_key].name)
-            if remote_file.state.name != "ACTIVE":
-                logger.info(
-                    "Файл %s в состоянии %s, требуется перевыгрузка",
-                    media_path,
-                    remote_file.state.name,
-                )
-                del uploaded_files[cache_key]
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            logger.warning(
-                "Не удалось проверить статус файла %s, перевыгружаем: %s",
-                media_path,
-                e,
-            )
-            del uploaded_files[cache_key]
-
-
-def upload_file(client: genai.Client, api_key: str, media_path):
-    """
-    Загружает файл
-
-    :param client: клиент ИИ
-    :type client: genai.Client
-    :param api_key: ключ Gemini, от имени которого идет выгрузка
-    :type api_key: str
-    :param media_path: путь к файлу
-    :type media_path: str
-    """
-    uploaded_file = client.files.upload(file=media_path)
-
-    # Цикл ожидания перехода в рабочее состояние
-    while uploaded_file.state.name == "PROCESSING":
-        time.sleep(2)
-        uploaded_file = client.files.get(name=uploaded_file.name)
-
-    if uploaded_file.state.name == "ACTIVE":
-        uploaded_files[(api_key, media_path)] = uploaded_file
-    else:
-        logger.error(
-            "Файл %s после загрузки перешел в состояние %s",
-            media_path,
-            uploaded_file.state.name,
-        )
 
 
 class GeminiRetryError(Exception):
@@ -439,164 +301,6 @@ async def generate_with_retries(
     )
 
 
-def build_message_parts(
-    client: genai.Client, api_key: str, msg: dict, media_dir: str = ""
-) -> list:
-    """
-    Превращает одно сообщение из БД в части запроса к модели.
-
-    :param client: клиент ИИ
-    :type client: genai.Client
-    :param api_key: ключ Gemini, которым работает клиент
-    :type api_key: str
-    :param msg: строка таблицы messages в виде словаря
-    :type msg: dict
-    :param media_dir: каталог медиа; нужен только сообщениям, сохраненным до появления
-        колонки media_path - у них путь к файлу приходится вычислять по mime заново
-    :type media_dir: str
-    :return: список частей (текст плюс медиа, если оно есть)
-    :rtype: list
-    """
-    parts = []
-    content = msg.get("content")
-    if msg.get("is_bot"):
-        # Свои реплики модель получает без служебных пометок, чтобы не копировать их
-        # в новые ответы: роль "model" и так говорит, чьи это слова.
-        parts.append(genai.types.Part(text=content or "[Пустой ответ]"))
-    else:
-        author = msg.get("username") or "unknown"
-        text = f"[{author}]: {content}" if content else f"[{author}]"
-        note = notes.build_service_note(msg)
-        parts.append(genai.types.Part(text=f"{note}\n{text}" if note else text))
-
-    if msg.get("file_id") and msg.get("mime_type"):
-        # Путь перекодированного файла лежит в базе: после ffmpeg у него другое
-        # расширение, и по mime его уже не вычислить. У сообщений, сохраненных до
-        # перекодирования, колонка пуста - для них путь считается по-старому.
-        raw_path = msg.get("media_path") or get_media_path(
-            media_dir, msg["file_id"], msg["mime_type"], msg.get("file_name")
-        )
-        media_path = os.path.abspath(raw_path) if raw_path else None
-        if media_path and os.path.exists(media_path):
-            try:
-                file_size = os.path.getsize(media_path)
-                if file_size < 20 * 1024 * 1024:
-                    # Выгрузка принадлежит ключу, поэтому и кэш ведется по паре с ним.
-                    cache_key = (api_key, media_path)
-                    # Проверяем, есть ли файл в кэше и валиден ли он
-                    check_file_validity(client, api_key, media_path)
-
-                    # Загрузка, если файла нет в кэше (или он был удален выше)
-                    if cache_key not in uploaded_files:
-                        upload_file(client, api_key, media_path)
-
-                    # Если файл успешно загружен и активен
-                    if cache_key in uploaded_files:
-                        parts.append(
-                            genai.types.Part(
-                                file_data=genai.types.FileData(
-                                    file_uri=uploaded_files[cache_key].uri,
-                                    mime_type=uploaded_files[cache_key].mime_type,
-                                )
-                            )
-                        )
-                    else:
-                        parts.append(
-                            genai.types.Part(
-                                text="[Ошибка обработки файла - не удалось активировать]"
-                            )
-                        )
-                else:
-                    logger.warning(
-                        "Файл %s слишком большой (%.2f МБ), пропускаем",
-                        media_path,
-                        file_size / 1024 / 1024,
-                    )
-                    parts.append(
-                        genai.types.Part(
-                            text="[Файл слишком большой для обработки - пропущено]"
-                        )
-                    )
-            except Exception as e:  # pylint: disable=broad-exception-caught
-                logger.error(
-                    "Ошибка при работе с медиафайлом %s: %s",
-                    media_path,
-                    e,
-                )
-    return parts
-
-
-def build_history(key: dict, context_messages: list, media_dir: str) -> list:
-    """
-    Готовит историю переписки в виде реплик для модели.
-
-    Рядом с ролью и частями кладем исходную строку БД: по ней сжатие потом определяет,
-    на каком сообщении провести границу.
-
-    Медиа по дороге выгружается в Files API, то есть функция ходит в сеть и может
-    занять заметное время - зовите ее через asyncio.to_thread.
-
-    :param key: строка ключа Gemini из пула чата
-    :type key: dict
-    :param context_messages: список сообщений контекста
-    :type context_messages: list
-    :param media_dir: каталог медиа, откуда берутся файлы старых сообщений
-    :type media_dir: str
-    :return: список словарей вида {"role", "parts", "source"}
-    :rtype: list
-    """
-    client = key_pool.client_for_key(key["api_key"])
-    history = []
-    for msg in context_messages:
-        parts = build_message_parts(client, key["api_key"], msg, media_dir)
-        if parts:
-            role = "model" if msg.get("is_bot") else "user"
-            history.append({"role": role, "parts": parts, "source": msg})
-    return history
-
-
-def build_contents(history: list, summary: str | None, system_prompt: str) -> list:
-    """
-    Собирает итоговый запрос: системный промпт, пересказ и история.
-
-    Последняя реплика запроса всегда пользовательская: запрос, который заканчивается
-    репликой роли "model", Gemini отклоняет неустранимой ошибкой 400.
-
-    :param history: история переписки от build_history (непустая)
-    :type history: list
-    :param summary: пересказ сжатой части истории или None
-    :type summary: str | None
-    :param system_prompt: системный промпт, он же первая реплика запроса
-    :type system_prompt: str
-    :return: содержимое запроса к модели
-    :rtype: list
-    """
-    contents = [
-        genai.types.ContentDict(
-            role="user", parts=[genai.types.PartDict(text=system_prompt)]
-        )
-    ]
-
-    # Сжатая часть истории идет перед дословными сообщениями, в хронологическом порядке.
-    if summary:
-        contents.append(
-            genai.types.ContentDict(
-                role="user",
-                parts=[genai.types.PartDict(text=f"{SUMMARY_HEADER}\n{summary}")],
-            )
-        )
-
-    # Добавляем историю сообщений
-    for entry in history[:-1]:
-        contents.append(
-            genai.types.ContentDict(role=entry["role"], parts=entry["parts"])
-        )
-
-    contents.append(genai.types.ContentDict(role="user", parts=history[-1]["parts"]))
-
-    return contents
-
-
 # --- БЛОК СЖАТИЯ КОНТЕКСТА ---
 
 
@@ -733,7 +437,7 @@ async def summarize_history(
     async def make_contents(key: dict) -> list:
         """Собирает запрос на пересказ под конкретный ключ."""
         entries = await asyncio.to_thread(
-            build_history, key, context_messages, cfg.media_dir
+            request_contents.build_history, key, context_messages, cfg.media_dir
         )
         contents = [
             genai.types.ContentDict(
@@ -746,7 +450,8 @@ async def summarize_history(
                     role="user",
                     parts=[
                         genai.types.PartDict(
-                            text=f"{SUMMARY_HEADER}\n{previous_summary}"
+                            text=f"{request_contents.SUMMARY_HEADER}\n"
+                            f"{previous_summary}"
                         )
                     ],
                 )
@@ -805,7 +510,7 @@ async def compress_context(  # pylint: disable=too-many-arguments,too-many-posit
     """
     key = pool.active()
     history = await asyncio.to_thread(
-        build_history, key, context_messages, cfg.media_dir
+        request_contents.build_history, key, context_messages, cfg.media_dir
     )
 
     # Дешевая прикидка на входе: обычный чат до лимита не дотягивает, и тратить на него
@@ -823,11 +528,13 @@ async def compress_context(  # pylint: disable=too-many-arguments,too-many-posit
         if current_key["id"] != key["id"]:
             key = current_key
             history = await asyncio.to_thread(
-                build_history, key, context_messages, cfg.media_dir
+                request_contents.build_history, key, context_messages, cfg.media_dir
             )
 
         total_tokens = await count_context_tokens(
-            pool, key, build_contents(history, summary, cfg.system_prompt)
+            pool,
+            key,
+            request_contents.build_contents(history, summary, cfg.system_prompt),
         )
         if total_tokens is None:
             return context_messages, summary
@@ -913,9 +620,9 @@ async def generate_gemini_response(
     async def make_contents(key: dict) -> list:
         """Собирает запрос под конкретный ключ: медиа выгружается от его имени."""
         history = await asyncio.to_thread(
-            build_history, key, context_messages, cfg.media_dir
+            request_contents.build_history, key, context_messages, cfg.media_dir
         )
-        return build_contents(history, summary, cfg.system_prompt)
+        return request_contents.build_contents(history, summary, cfg.system_prompt)
 
     logger.info("Отправка запроса в Gemini...")
 
@@ -1125,9 +832,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_conn, message, is_bot=False
     )
     if file_id:
-        file_path = get_media_path(cfg.media_dir, file_id, mime_type, file_name)
+        file_path = paths.get_media_path(cfg.media_dir, file_id, mime_type, file_name)
         if file_path:
-            await download_media_file(context.application, file_id, file_path)
+            await paths.download_media_file(context.application, file_id, file_path)
             await normalize_media(db_conn, message, file_path, mime_type)
 
     if not (triggered_by_text or message.voice):

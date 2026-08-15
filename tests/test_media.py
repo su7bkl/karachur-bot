@@ -21,6 +21,7 @@ import pytest
 
 import bot
 from karachur import media
+from karachur.gemini import contents, files
 from karachur.media import ffmpeg
 from karachur.storage import messages
 
@@ -239,11 +240,13 @@ def test_stored_media_path_wins(db, tmp_path, monkeypatch):
     db.commit()
 
     used = []
-    monkeypatch.setattr(bot, "check_file_validity", lambda c, k, p: used.append(p))
-    monkeypatch.setattr(bot, "upload_file", lambda c, k, p: used.append(p))
+    # Подменяем атрибуты самого karachur.gemini.files: сборка запроса зовет выгрузку
+    # через модуль, а не по импортированному имени, - иначе подмена бы ее не достала.
+    monkeypatch.setattr(files, "check_file_validity", lambda c, k, p: used.append(p))
+    monkeypatch.setattr(files, "upload_file", lambda c, k, p: used.append(p))
 
     _, context = messages.get_context(db, -100)
-    bot.build_message_parts(None, "ключ", context[0])
+    contents.build_message_parts(None, "ключ", context[0])
 
     assert used == [str(converted), str(converted)]
 
