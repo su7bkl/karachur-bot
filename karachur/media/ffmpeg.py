@@ -1,5 +1,5 @@
 """
-Приведение скачанного медиа к форматам, которые Gemini заведомо понимает.
+Движок перекодирования: все, что умеет ffmpeg.
 
 Телеграм отдает файлы в том виде, в каком их собрал отправитель, и среди них попадаются
 контейнеры, на которых модель спотыкается. Реальный случай: видео-стикер, у которого в
@@ -16,8 +16,9 @@
     видео и gif  -> mp4  (H.264 + AAC)
     аудио и голос -> ogg/opus (голосовые - переливкой, без пересжатия)
     webp, heic   -> png
-    jpeg, png    -> остаются как есть
-    pdf, текст и прочее - не трогаем, там перекодировать нечего
+
+Кого сюда вообще звать, решает policy: этот модуль занят только кодированием и о
+документах, тексте и архивах ничего не знает.
 
 Если ffmpeg недоступен или не справился, файл остается прежним: перекодирование улучшает
 шансы, но не должно ломать работу бота.
@@ -57,6 +58,7 @@ AUDIO_COPY = ["-vn", "-c:a", "copy", "-f", "ogg"]
 AUDIO_OPUS = ["-vn", "-c:a", "libopus", "-b:a", "64k", "-f", "ogg"]
 # Из анимированного webp берем первый кадр: смысла в нем ровно на одну картинку.
 IMAGE_ARGS = ["-frames:v", "1"]
+
 
 def audio_codec(path: str) -> str | None:
     """
@@ -164,7 +166,7 @@ def run_ffmpeg(source: str, target: str, args: list[str]) -> bool:
     return True
 
 
-def normalize(path: str, mime_type: str | None) -> tuple[str, str | None]:
+def encode(path: str, mime_type: str | None) -> tuple[str, str | None]:
     """
     Перекодирует файл в формат, понятный модели.
 
@@ -173,7 +175,7 @@ def normalize(path: str, mime_type: str | None) -> tuple[str, str | None]:
 
     :param path: путь к скачанному файлу
     :type path: str
-    :param mime_type: mime, с которым файл пришел из Telegram
+    :param mime_type: mime, по которому подбирается правило перекодирования
     :type mime_type: str | None
     :return: (путь, mime) - новые после перекодирования или прежние, если она не нужна
         или не удалась
@@ -197,27 +199,31 @@ def normalize(path: str, mime_type: str | None) -> tuple[str, str | None]:
     staging = f"{base}.converting.{extension}"
 
     if not any(run_ffmpeg(path, staging, args) for args in attempts):
-        _remove(staging)
+        remove_quietly(staging)
         return path, mime_type
 
     try:
         os.replace(staging, target)
     except OSError as e:
         logger.warning("Не удалось положить перекодированный файл %s: %s", target, e)
-        _remove(staging)
+        remove_quietly(staging)
         return path, mime_type
 
     if target != path:
         # Исходник больше не нужен: в контекст пойдет перекодированный файл.
-        _remove(path)
+        remove_quietly(path)
 
     logger.info("Медиа перекодировано: %s (%s) -> %s (%s)", path, mime_type, target, new_mime)
     return target, new_mime
 
 
-def _remove(path: str):
+def remove_quietly(path: str):
     """
     Убирает файл, не поднимая шум, если его уже нет.
+
+    Лежит на виду, а не под подчеркиванием, потому что убирать исходник приходится и
+    после ffmpeg, и после конвертации документа в PDF: два одинаковых хелпера в соседних
+    модулях - тот же код, только дважды.
 
     :param path: путь к файлу
     :type path: str

@@ -4,6 +4,11 @@
 Правила подбора формата проверяются без ffmpeg, а сама перекодировка - настоящим
 вызовом на файлах, которые ffmpeg тут же и создает. Если ffmpeg в системе нет, эти
 тесты пропускаются: бот без него тоже работает, просто отдает файлы как есть.
+
+Вход в перекодирование - по-прежнему media.normalize, а вот сам движок переехал в
+karachur.media.ffmpeg: подменять и спрашивать про кодеки надо теперь его, потому что
+encode зовет run_ffmpeg через глобальные имена своего модуля. Что делать с форматами,
+которые ffmpeg не касается, проверяется отдельно в test_formats.py.
 """
 
 import asyncio
@@ -16,6 +21,7 @@ import pytest
 
 import bot
 from karachur import media
+from karachur.media import ffmpeg
 
 FFMPEG_MISSING = shutil.which("ffmpeg") is None
 needs_ffmpeg = pytest.mark.skipif(FFMPEG_MISSING, reason="в системе нет ffmpeg")
@@ -41,13 +47,13 @@ needs_ffmpeg = pytest.mark.skipif(FFMPEG_MISSING, reason="в системе не
 )
 def test_conversion_rules(mime, expected):
     """Каждому типу подбирается свой формат, а лишнее не трогается."""
-    rule = media.conversion_for(mime)
+    rule = ffmpeg.conversion_for(mime)
     assert (rule[1] if rule else None) == expected
 
 
 def test_mime_with_parameters_is_understood():
     """Mime с довеском разбирается наравне с чистым."""
-    rule = media.conversion_for("VIDEO/WEBM; codecs=vp9")
+    rule = ffmpeg.conversion_for("VIDEO/WEBM; codecs=vp9")
     assert rule is not None and rule[1] == "video/mp4"
 
 
@@ -60,7 +66,7 @@ def test_missing_file_is_left_alone(tmp_path):
 def test_untouched_types_skip_ffmpeg(tmp_path, monkeypatch):
     """Для jpeg ffmpeg вообще не зовется."""
     called = []
-    monkeypatch.setattr(media, "run_ffmpeg", lambda *a: called.append(a) or True)
+    monkeypatch.setattr(ffmpeg, "run_ffmpeg", lambda *a: called.append(a) or True)
     photo = tmp_path / "фото.jpg"
     photo.write_bytes(b"not a real jpeg")
 
@@ -70,7 +76,7 @@ def test_untouched_types_skip_ffmpeg(tmp_path, monkeypatch):
 
 def test_failed_conversion_keeps_the_original(tmp_path, monkeypatch):
     """Если ffmpeg не справился, остается исходный файл и исходный mime."""
-    monkeypatch.setattr(media, "run_ffmpeg", lambda *a: False)
+    monkeypatch.setattr(ffmpeg, "run_ffmpeg", lambda *a: False)
     source = tmp_path / "стикер.webm"
     source.write_bytes(b"broken webm")
 
@@ -81,7 +87,7 @@ def test_failed_conversion_keeps_the_original(tmp_path, monkeypatch):
 
 def test_missing_ffmpeg_keeps_the_original(tmp_path, monkeypatch):
     """Без ffmpeg бот работает по-прежнему, просто без перекодирования."""
-    monkeypatch.setattr(media.shutil, "which", lambda name: None)
+    monkeypatch.setattr(ffmpeg.shutil, "which", lambda name: None)
     source = tmp_path / "стикер.webm"
     source.write_bytes(b"webm")
 
@@ -286,5 +292,5 @@ def test_audio_codec_is_detected(tmp_path):
     make_video(source, ["-f", "lavfi", "-i", "sine=frequency=440:duration=1",
                         "-c:a", "libopus"])
 
-    assert media.audio_codec(str(source)) == "opus"
-    assert media.audio_attempts(str(source))[0] == media.AUDIO_COPY
+    assert ffmpeg.audio_codec(str(source)) == "opus"
+    assert ffmpeg.audio_attempts(str(source))[0] == ffmpeg.AUDIO_COPY
