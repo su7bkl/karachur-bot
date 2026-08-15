@@ -16,7 +16,7 @@ import chat_settings
 from conftest import CHAT_ONE, KEY_ONE, KEY_TWO
 
 
-def prepared_pool(conn, *keys, start_with=None, daily_limit=250):
+def prepared_pool(conn, *keys, start_with=None, daily_limit=250, model="gemini-test"):
     """Заводит чату ключи и ставит указатель на нужный."""
     for key in keys:
         api_keys.add_key(conn, CHAT_ONE, key)
@@ -25,12 +25,12 @@ def prepared_pool(conn, *keys, start_with=None, daily_limit=250):
             "SELECT id FROM api_keys WHERE api_key = ?", (start_with,)
         ).fetchone()
         chat_settings.set_active_key_id(conn, CHAT_ONE, row[0])
-    return api_keys.KeyPool(conn, CHAT_ONE, daily_limit)
+    return api_keys.KeyPool(conn, CHAT_ONE, model, daily_limit)
 
 
-def ask(pool, gemini, model="gemini-test"):
-    """Прогоняет запрос через цикл повторов."""
-    return asyncio.run(bot.generate_with_retries(pool, model, gemini.make_contents))
+def ask(pool, gemini):
+    """Прогоняет запрос через цикл повторов. Модель берется из самого пула."""
+    return asyncio.run(bot.generate_with_retries(pool, gemini.make_contents))
 
 
 def test_daily_quota_switches_key_and_rebuilds_request(db, gemini, api_error):
@@ -55,7 +55,14 @@ def test_spent_request_is_counted_on_the_key_that_answered(db, gemini, api_error
 
     ask(pool, gemini)
 
-    spent = dict(db.execute("SELECT api_key, requests_today FROM api_keys").fetchall())
+    spent = dict(
+        db.execute(
+            """
+            SELECT k.api_key, COALESCE(q.requests_today, 0) FROM api_keys k
+            LEFT JOIN key_quota q ON q.key_id = k.id
+            """
+        ).fetchall()
+    )
     assert spent[KEY_ONE] == 0
     assert spent[KEY_TWO] == 1
 
@@ -69,10 +76,8 @@ def test_rate_limit_keeps_the_same_key(db, gemini, api_error):
 
     assert answer == "ответ после паузы"
     assert gemini.calls == [KEY_ONE, KEY_ONE]
-    exhausted = db.execute(
-        "SELECT daily_exhausted FROM api_keys WHERE api_key = ?", (KEY_ONE,)
-    ).fetchone()[0]
-    assert not exhausted
+    exhausted = db.execute("SELECT COUNT(*) FROM key_quota WHERE daily_exhausted = 1")
+    assert exhausted.fetchone()[0] == 0
 
 
 def test_rejected_key_is_marked_and_replaced(db, gemini, api_error):
@@ -143,10 +148,10 @@ def test_exhausted_pool_stops_the_request(db, gemini, api_error):
 
 def test_chosen_model_reaches_the_api(db, gemini):
     """В запрос уходит модель, выбранная чатом."""
-    pool = prepared_pool(db, KEY_ONE, start_with=KEY_ONE)
+    pool = prepared_pool(db, KEY_ONE, start_with=KEY_ONE, model="gemini-3-pro")
     gemini.script(KEY_ONE, "готово")
 
-    ask(pool, gemini, model="gemini-3-pro")
+    ask(pool, gemini)
 
     assert gemini.models_used == ["gemini-3-pro"]
 
@@ -164,7 +169,7 @@ def test_context_is_compressed_and_saved(db, gemini, add_message, monkeypatch):
 
     _, messages = bot.get_context(db, CHAT_ONE)
     kept, summary = asyncio.run(
-        bot.compress_context(pool, "gemini-test", db, CHAT_ONE, messages, None)
+        bot.compress_context(pool, db, CHAT_ONE, messages, None)
     )
 
     assert summary == "пересказ старой части"
@@ -183,7 +188,7 @@ def test_small_context_is_left_alone(db, gemini, add_message):
 
     _, messages = bot.get_context(db, CHAT_ONE)
     kept, summary = asyncio.run(
-        bot.compress_context(pool, "gemini-test", db, CHAT_ONE, messages, None)
+        bot.compress_context(pool, db, CHAT_ONE, messages, None)
     )
 
     assert kept == messages

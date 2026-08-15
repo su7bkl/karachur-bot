@@ -33,9 +33,13 @@ HELP_TEXT = """Команды бота:
 /model default - вернуться к модели из настроек бота
 /help - эта справка
 
-Ключи относятся к чату: у каждого чата свой пул, своя история и своя модель. Когда ключ
-выбирает дневную квоту, бот сам переходит к следующему, а после полуночи по
-тихоокеанскому времени счетчики обнуляются."""
+Ключи относятся к чату: у каждого чата свой пул, своя история и своя модель. Когда у
+ключа кончается дневная квота, бот сам переходит к следующему, а после полуночи по
+тихоокеанскому времени счетчики обнуляются.
+
+Квота считается отдельно на каждую модель, поэтому /keys показывает счетчики по текущей
+модели чата. Если ключи кончились на одной модели, на другой они могут быть еще живы - у
+части моделей бесплатной квоты нет вовсе."""
 
 # Модель, которую /model понимает как "вернуться к настройке из config.cfg".
 DEFAULT_MODEL_ALIASES = frozenset({"default", "по умолчанию", "сброс", "reset"})
@@ -43,7 +47,10 @@ DEFAULT_MODEL_ALIASES = frozenset({"default", "по умолчанию", "сбр
 
 def _pool(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> api_keys.KeyPool:
     """
-    Собирает пул ключей чата из общих данных бота.
+    Собирает пул ключей чата под его текущую модель.
+
+    Модель нужна пулу не для запроса, а для счетчиков: дневная квота у Gemini своя на
+    каждую модель, и состояние ключа имеет смысл только вместе с ней.
 
     :param context: контекст обработчика
     :type context: ContextTypes.DEFAULT_TYPE
@@ -52,9 +59,9 @@ def _pool(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> api_keys.KeyPool:
     :return: пул ключей
     :rtype: api_keys.KeyPool
     """
-    return api_keys.KeyPool(
-        context.bot_data["db_conn"], chat_id, context.bot_data["key_rpd_limit"]
-    )
+    conn = context.bot_data["db_conn"]
+    model = chat_settings.get_model(conn, chat_id, context.bot_data["default_model"])
+    return api_keys.KeyPool(conn, chat_id, model, context.bot_data["key_rpd_limit"])
 
 
 def list_models(api_key: str) -> list[str]:
@@ -155,11 +162,9 @@ async def keys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         api_keys.describe_key(key, index, active_id, pool.daily_limit)
         for index, key in enumerate(keys, start=1)
     ]
-    model = chat_settings.get_model(
-        context.bot_data["db_conn"], chat_id, context.bot_data["default_model"]
-    )
     lines.append("")
-    lines.append(f"Модель чата: {model}")
+    lines.append(f"Модель чата: {pool.model}")
+    lines.append("Счетчики и квоты показаны по ней - у каждой модели квота своя.")
     await _reply(update, context, "\n".join(lines))
 
 
@@ -198,7 +203,7 @@ async def add_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    total = len(api_keys.list_chat_keys(conn, chat_id))
+    total = len(_pool(context, chat_id).keys())
     await _reply(
         update,
         context,
@@ -239,7 +244,7 @@ async def delete_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """
     chat_id = update.effective_chat.id
     conn = context.bot_data["db_conn"]
-    keys = api_keys.list_chat_keys(conn, chat_id)
+    keys = _pool(context, chat_id).keys()
 
     if not context.args:
         await _reply(
@@ -270,7 +275,7 @@ async def delete_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     api_keys.remove_key(conn, chat_id, key)
-    left = len(api_keys.list_chat_keys(conn, chat_id))
+    left = len(_pool(context, chat_id).keys())
     await _reply(
         update,
         context,

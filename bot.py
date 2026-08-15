@@ -955,9 +955,7 @@ def handle_api_failure(
     return exc
 
 
-async def generate_with_retries(
-    pool: api_keys.KeyPool, model: str, make_contents
-) -> str:
+async def generate_with_retries(pool: api_keys.KeyPool, make_contents) -> str:
     """
     Запрашивает ответ у Gemini, повторяя попытки при сбоях и меняя выдохшиеся ключи.
 
@@ -969,10 +967,8 @@ async def generate_with_retries(
     Смена ключа тратит попытку. Так цикл не может закружиться на пуле из сотни мертвых
     ключей, а на живом пуле лишние попытки и не понадобятся.
 
-    :param pool: пул ключей чата
+    :param pool: пул ключей чата, он же задает модель запроса
     :type pool: api_keys.KeyPool
-    :param model: имя модели Gemini
-    :type model: str
     :param make_contents: корутина, собирающая содержимое запроса под переданный ключ
     :return: текст ответа модели
     :rtype: str
@@ -996,7 +992,7 @@ async def generate_with_retries(
             # Вызов синхронный, уводим его в поток, чтобы не морозить event loop.
             response = await asyncio.to_thread(
                 pool.client(key).models.generate_content,
-                model=model,
+                model=pool.model,
                 contents=contents,
             )
         except Exception as e:  # pylint: disable=broad-exception-caught
@@ -1220,7 +1216,7 @@ def estimate_context_tokens(history: list, summary: str | None) -> float:
 
 
 async def count_context_tokens(
-    pool: api_keys.KeyPool, key: dict, model: str, contents: list
+    pool: api_keys.KeyPool, key: dict, contents: list
 ) -> int | None:
     """
     Считает точный размер запроса токенайзером Gemini.
@@ -1229,8 +1225,6 @@ async def count_context_tokens(
     :type pool: api_keys.KeyPool
     :param key: ключ, которым идем в API
     :type key: dict
-    :param model: имя модели Gemini
-    :type model: str
     :param contents: подготовленное содержимое запроса
     :type contents: list
     :return: число токенов или None, если посчитать не вышло
@@ -1239,7 +1233,7 @@ async def count_context_tokens(
     try:
         # Вызов синхронный, уводим его в поток, чтобы не морозить event loop.
         response = await asyncio.to_thread(
-            pool.client(key).models.count_tokens, model=model, contents=contents
+            pool.client(key).models.count_tokens, model=pool.model, contents=contents
         )
     except Exception as e:  # pylint: disable=broad-exception-caught
         logger.warning("Не удалось посчитать токены контекста: %s", e)
@@ -1281,7 +1275,7 @@ def choose_cut_index(history: list, total_tokens: int) -> int:
 
 
 async def summarize_history(
-    pool: api_keys.KeyPool, model: str, messages: list, previous_summary: str | None
+    pool: api_keys.KeyPool, messages: list, previous_summary: str | None
 ) -> str:
     """
     Просит модель пересказать кусок истории одним текстом.
@@ -1291,8 +1285,6 @@ async def summarize_history(
 
     :param pool: пул ключей чата
     :type pool: api_keys.KeyPool
-    :param model: имя модели Gemini
-    :type model: str
     :param messages: сообщения, которые надо сжать
     :type messages: list
     :param previous_summary: прошлый пересказ или None, если сжимаем впервые
@@ -1333,12 +1325,11 @@ async def summarize_history(
         return contents
 
     logger.info("Сжимаем %d самых старых сообщений в пересказ...", len(messages))
-    return (await generate_with_retries(pool, model, make_contents)).strip()
+    return (await generate_with_retries(pool, make_contents)).strip()
 
 
-async def compress_context(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+async def compress_context(
     pool: api_keys.KeyPool,
-    model: str,
     conn: sqlite3.Connection,
     chat_id: int,
     messages: list,
@@ -1356,10 +1347,8 @@ async def compress_context(  # pylint: disable=too-many-arguments,too-many-posit
     получить пересказ не вышло, отдаем контекст как есть и даем разбираться
     обычному механизму повторов.
 
-    :param pool: пул ключей чата
+    :param pool: пул ключей чата, он же задает модель запроса
     :type pool: api_keys.KeyPool
-    :param model: имя модели Gemini
-    :type model: str
     :param conn: соединение с базой данных
     :type conn: sqlite3.Connection
     :param chat_id: идентификатор чата
@@ -1391,7 +1380,7 @@ async def compress_context(  # pylint: disable=too-many-arguments,too-many-posit
             history = await asyncio.to_thread(build_history, key, messages)
 
         total_tokens = await count_context_tokens(
-            pool, key, model, build_contents(history, summary)
+            pool, key, build_contents(history, summary)
         )
         if total_tokens is None:
             return messages, summary
@@ -1415,7 +1404,7 @@ async def compress_context(  # pylint: disable=too-many-arguments,too-many-posit
         )
         compressed = [entry["source"] for entry in history[:cut]]
         try:
-            summary = await summarize_history(pool, model, compressed, summary)
+            summary = await summarize_history(pool, compressed, summary)
         except GeminiRetryError as e:
             logger.error("Не удалось сжать контекст, отправляем как есть: %s", e)
             return messages, summary
@@ -1430,9 +1419,8 @@ async def compress_context(  # pylint: disable=too-many-arguments,too-many-posit
     return messages, summary
 
 
-async def generate_gemini_response(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+async def generate_gemini_response(
     pool: api_keys.KeyPool,
-    model: str,
     conn: sqlite3.Connection,
     chat_id: int,
     context_messages: list,
@@ -1442,8 +1430,7 @@ async def generate_gemini_response(  # pylint: disable=too-many-arguments,too-ma
     Генерирует ответ с использованием модели Google Gemini AI на основе контекста чата.
 
     Args:
-        pool (api_keys.KeyPool): Пул ключей этого чата.
-        model (str): Имя модели Gemini, выбранное чатом.
+        pool (api_keys.KeyPool): Пул ключей этого чата, он же задает модель.
         conn (sqlite3.Connection): Соединение с БД - нужно, чтобы сохранить пересказ.
         chat_id (int): Идентификатор чата.
         context_messages (list): Список сообщений контекста.
@@ -1456,14 +1443,14 @@ async def generate_gemini_response(  # pylint: disable=too-many-arguments,too-ma
         "Чат %s: подготовка %d сообщений контекста для модели %s.",
         chat_id,
         len(context_messages),
-        model,
+        pool.model,
     )
     if not context_messages:
         logger.warning("Контекст для Gemini пуст. Отмена запроса.")
         return "Не могу обработать пустой запрос."
 
     messages, summary = await compress_context(
-        pool, model, conn, chat_id, context_messages, summary
+        pool, conn, chat_id, context_messages, summary
     )
 
     async def make_contents(key: dict) -> list:
@@ -1474,7 +1461,7 @@ async def generate_gemini_response(  # pylint: disable=too-many-arguments,too-ma
     logger.info("Отправка запроса в Gemini...")
 
     # Генерируем ответ с новым API, повторяя попытки при сбоях
-    response_text = await generate_with_retries(pool, model, make_contents)
+    response_text = await generate_with_retries(pool, make_contents)
     return strip_service_prefixes(response_text)
 
 
@@ -1624,15 +1611,15 @@ async def answer_chat(
                 f"Напиши расшифровку голосового сообщения. {current_content}"
             )
 
-    pool = api_keys.KeyPool(db_conn, chat_id, KEY_RPD_LIMIT)
     model = chat_settings.get_model(db_conn, chat_id, MODEL)
+    pool = api_keys.KeyPool(db_conn, chat_id, model, KEY_RPD_LIMIT)
 
     placeholder = await send_placeholder(message)
     err = False
 
     try:
         response_text = await generate_gemini_response(
-            pool, model, db_conn, chat_id, context_messages, summary
+            pool, db_conn, chat_id, context_messages, summary
         )
     except api_keys.NoUsableKeys as e:
         # Не поломка, а исчерпанный пул: человеку нужен не трейсбек, а что делать дальше.
