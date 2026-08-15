@@ -70,13 +70,12 @@ def init_key_tables(cursor: sqlite3.Cursor):
     :param cursor: курсор открытой базы
     :type cursor: sqlite3.Cursor
     """
+    # В самом ключе лежит только то, что от модели не зависит: отказ API - беда ключа
+    # целиком, а вот квоты и счетчики живут отдельно, в key_quota.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS api_keys (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             api_key TEXT UNIQUE NOT NULL,
-            quota_date TEXT,
-            requests_today INTEGER DEFAULT 0,
-            daily_exhausted INTEGER DEFAULT 0,
             broken_reason TEXT,
             added_at TEXT
         )
@@ -88,6 +87,20 @@ def init_key_tables(cursor: sqlite3.Cursor):
             position INTEGER NOT NULL,
             added_at TEXT,
             PRIMARY KEY (chat_id, key_id)
+        )
+    """)
+    # Дневную квоту Gemini считает на пару "проект и модель" - это видно и по имени
+    # квоты в ошибке: GenerateRequestsPerDayPerProjectPerModel. Поэтому счетчики ведутся
+    # на пару "ключ и модель": исчерпанная квота одной модели ничего не говорит о
+    # других, и помечать из-за нее весь ключ нельзя.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS key_quota (
+            key_id INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            quota_date TEXT,
+            requests_today INTEGER DEFAULT 0,
+            daily_exhausted INTEGER DEFAULT 0,
+            PRIMARY KEY (key_id, model)
         )
     """)
 
@@ -217,56 +230,99 @@ def _fetch_dicts(cursor: sqlite3.Cursor) -> list[dict]:
     return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
 
-def _reset_stale_days(conn: sqlite3.Connection, keys: list[dict]):
+def _reset_stale_days(conn: sqlite3.Connection, keys: list[dict], model: str):
     """
-    Обнуляет дневные счетчики ключей, у которых записанные сутки уже прошли.
+    Обнуляет счетчики, у которых записанные сутки уже прошли.
 
-    Сбрасываем лениво, при чтении: будильника на полночь у бота нет, а нужен свежий
-    счетчик ровно в тот момент, когда ключ собираются использовать.
+    Сбрасываем лениво, при чтении: будильника на полночь у бота нет, а свежий счетчик
+    нужен ровно в тот момент, когда ключ собираются использовать.
 
     :param conn: соединение с базой данных
     :type conn: sqlite3.Connection
     :param keys: прочитанные ключи; устаревшие поля правятся прямо в них
     :type keys: list[dict]
+    :param model: модель, к которой относятся счетчики
+    :type model: str
     """
     today = quota_date()
-    stale = [key for key in keys if key["quota_date"] != today]
+    stale = [key for key in keys if key["quota_date"] and key["quota_date"] != today]
     if not stale:
         return
 
     conn.executemany(
         """
-        UPDATE api_keys SET quota_date = ?, requests_today = 0, daily_exhausted = 0
-        WHERE id = ?
+        UPDATE key_quota SET quota_date = ?, requests_today = 0, daily_exhausted = 0
+        WHERE key_id = ? AND model = ?
         """,
-        [(today, key["id"]) for key in stale],
+        [(today, key["id"], model) for key in stale],
     )
     conn.commit()
     for key in stale:
         key.update(quota_date=today, requests_today=0, daily_exhausted=0)
-    logger.info("Дневные счетчики %d ключей обнулены: наступили новые сутки.", len(stale))
+    logger.info(
+        "Счетчики %d ключей по модели %s обнулены: наступили новые сутки.",
+        len(stale),
+        model,
+    )
 
 
-def list_chat_keys(conn: sqlite3.Connection, chat_id: int) -> list[dict]:
+def _linked_keys(conn: sqlite3.Connection, chat_id: int) -> list[dict]:
     """
-    Возвращает ключи, доступные чату: сначала свои, потом общий из config.cfg.
+    Возвращает ключи, привязанные к чату, без квот и счетчиков.
 
     :param conn: соединение с базой данных
     :type conn: sqlite3.Connection
     :param chat_id: идентификатор чата
     :type chat_id: int
-    :return: строки api_keys с дополнительным ключом "owner_chat_id"
+    :return: строки с полями id и api_key
     :rtype: list[dict]
     """
+    return _fetch_dicts(
+        conn.execute(
+            """
+            SELECT k.id, k.api_key FROM api_keys k
+            JOIN chat_keys ck ON ck.key_id = k.id
+            WHERE ck.chat_id = ?
+            ORDER BY ck.position, k.id
+            """,
+            (chat_id,),
+        )
+    )
+
+
+def list_chat_keys(conn: sqlite3.Connection, chat_id: int, model: str) -> list[dict]:
+    """
+    Возвращает ключи, доступные чату: сначала свои, потом общий из config.cfg.
+
+    Счетчики и пометка об исчерпанной квоте подтягиваются под конкретную модель:
+    квота у Gemini считается на пару "проект и модель", и у другой модели у того же
+    ключа свои счетчики.
+
+    :param conn: соединение с базой данных
+    :type conn: sqlite3.Connection
+    :param chat_id: идентификатор чата
+    :type chat_id: int
+    :param model: модель, к которой относятся счетчики
+    :type model: str
+    :return: строки ключей с полями owner_chat_id, position и счетчиками по модели
+    :rtype: list[dict]
+    """
+    # Колонки перечислены поименно, а не через k.*: в базах, заведенных до разделения
+    # квот по моделям, у api_keys остались одноименные колонки, и они бы все затерли.
     cursor = conn.execute(
         """
-        SELECT k.*, ck.chat_id AS owner_chat_id, ck.position AS position
+        SELECT k.id AS id, k.api_key AS api_key, k.broken_reason AS broken_reason,
+               ck.chat_id AS owner_chat_id, ck.position AS position,
+               q.quota_date AS quota_date,
+               COALESCE(q.requests_today, 0) AS requests_today,
+               COALESCE(q.daily_exhausted, 0) AS daily_exhausted
         FROM api_keys k
         JOIN chat_keys ck ON ck.key_id = k.id
+        LEFT JOIN key_quota q ON q.key_id = k.id AND q.model = ?
         WHERE ck.chat_id IN (?, ?)
         ORDER BY ck.chat_id = ?, ck.position, k.id
         """,
-        (chat_id, SHARED_CHAT_ID, SHARED_CHAT_ID),
+        (model, chat_id, SHARED_CHAT_ID, SHARED_CHAT_ID),
     )
     keys = _fetch_dicts(cursor)
 
@@ -277,7 +333,7 @@ def list_chat_keys(conn: sqlite3.Connection, chat_id: int) -> list[dict]:
         unique.setdefault(key["id"], key)
     keys = list(unique.values())
 
-    _reset_stale_days(conn, keys)
+    _reset_stale_days(conn, keys, model)
     return keys
 
 
@@ -296,11 +352,8 @@ def add_key(conn: sqlite3.Connection, chat_id: int, api_key: str) -> tuple[dict,
     """
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        """
-        INSERT OR IGNORE INTO api_keys (api_key, quota_date, requests_today, added_at)
-        VALUES (?, ?, 0, ?)
-        """,
-        (api_key, quota_date(), now),
+        "INSERT OR IGNORE INTO api_keys (api_key, added_at) VALUES (?, ?)",
+        (api_key, now),
     )
     key = _fetch_dicts(
         conn.execute("SELECT * FROM api_keys WHERE api_key = ?", (api_key,))
@@ -370,6 +423,7 @@ def remove_key(conn: sqlite3.Connection, chat_id: int, key: dict):
     if not left:
         # Ключ выпал из всех чатов: счетчики без него бессмысленны.
         conn.execute("DELETE FROM api_keys WHERE id = ?", (key["id"],))
+        conn.execute("DELETE FROM key_quota WHERE key_id = ?", (key["id"],))
     conn.commit()
     logger.info("Из чата %s удален ключ %s.", chat_id, mask_key(key["api_key"]))
 
@@ -387,7 +441,7 @@ def sync_shared_key(conn: sqlite3.Connection, api_key: str | None):
     :param api_key: ключ из config.cfg или None, если его там нет
     :type api_key: str | None
     """
-    for key in list_chat_keys(conn, SHARED_CHAT_ID):
+    for key in _linked_keys(conn, SHARED_CHAT_ID):
         if key["api_key"] != api_key:
             remove_key(conn, SHARED_CHAT_ID, key)
 
@@ -421,7 +475,7 @@ def describe_key(key: dict, index: int, active_id: int | None, daily_limit: int)
     if key["broken_reason"]:
         state = f"отклонен API: {key['broken_reason']}"
     elif key["daily_exhausted"]:
-        state = f"дневная квота выбрана, сброс в {describe_quota_reset()}"
+        state = f"квота на эту модель выбрана, сброс в {describe_quota_reset()}"
     else:
         limit = f" из {daily_limit}" if daily_limit else ""
         state = f"запросов сегодня: {key['requests_today']}{limit}"
@@ -432,34 +486,42 @@ def describe_key(key: dict, index: int, active_id: int | None, daily_limit: int)
 
 class KeyPool:
     """
-    Ключи одного чата и переключение между ними.
+    Ключи одного чата под одну модель и переключение между ними.
 
     Пул не держит состояние в себе: и счетчики, и указатель на активный ключ лежат в
     базе. Так ротация переживает перезапуск бота, а два чата с одним и тем же ключом
     видят один общий счетчик.
+
+    Пул всегда привязан к модели: дневная квота у Gemini своя на каждую пару "проект и
+    модель", поэтому выбранная квота одной модели ничего не говорит об остальных.
     """
 
-    def __init__(self, conn: sqlite3.Connection, chat_id: int, daily_limit: int):
+    def __init__(
+        self, conn: sqlite3.Connection, chat_id: int, model: str, daily_limit: int
+    ):
         """
         :param conn: соединение с базой данных
         :type conn: sqlite3.Connection
         :param chat_id: идентификатор чата
         :type chat_id: int
+        :param model: модель, для которой нужен ключ
+        :type model: str
         :param daily_limit: местный потолок запросов в сутки на ключ (0 - не считать)
         :type daily_limit: int
         """
         self.conn = conn
         self.chat_id = chat_id
+        self.model = model
         self.daily_limit = daily_limit
 
     def keys(self) -> list[dict]:
         """
-        Возвращает ключи, доступные чату.
+        Возвращает ключи, доступные чату, со счетчиками по модели пула.
 
         :return: строки ключей в порядке обхода
         :rtype: list[dict]
         """
-        return list_chat_keys(self.conn, self.chat_id)
+        return list_chat_keys(self.conn, self.chat_id, self.model)
 
     def active_key_id(self) -> int | None:
         """
@@ -601,7 +663,7 @@ class KeyPool:
 
     def note_request(self, key: dict):
         """
-        Отмечает потраченный запрос в дневном счетчике ключа.
+        Отмечает потраченный запрос в счетчике этой пары "ключ и модель".
 
         :param key: строка ключа
         :type key: dict
@@ -609,32 +671,49 @@ class KeyPool:
         today = quota_date()
         self.conn.execute(
             """
-            UPDATE api_keys
-            SET requests_today = CASE WHEN quota_date = ? THEN requests_today + 1 ELSE 1 END,
-                quota_date = ?
-            WHERE id = ?
+            INSERT INTO key_quota (key_id, model, quota_date, requests_today)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT(key_id, model) DO UPDATE SET
+                requests_today = CASE
+                    WHEN key_quota.quota_date = excluded.quota_date
+                    THEN key_quota.requests_today + 1 ELSE 1 END,
+                quota_date = excluded.quota_date
             """,
-            (today, today, key["id"]),
+            (key["id"], self.model, today),
         )
         self.conn.commit()
         key["requests_today"] = key.get("requests_today", 0) + 1
+        key["quota_date"] = today
 
     def mark_daily_exhausted(self, key: dict):
         """
-        Помечает, что ключ выбрал дневную квоту и до полуночи не годится.
+        Помечает, что у ключа кончилась дневная квота на модель пула.
+
+        Помечается именно пара "ключ и модель": квота у Gemini своя на каждую модель, и
+        выбранная квота одной из них не делает ключ негодным для остальных. Иначе один
+        запрос к модели без бесплатной квоты выводил бы из строя весь пул чата до
+        полуночи.
 
         :param key: строка ключа
         :type key: dict
         """
+        today = quota_date()
         self.conn.execute(
-            "UPDATE api_keys SET daily_exhausted = 1, quota_date = ? WHERE id = ?",
-            (quota_date(), key["id"]),
+            """
+            INSERT INTO key_quota (key_id, model, quota_date, daily_exhausted)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT(key_id, model) DO UPDATE SET
+                daily_exhausted = 1, quota_date = excluded.quota_date
+            """,
+            (key["id"], self.model, today),
         )
         self.conn.commit()
         key["daily_exhausted"] = 1
+        key["quota_date"] = today
         logger.warning(
-            "Ключ %s выбрал дневную квоту, сброс в %s.",
+            "У ключа %s кончилась дневная квота на модель %s, сброс в %s.",
             mask_key(key["api_key"]),
+            self.model,
             describe_quota_reset(),
         )
 
@@ -656,22 +735,6 @@ class KeyPool:
         key["broken_reason"] = short
         logger.error("Ключ %s отвергнут API: %s", mask_key(key["api_key"]), short)
 
-    def clear_daily_exhausted(self, key: dict):
-        """
-        Снимает с ключа пометку об исчерпанной дневной квоте.
-
-        Нужно для ручного возврата ключа в строй: если квоту подняли или бот ошибся с
-        разбором ошибки, ждать полуночи незачем.
-
-        :param key: строка ключа
-        :type key: dict
-        """
-        self.conn.execute(
-            "UPDATE api_keys SET daily_exhausted = 0, requests_today = 0 WHERE id = ?",
-            (key["id"],),
-        )
-        self.conn.commit()
-        key.update(daily_exhausted=0, requests_today=0)
 
     def _describe_dead_pool(self, keys: list[dict]) -> str:
         """
@@ -686,12 +749,19 @@ class KeyPool:
         exhausted = sum(1 for key in keys if key["daily_exhausted"])
         parts = []
         if exhausted:
-            parts.append(f"{exhausted} выбрали дневную квоту")
+            parts.append(f"у {exhausted} кончилась дневная квота на эту модель")
         if broken:
             parts.append(f"{broken} отклонены API")
         details = ", ".join(parts) if parts else "все непригодны"
-        return (
-            f"ни один из {len(keys)} ключей чата сейчас не работает ({details}). "
-            f"Квоты обнулятся в {describe_quota_reset()}, "
-            f"состояние ключей покажет /keys"
+        message = (
+            f"ни один из {len(keys)} ключей чата не работает с моделью "
+            f"{self.model} ({details}). "
         )
+        if exhausted:
+            # Квота считается на каждую модель отдельно, так что дело может быть не в
+            # ключах, а в модели - у части моделей бесплатной квоты нет вовсе.
+            message += (
+                f"Квоты на эту модель обнулятся в {describe_quota_reset()}, но у других "
+                "моделей квота своя: посмотрите /model. "
+            )
+        return message + "Состояние ключей покажет /keys"

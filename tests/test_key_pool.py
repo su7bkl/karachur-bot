@@ -1,20 +1,29 @@
 """
 Тесты пула ключей: владение, счетчики, выбытие и ротация.
 
-Отдельно проверяется, что счетчик запросов общий для всех чатов, где стоит один и тот
-же ключ: квоту Google считает на ключ, и раздельные счетчики врали бы вдвое.
+Отдельно проверяется, что счетчик общий для всех чатов с одним и тем же ключом, но
+раздельный для разных моделей: квоту Google считает на пару "проект и модель".
 """
 
 import pytest
 
 import api_keys
 import chat_settings
-from conftest import CHAT_ONE, CHAT_TWO, KEY_ONE, KEY_THREE, KEY_TWO, SHARED_KEY
+from conftest import (
+    CHAT_ONE,
+    CHAT_TWO,
+    KEY_ONE,
+    KEY_THREE,
+    KEY_TWO,
+    MODEL,
+    OTHER_MODEL,
+    SHARED_KEY,
+)
 
 
-def pool_for(conn, chat_id, daily_limit=250):
-    """Собирает пул ключей чата."""
-    return api_keys.KeyPool(conn, chat_id, daily_limit)
+def pool_for(conn, chat_id, daily_limit=250, model=MODEL):
+    """Собирает пул ключей чата под указанную модель."""
+    return api_keys.KeyPool(conn, chat_id, model, daily_limit)
 
 
 def test_keys_belong_to_their_chat(db):
@@ -23,8 +32,8 @@ def test_keys_belong_to_their_chat(db):
     api_keys.add_key(db, CHAT_ONE, KEY_TWO)
     api_keys.add_key(db, CHAT_TWO, KEY_THREE)
 
-    assert len(api_keys.list_chat_keys(db, CHAT_ONE)) == 2
-    assert [key["api_key"] for key in api_keys.list_chat_keys(db, CHAT_TWO)] == [
+    assert len(api_keys.list_chat_keys(db, CHAT_ONE, MODEL)) == 2
+    assert [key["api_key"] for key in api_keys.list_chat_keys(db, CHAT_TWO, MODEL)] == [
         KEY_THREE
     ]
 
@@ -35,7 +44,7 @@ def test_adding_the_same_key_twice_is_noticed(db):
     _, already = api_keys.add_key(db, CHAT_ONE, KEY_ONE)
 
     assert already
-    assert len(api_keys.list_chat_keys(db, CHAT_ONE)) == 1
+    assert len(api_keys.list_chat_keys(db, CHAT_ONE, MODEL)) == 1
 
 
 def test_counter_is_shared_between_chats(db):
@@ -48,7 +57,12 @@ def test_counter_is_shared_between_chats(db):
     pool_two.note_request(pool_two.active())
 
     spent = db.execute(
-        "SELECT requests_today FROM api_keys WHERE api_key = ?", (KEY_ONE,)
+        """
+        SELECT q.requests_today FROM key_quota q
+        JOIN api_keys k ON k.id = q.key_id
+        WHERE k.api_key = ? AND q.model = ?
+        """,
+        (KEY_ONE, MODEL),
     ).fetchone()[0]
     assert spent == 2
 
@@ -135,7 +149,7 @@ def test_dead_pool_reports_what_happened(db):
         pool.active()
 
     message = str(failure.value)
-    assert "выбрали дневную квоту" in message
+    assert "кончилась дневная квота" in message
     assert "отклонены API" in message
 
 
@@ -162,7 +176,7 @@ def test_rotate_without_spare_keys_returns_nothing(db):
 def test_removed_key_disappears_with_its_counters(db):
     """Ключ, выпавший из всех чатов, удаляется вместе со счетчиками."""
     api_keys.add_key(db, CHAT_ONE, KEY_ONE)
-    key = api_keys.list_chat_keys(db, CHAT_ONE)[0]
+    key = api_keys.list_chat_keys(db, CHAT_ONE, MODEL)[0]
 
     api_keys.remove_key(db, CHAT_ONE, key)
 
@@ -174,19 +188,19 @@ def test_key_used_elsewhere_survives_removal(db):
     """Ключ, оставшийся в другом чате, при удалении не пропадает."""
     api_keys.add_key(db, CHAT_ONE, KEY_ONE)
     api_keys.add_key(db, CHAT_TWO, KEY_ONE)
-    key = api_keys.list_chat_keys(db, CHAT_ONE)[0]
+    key = api_keys.list_chat_keys(db, CHAT_ONE, MODEL)[0]
 
     api_keys.remove_key(db, CHAT_ONE, key)
 
-    assert not api_keys.list_chat_keys(db, CHAT_ONE)
-    assert len(api_keys.list_chat_keys(db, CHAT_TWO)) == 1
+    assert not api_keys.list_chat_keys(db, CHAT_ONE, MODEL)
+    assert len(api_keys.list_chat_keys(db, CHAT_TWO, MODEL)) == 1
 
 
 def test_shared_key_is_available_everywhere(db):
     """Общий ключ из конфига виден всем чатам и помечен как общий."""
     api_keys.sync_shared_key(db, SHARED_KEY)
 
-    keys = api_keys.list_chat_keys(db, CHAT_TWO)
+    keys = api_keys.list_chat_keys(db, CHAT_TWO, MODEL)
 
     assert [key["api_key"] for key in keys] == [SHARED_KEY]
     assert keys[0]["owner_chat_id"] == api_keys.SHARED_CHAT_ID
@@ -197,7 +211,7 @@ def test_shared_key_follows_the_config(db):
     api_keys.sync_shared_key(db, SHARED_KEY)
     api_keys.sync_shared_key(db, KEY_TWO)
 
-    keys = api_keys.list_chat_keys(db, CHAT_ONE)
+    keys = api_keys.list_chat_keys(db, CHAT_ONE, MODEL)
 
     assert [key["api_key"] for key in keys] == [KEY_TWO]
 
@@ -213,13 +227,12 @@ def test_own_keys_come_before_the_shared_one(db):
 def test_yesterday_counters_are_reset(db):
     """Счетчики прошлых суток обнуляются при первом же обращении."""
     api_keys.add_key(db, CHAT_ONE, KEY_ONE)
-    db.execute(
-        "UPDATE api_keys SET quota_date = '2020-01-01', requests_today = 99, "
-        "daily_exhausted = 1"
-    )
+    pool = pool_for(db, CHAT_ONE)
+    pool.note_request(pool.active())
+    db.execute("UPDATE key_quota SET quota_date = '2020-01-01', requests_today = 99")
     db.commit()
 
-    key = api_keys.list_chat_keys(db, CHAT_ONE)[0]
+    key = api_keys.list_chat_keys(db, CHAT_ONE, MODEL)[0]
 
     assert key["requests_today"] == 0
     assert not key["daily_exhausted"]
@@ -235,7 +248,7 @@ def test_key_is_found_by_number_and_by_tail(db):
     """Ключ находится и по номеру в списке, и по хвосту самого ключа."""
     api_keys.add_key(db, CHAT_ONE, KEY_ONE)
     api_keys.add_key(db, CHAT_ONE, KEY_TWO)
-    keys = api_keys.list_chat_keys(db, CHAT_ONE)
+    keys = api_keys.list_chat_keys(db, CHAT_ONE, MODEL)
 
     assert found_key(keys, "2") == KEY_TWO
     assert found_key(keys, KEY_ONE[-6:]) == KEY_ONE
@@ -273,3 +286,71 @@ def test_api_errors_are_classified(api_error, code, message, expected):
 def test_connection_errors_are_retryable():
     """Ошибка без кода - обрыв связи или таймаут - считается временной."""
     assert api_keys.classify_api_error(TimeoutError("read timeout")) == "transient"
+
+
+def test_quota_is_counted_per_model(db):
+    """Счетчики одного ключа не смешиваются между моделями."""
+    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
+    first = pool_for(db, CHAT_ONE, model=MODEL)
+    second = pool_for(db, CHAT_ONE, model=OTHER_MODEL)
+
+    first.note_request(first.active())
+    first.note_request(first.active())
+    second.note_request(second.active())
+
+    assert first.keys()[0]["requests_today"] == 2
+    assert second.keys()[0]["requests_today"] == 1
+
+
+def test_exhausted_model_does_not_disable_the_key_elsewhere(db):
+    """Кончившаяся квота одной модели не выводит ключ из строя на других."""
+    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
+    spent = pool_for(db, CHAT_ONE, model="модель-без-квоты")
+    spent.mark_daily_exhausted(spent.active())
+
+    # На модели без квоты ключей не осталось...
+    with pytest.raises(api_keys.NoUsableKeys):
+        spent.active()
+    # ...а на рабочей модели тот же ключ по-прежнему годится.
+    assert pool_for(db, CHAT_ONE, model=MODEL).active()["api_key"] == KEY_ONE
+
+
+def test_model_without_quota_does_not_burn_the_whole_pool(db):
+    """Модель без бесплатной квоты не должна выжигать весь пул чата до полуночи."""
+    for key in (KEY_ONE, KEY_TWO, KEY_THREE):
+        api_keys.add_key(db, CHAT_ONE, key)
+
+    # Все три ключа спотыкаются об одну и ту же модель без квоты.
+    doomed = pool_for(db, CHAT_ONE, model="модель-без-квоты")
+    for _ in range(3):
+        doomed.mark_daily_exhausted(doomed.active())
+
+    with pytest.raises(api_keys.NoUsableKeys):
+        doomed.active()
+
+    working = pool_for(db, CHAT_ONE, model=MODEL)
+    assert len([key for key in working.keys() if working.is_usable(key)]) == 3
+
+
+def test_dead_pool_names_the_model(db):
+    """Отказ называет модель: дело может быть в ней, а не в ключах."""
+    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
+    pool = pool_for(db, CHAT_ONE, model="модель-без-квоты")
+    pool.mark_daily_exhausted(pool.active())
+
+    with pytest.raises(api_keys.NoUsableKeys) as failure:
+        pool.active()
+
+    message = str(failure.value)
+    assert "модель-без-квоты" in message
+    assert "/model" in message
+
+
+def test_broken_key_stays_broken_for_every_model(db):
+    """Отказ по самому ключу от модели не зависит."""
+    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
+    pool = pool_for(db, CHAT_ONE, model=MODEL)
+    pool.mark_broken(pool.active(), "403 PERMISSION_DENIED")
+
+    with pytest.raises(api_keys.NoUsableKeys):
+        pool_for(db, CHAT_ONE, model=OTHER_MODEL).active()

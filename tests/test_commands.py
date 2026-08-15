@@ -73,7 +73,7 @@ def test_key_list_marks_the_active_key_before_first_request(run_command):
 def test_broken_key_shows_its_reason(run_command, db):
     """Отклоненный ключ виден в списке вместе с причиной."""
     run_command.run(commands.add_key_command, KEY_ONE)
-    pool = api_keys.KeyPool(db, CHAT_ONE, 250)
+    pool = api_keys.KeyPool(db, CHAT_ONE, bot.MODEL, 250)
     pool.mark_broken(pool.active(), "403 PERMISSION_DENIED")
 
     assert "отклонен API" in run_command.run(commands.keys_command)
@@ -87,7 +87,7 @@ def test_rotate_switches_the_active_key(run_command, db):
     answer = run_command.run(commands.rotate_key_command)
 
     assert "Активный ключ теперь" in answer
-    assert api_keys.KeyPool(db, CHAT_ONE, 250).active()["api_key"] == KEY_TWO
+    assert api_keys.KeyPool(db, CHAT_ONE, bot.MODEL, 250).active()["api_key"] == KEY_TWO
 
 
 def test_rotate_needs_a_spare_key(run_command):
@@ -127,7 +127,7 @@ def test_shared_key_cannot_be_deleted_from_chat(run_command, db):
     answer = run_command.run(commands.delete_key_command, "1")
 
     assert "только оттуда" in answer
-    assert api_keys.list_chat_keys(db, CHAT_ONE)
+    assert api_keys.list_chat_keys(db, CHAT_ONE, bot.MODEL)
 
 
 def test_model_is_shown_with_the_available_list(run_command):
