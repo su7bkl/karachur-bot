@@ -5,9 +5,11 @@
 /addkey: команда доступна всем участникам, и ключ не должен оставаться в истории.
 """
 
-import api_keys
 import commands
 from conftest import CHAT_ONE, KEY_ONE, KEY_TWO, MODEL, SHARED_KEY
+
+# Модуль зовется key_pool, а не pool: имя pool в тестах занято самим пулом чата.
+from karachur.gemini import pool as key_pool
 from karachur.storage import keys as key_store
 from karachur.storage import settings
 
@@ -73,7 +75,7 @@ def test_key_list_marks_the_active_key_before_first_request(run_command):
 def test_broken_key_shows_its_reason(run_command, db):
     """Отклоненный ключ виден в списке вместе с причиной."""
     run_command.run(commands.add_key_command, KEY_ONE)
-    pool = api_keys.KeyPool(db, CHAT_ONE, MODEL, 250)
+    pool = key_pool.KeyPool(db, CHAT_ONE, MODEL, 250)
     pool.mark_broken(pool.active(), "403 PERMISSION_DENIED")
 
     assert "отклонен API" in run_command.run(commands.keys_command)
@@ -87,7 +89,7 @@ def test_rotate_switches_the_active_key(run_command, db):
     answer = run_command.run(commands.rotate_key_command)
 
     assert "Активный ключ теперь" in answer
-    assert api_keys.KeyPool(db, CHAT_ONE, MODEL, 250).active()["api_key"] == KEY_TWO
+    assert key_pool.KeyPool(db, CHAT_ONE, MODEL, 250).active()["api_key"] == KEY_TWO
 
 
 def test_rotate_needs_a_spare_key(run_command):

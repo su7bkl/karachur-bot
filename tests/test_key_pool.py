@@ -7,7 +7,6 @@
 
 import pytest
 
-import api_keys
 from conftest import (
     CHAT_ONE,
     CHAT_TWO,
@@ -18,13 +17,17 @@ from conftest import (
     OTHER_MODEL,
     SHARED_KEY,
 )
+from karachur.gemini import errors
+
+# Модуль зовется key_pool, а не pool: имя pool в тестах занято самим пулом чата.
+from karachur.gemini import pool as key_pool
 from karachur.storage import keys as key_store
 from karachur.storage import settings
 
 
 def pool_for(conn, chat_id, daily_limit=250, model=MODEL):
     """Собирает пул ключей чата под указанную модель."""
-    return api_keys.KeyPool(conn, chat_id, model, daily_limit)
+    return key_pool.KeyPool(conn, chat_id, model, daily_limit)
 
 
 def test_keys_belong_to_their_chat(db):
@@ -134,7 +137,7 @@ def test_broken_key_is_skipped(db):
 
 def test_empty_pool_explains_itself(db):
     """Чат без ключей получает подсказку, а не отказ без объяснений."""
-    with pytest.raises(api_keys.NoUsableKeys, match="/addkey"):
+    with pytest.raises(key_pool.NoUsableKeys, match="/addkey"):
         pool_for(db, CHAT_ONE).active()
 
 
@@ -146,7 +149,7 @@ def test_dead_pool_reports_what_happened(db):
     pool.mark_daily_exhausted(pool.active())
     pool.mark_broken(pool.active(), "403 PERMISSION_DENIED")
 
-    with pytest.raises(api_keys.NoUsableKeys) as failure:
+    with pytest.raises(key_pool.NoUsableKeys) as failure:
         pool.active()
 
     message = str(failure.value)
@@ -281,12 +284,12 @@ def test_masked_key_hides_the_middle():
 )
 def test_api_errors_are_classified(api_error, code, message, expected):
     """Ошибка API разбирается по коду и деталям квоты."""
-    assert api_keys.classify_api_error(api_error(code, message)) == expected
+    assert errors.classify_api_error(api_error(code, message)) == expected
 
 
 def test_connection_errors_are_retryable():
     """Ошибка без кода - обрыв связи или таймаут - считается временной."""
-    assert api_keys.classify_api_error(TimeoutError("read timeout")) == "transient"
+    assert errors.classify_api_error(TimeoutError("read timeout")) == "transient"
 
 
 def test_quota_is_counted_per_model(db):
@@ -310,7 +313,7 @@ def test_exhausted_model_does_not_disable_the_key_elsewhere(db):
     spent.mark_daily_exhausted(spent.active())
 
     # На модели без квоты ключей не осталось...
-    with pytest.raises(api_keys.NoUsableKeys):
+    with pytest.raises(key_pool.NoUsableKeys):
         spent.active()
     # ...а на рабочей модели тот же ключ по-прежнему годится.
     assert pool_for(db, CHAT_ONE, model=MODEL).active()["api_key"] == KEY_ONE
@@ -326,7 +329,7 @@ def test_model_without_quota_does_not_burn_the_whole_pool(db):
     for _ in range(3):
         doomed.mark_daily_exhausted(doomed.active())
 
-    with pytest.raises(api_keys.NoUsableKeys):
+    with pytest.raises(key_pool.NoUsableKeys):
         doomed.active()
 
     working = pool_for(db, CHAT_ONE, model=MODEL)
@@ -339,7 +342,7 @@ def test_dead_pool_names_the_model(db):
     pool = pool_for(db, CHAT_ONE, model="модель-без-квоты")
     pool.mark_daily_exhausted(pool.active())
 
-    with pytest.raises(api_keys.NoUsableKeys) as failure:
+    with pytest.raises(key_pool.NoUsableKeys) as failure:
         pool.active()
 
     message = str(failure.value)
@@ -353,5 +356,5 @@ def test_broken_key_stays_broken_for_every_model(db):
     pool = pool_for(db, CHAT_ONE, model=MODEL)
     pool.mark_broken(pool.active(), "403 PERMISSION_DENIED")
 
-    with pytest.raises(api_keys.NoUsableKeys):
+    with pytest.raises(key_pool.NoUsableKeys):
         pool_for(db, CHAT_ONE, model=OTHER_MODEL).active()

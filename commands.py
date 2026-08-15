@@ -17,7 +17,12 @@ from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
-import api_keys
+from karachur.gemini import errors
+
+# Модуль зовется key_pool, а не pool: имя pool по всему коду занято самим пулом чата
+# (локальные переменные команд, поле сессии), и модуль под тем же именем ими бы
+# перекрывался.
+from karachur.gemini import pool as key_pool
 from karachur.session import ChatSession
 from karachur.storage import keys as key_store
 from karachur.storage import settings
@@ -47,7 +52,7 @@ HELP_TEXT = """Команды бота:
 DEFAULT_MODEL_ALIASES = frozenset({"default", "по умолчанию", "сброс", "reset"})
 
 
-def _pool(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> api_keys.KeyPool:
+def _pool(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> key_pool.KeyPool:
     """
     Собирает пул ключей чата под его текущую модель.
 
@@ -59,7 +64,7 @@ def _pool(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> api_keys.KeyPool:
     :param chat_id: идентификатор чата
     :type chat_id: int
     :return: пул ключей
-    :rtype: api_keys.KeyPool
+    :rtype: key_pool.KeyPool
     """
     conn = context.bot_data["db_conn"]
     cfg = context.bot_data["cfg"]
@@ -75,7 +80,7 @@ def list_models(api_key: str) -> list[str]:
     :return: имена моделей, умеющих отвечать на запросы
     :rtype: list[str]
     """
-    client = api_keys.client_for_key(api_key)
+    client = key_pool.client_for_key(api_key)
     names = []
     for model in client.models.list():
         actions = getattr(model, "supported_actions", None)
@@ -156,7 +161,7 @@ async def keys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # запрос: пока чат ни разу не ходил в API, указателя еще нет, и без этого
         # /keys не пометил бы активным никого.
         active_id = pool.active()["id"]
-    except api_keys.NoUsableKeys:
+    except key_pool.NoUsableKeys:
         # Все ключи выбыли - помечать активным нечего.
         active_id = None
 
@@ -228,7 +233,7 @@ async def _probe_key(api_key: str) -> str | None:
     try:
         await asyncio.to_thread(list_models, api_key)
     except Exception as e:  # pylint: disable=broad-exception-caught
-        if api_keys.classify_api_error(e) == api_keys.ERROR_KIND_KEY:
+        if errors.classify_api_error(e) == errors.ERROR_KIND_KEY:
             return f"Gemini не принял этот ключ: {e}"
         # Сеть легла или API прилегло - ключ в этом не виноват, берем как есть.
         logger.warning("Не удалось проверить ключ, добавляем без проверки: %s", e)
@@ -381,7 +386,7 @@ async def _available_models(
     pool = _pool(context, chat_id)
     try:
         key = pool.active()
-    except api_keys.NoUsableKeys as e:
+    except key_pool.NoUsableKeys as e:
         logger.info("Список моделей для чата %s недоступен: %s", chat_id, e)
         return None
 

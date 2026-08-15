@@ -15,8 +15,11 @@ ChatSession.create - единственная точка, где эти четы
 import sqlite3
 from dataclasses import dataclass
 
-import api_keys
 from karachur import config
+
+# Модуль зовется key_pool, а не pool: имя pool по всему коду занято самим пулом чата
+# (поле сессии, аргументы обработчиков), и модуль под тем же именем ими бы перекрывался.
+from karachur.gemini import pool as key_pool
 from karachur.storage import settings
 
 
@@ -32,7 +35,7 @@ class ChatSession:
     cfg: config.Config
     conn: sqlite3.Connection
     chat_id: int
-    pool: api_keys.KeyPool
+    pool: key_pool.KeyPool
 
     @classmethod
     def create(
@@ -54,5 +57,5 @@ class ChatSession:
         :rtype: ChatSession
         """
         model = settings.get_model(conn, chat_id, cfg.model)
-        pool = api_keys.KeyPool(conn, chat_id, model, cfg.key_rpd_limit)
+        pool = key_pool.KeyPool(conn, chat_id, model, cfg.key_rpd_limit)
         return cls(cfg=cfg, conn=conn, chat_id=chat_id, pool=pool)

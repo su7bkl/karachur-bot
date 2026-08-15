@@ -11,9 +11,11 @@ import dataclasses
 
 import pytest
 
-import api_keys
 import bot
 from conftest import CHAT_ONE, KEY_ONE, KEY_TWO
+
+# Модуль зовется key_pool, а не pool: имя pool в тестах занято самим пулом чата.
+from karachur.gemini import pool as key_pool
 from karachur.storage import keys as key_store
 from karachur.storage import messages, settings, summaries
 
@@ -27,7 +29,7 @@ def prepared_pool(conn, *keys, start_with=None, daily_limit=250, model="gemini-t
             "SELECT id FROM api_keys WHERE api_key = ?", (start_with,)
         ).fetchone()
         settings.set_active_key_id(conn, CHAT_ONE, row[0])
-    return api_keys.KeyPool(conn, CHAT_ONE, model, daily_limit)
+    return key_pool.KeyPool(conn, CHAT_ONE, model, daily_limit)
 
 
 def ask(cfg, pool, gemini):
@@ -144,7 +146,7 @@ def test_exhausted_pool_stops_the_request(cfg, db, gemini, api_error):
     pool = prepared_pool(db, KEY_ONE, start_with=KEY_ONE)
     gemini.script(KEY_ONE, api_error.daily_quota())
 
-    with pytest.raises(api_keys.NoUsableKeys, match="/keys"):
+    with pytest.raises(key_pool.NoUsableKeys, match="/keys"):
         ask(cfg, pool, gemini)
 
 

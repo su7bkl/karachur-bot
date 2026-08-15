@@ -2,8 +2,8 @@
 Пул ключей Gemini: ключи принадлежат чату, бот сам переключается между ними.
 
 Хранение ключей - таблицы, привязка к чатам, дневные счетчики - лежит в
-karachur.storage.keys. Здесь остается поведение: кем из ключей идти в API сейчас, когда
-пора уходить на следующий и что вообще случилось с запросом.
+karachur.storage.keys, а разбор ошибок API - в karachur.gemini.errors. Здесь остается
+поведение: кем из ключей идти в API сейчас и когда пора уходить на следующий.
 
 Ключ выбывает из работы по двум причинам. Дневная квота (RPD) выбрана - до полуночи по
 тихоокеанскому времени, когда Google обнуляет счетчики. Ключ отвергнут API (401, 403,
@@ -12,7 +12,6 @@ karachur.storage.keys. Здесь остается поведение: кем и
 """
 
 import logging
-import re
 import sqlite3
 
 from google import genai
@@ -23,26 +22,6 @@ from karachur.storage import keys as key_store
 from karachur.storage import settings
 
 logger = logging.getLogger(__name__)
-
-# --- РАЗБОР ОШИБОК API ---
-# Что именно случилось, решает судьбу ключа, поэтому разбор живет рядом с пулом.
-# Дневная квота: ключ выбыл до полуночи, надо брать следующий.
-ERROR_KIND_DAILY = "daily"
-# Минутный лимит: ключ живой, просто частим - ждем и повторяем тем же ключом.
-ERROR_KIND_RATE = "rate"
-# Ключ отвергнут: больше он не заработает, помечаем и переключаемся.
-ERROR_KIND_KEY = "key"
-# Беда не в ключе, а в запросе или модели - повторять бессмысленно.
-ERROR_KIND_FATAL = "fatal"
-# Все остальное (500, обрывы связи, таймауты) - повторяем с паузой.
-ERROR_KIND_TRANSIENT = "transient"
-
-# В деталях 429 Gemini называет нарушенную квоту: "GenerateRequestsPerDayPerProjectPerModel".
-DAILY_QUOTA_PATTERN = re.compile(r"per[-_ ]?day", re.IGNORECASE)
-# "API key not valid. Please pass a valid API key." приезжает кодом 400, но это беда ключа.
-BAD_KEY_PATTERN = re.compile(r"api[-_ ]?key", re.IGNORECASE)
-KEY_ERROR_CODES = frozenset({401, 403})
-FATAL_ERROR_CODES = frozenset({400, 404})
 
 # Клиент - тонкая обертка над ключом, но плодить их на каждый запрос незачем.
 _CLIENTS: dict[str, genai.Client] = {}
@@ -66,55 +45,6 @@ def client_for_key(api_key: str) -> genai.Client:
         client = genai.Client(api_key=api_key)
         _CLIENTS[api_key] = client
     return client
-
-
-def get_error_code(exc: Exception) -> int | None:
-    """
-    Определяет HTTP-код ошибки Gemini API.
-
-    :param exc: пойманное исключение
-    :type exc: Exception
-    :return: код ответа или None, если определить не удалось (например, обрыв связи)
-    :rtype: int | None
-    """
-    for attr in ("code", "status_code"):
-        value = getattr(exc, attr, None)
-        if isinstance(value, bool):
-            continue
-        if isinstance(value, int):
-            return value
-        if isinstance(value, str) and value.isdigit():
-            return int(value)
-    # В разных версиях SDK текст ошибки начинается с кода: "429 RESOURCE_EXHAUSTED ..."
-    match = re.match(r"\s*(\d{3})\b", str(exc))
-    return int(match.group(1)) if match else None
-
-
-def classify_api_error(exc: Exception) -> str:
-    """
-    Решает, что случилось с запросом и что делать с ключом.
-
-    :param exc: пойманное исключение
-    :type exc: Exception
-    :return: одна из констант ERROR_KIND_*
-    :rtype: str
-    """
-    code = get_error_code(exc)
-    text = str(exc)
-
-    if code == 429:
-        # Дневную квоту от минутной отличаем по названию квоты в деталях ошибки: на
-        # минутной ключ менять не надо, достаточно подождать.
-        if DAILY_QUOTA_PATTERN.search(text):
-            return ERROR_KIND_DAILY
-        return ERROR_KIND_RATE
-    if code in KEY_ERROR_CODES:
-        return ERROR_KIND_KEY
-    if code == 400 and BAD_KEY_PATTERN.search(text):
-        return ERROR_KIND_KEY
-    if code in FATAL_ERROR_CODES:
-        return ERROR_KIND_FATAL
-    return ERROR_KIND_TRANSIENT
 
 
 class KeyPool:
@@ -371,7 +301,6 @@ class KeyPool:
         logger.error(
             "Ключ %s отвергнут API: %s", key_store.mask_key(key["api_key"]), short
         )
-
 
     def _describe_dead_pool(self, keys: list[dict]) -> str:
         """

@@ -28,9 +28,13 @@ from telegram.ext import (
     filters,
 )
 
-import api_keys
 import commands
 from karachur import config, media
+from karachur.gemini import errors
+
+# Модуль зовется key_pool, а не pool: имя pool по всему коду занято самим пулом чата
+# (аргументы обработчиков, поле сессии), и модуль под тем же именем ими бы перекрывался.
+from karachur.gemini import pool as key_pool
 from karachur.session import ChatSession
 from karachur.storage import keys as key_store
 from karachur.storage import messages, schema, summaries
@@ -309,13 +313,13 @@ def extract_response_text(response) -> tuple[str | None, str, bool]:
 
 
 def handle_api_failure(
-    pool: api_keys.KeyPool, key: dict, exc: Exception, attempt: int, max_retries: int
+    pool: key_pool.KeyPool, key: dict, exc: Exception, attempt: int, max_retries: int
 ) -> Exception | None:
     """
     Разбирает ошибку API: помечает ключ и решает, стоит ли ждать перед повтором.
 
     :param pool: пул ключей чата
-    :type pool: api_keys.KeyPool
+    :type pool: key_pool.KeyPool
     :param key: ключ, на котором упал запрос
     :type key: dict
     :param exc: пойманное исключение
@@ -329,20 +333,20 @@ def handle_api_failure(
     :rtype: Exception | None
     :raises GeminiRetryError: если повторять бессмысленно
     """
-    kind = api_keys.classify_api_error(exc)
-    code = api_keys.get_error_code(exc)
+    kind = errors.classify_api_error(exc)
+    code = errors.get_error_code(exc)
 
-    if kind == api_keys.ERROR_KIND_FATAL:
+    if kind == errors.ERROR_KIND_FATAL:
         logger.error("Неустранимая ошибка Gemini (код %s): %s", code, exc)
         raise GeminiRetryError(
             f"Неустранимая ошибка API на попытке {attempt} из {max_retries} "
             f"(код {code}): {exc}"
         ) from exc
 
-    if kind == api_keys.ERROR_KIND_DAILY:
+    if kind == errors.ERROR_KIND_DAILY:
         pool.mark_daily_exhausted(key)
         return None
-    if kind == api_keys.ERROR_KIND_KEY:
+    if kind == errors.ERROR_KIND_KEY:
         pool.mark_broken(key, exc)
         return None
 
@@ -351,7 +355,7 @@ def handle_api_failure(
 
 
 async def generate_with_retries(
-    cfg: config.Config, pool: api_keys.KeyPool, make_contents
+    cfg: config.Config, pool: key_pool.KeyPool, make_contents
 ) -> str:
     """
     Запрашивает ответ у Gemini, повторяя попытки при сбоях и меняя выдохшиеся ключи.
@@ -367,12 +371,12 @@ async def generate_with_retries(
     :param cfg: настройки бота - отсюда берутся число попыток и длина пауз
     :type cfg: config.Config
     :param pool: пул ключей чата, он же задает модель запроса
-    :type pool: api_keys.KeyPool
+    :type pool: key_pool.KeyPool
     :param make_contents: корутина, собирающая содержимое запроса под переданный ключ
     :return: текст ответа модели
     :rtype: str
     :raises GeminiRetryError: если попытки исчерпаны
-    :raises api_keys.NoUsableKeys: если в чате не осталось рабочих ключей
+    :raises key_pool.NoUsableKeys: если в чате не осталось рабочих ключей
     """
     last_reason = "причина неизвестна"
     contents = None
@@ -395,7 +399,7 @@ async def generate_with_retries(
                 contents=contents,
             )
         except Exception as e:  # pylint: disable=broad-exception-caught
-            last_reason = f"ошибка API {api_keys.get_error_code(e)}: {e}"
+            last_reason = f"ошибка API {errors.get_error_code(e)}: {e}"
             failure = handle_api_failure(pool, key, e, attempt, cfg.max_retries)
         else:
             pool.note_request(key)
@@ -541,7 +545,7 @@ def build_history(key: dict, context_messages: list, media_dir: str) -> list:
     :return: список словарей вида {"role", "parts", "source"}
     :rtype: list
     """
-    client = api_keys.client_for_key(key["api_key"])
+    client = key_pool.client_for_key(key["api_key"])
     history = []
     for msg in context_messages:
         parts = build_message_parts(client, key["api_key"], msg, media_dir)
@@ -640,13 +644,13 @@ def estimate_context_tokens(
 
 
 async def count_context_tokens(
-    pool: api_keys.KeyPool, key: dict, contents: list
+    pool: key_pool.KeyPool, key: dict, contents: list
 ) -> int | None:
     """
     Считает точный размер запроса токенайзером Gemini.
 
     :param pool: пул ключей чата
-    :type pool: api_keys.KeyPool
+    :type pool: key_pool.KeyPool
     :param key: ключ, которым идем в API
     :type key: dict
     :param contents: подготовленное содержимое запроса
@@ -703,7 +707,7 @@ def choose_cut_index(cfg: config.Config, history: list, total_tokens: int) -> in
 
 async def summarize_history(
     cfg: config.Config,
-    pool: api_keys.KeyPool,
+    pool: key_pool.KeyPool,
     context_messages: list,
     previous_summary: str | None,
 ) -> str:
@@ -716,7 +720,7 @@ async def summarize_history(
     :param cfg: настройки бота
     :type cfg: config.Config
     :param pool: пул ключей чата
-    :type pool: api_keys.KeyPool
+    :type pool: key_pool.KeyPool
     :param context_messages: сообщения, которые надо сжать
     :type context_messages: list
     :param previous_summary: прошлый пересказ или None, если сжимаем впервые
@@ -766,7 +770,7 @@ async def summarize_history(
 
 async def compress_context(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     cfg: config.Config,
-    pool: api_keys.KeyPool,
+    pool: key_pool.KeyPool,
     conn: sqlite3.Connection,
     chat_id: int,
     context_messages: list,
@@ -787,7 +791,7 @@ async def compress_context(  # pylint: disable=too-many-arguments,too-many-posit
     :param cfg: настройки бота - отсюда лимит контекста и правила сжатия
     :type cfg: config.Config
     :param pool: пул ключей чата, он же задает модель запроса
-    :type pool: api_keys.KeyPool
+    :type pool: key_pool.KeyPool
     :param conn: соединение с базой данных
     :type conn: sqlite3.Connection
     :param chat_id: идентификатор чата
@@ -868,7 +872,7 @@ async def compress_context(  # pylint: disable=too-many-arguments,too-many-posit
 
 async def generate_gemini_response(
     cfg: config.Config,
-    pool: api_keys.KeyPool,
+    pool: key_pool.KeyPool,
     conn: sqlite3.Connection,
     chat_id: int,
     context_messages: list,
@@ -880,7 +884,7 @@ async def generate_gemini_response(
     :param cfg: настройки бота
     :type cfg: config.Config
     :param pool: пул ключей этого чата, он же задает модель
-    :type pool: api_keys.KeyPool
+    :type pool: key_pool.KeyPool
     :param conn: соединение с БД - нужно, чтобы сохранить пересказ
     :type conn: sqlite3.Connection
     :param chat_id: идентификатор чата
@@ -1080,7 +1084,7 @@ async def answer_chat(
         response_text = await generate_gemini_response(
             cfg, pool, db_conn, chat_id, context_messages, summary
         )
-    except api_keys.NoUsableKeys as e:
+    except key_pool.NoUsableKeys as e:
         # Не поломка, а исчерпанный пул: человеку нужен не трейсбек, а что делать дальше.
         logger.warning("Чат %s остался без рабочего ключа: %s", chat_id, e)
         response_text = f"Не могу ответить: {e}"

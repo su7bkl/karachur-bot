@@ -18,9 +18,11 @@ import asyncio
 
 import pytest
 
-import api_keys
 import commands
 from karachur import config
+
+# Модуль зовется key_pool, а не pool: имя pool в тестах занято самим пулом чата.
+from karachur.gemini import pool as key_pool
 from karachur.storage import schema
 
 # Ключи в тестах намеренно непохожи на настоящие, но той же длины и формы.
@@ -355,15 +357,18 @@ def gemini_fixture(monkeypatch):
     """
     Подменяет клиента Gemini подделкой.
 
-    Подменяется именно атрибут модуля api_keys: бот зовет client_for_key через модуль,
-    и подмена работает для всех, кто им пользуется.
+    Подменяется именно атрибут модуля karachur.gemini.pool: и бот, и сам пул зовут
+    client_for_key через модуль, а не по импортированному имени, поэтому подмена
+    работает для всех, кто им пользуется. Если где-то появится
+    "from karachur.gemini.pool import client_for_key", это имя будет указывать на
+    настоящую функцию, подмена его не достанет, и тест молча уйдет в сеть.
 
     :param monkeypatch: штатная подмена атрибутов pytest
     :return: держатель сценариев ответов
     :rtype: FakeGemini
     """
     fake = FakeGemini()
-    monkeypatch.setattr(api_keys, "client_for_key", fake.client_for_key)
+    monkeypatch.setattr(key_pool, "client_for_key", fake.client_for_key)
     return fake
 
 
