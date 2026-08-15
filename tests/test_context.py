@@ -12,6 +12,7 @@ import pytest
 
 import bot
 from conftest import CHAT_ONE, CHAT_TWO
+from karachur.text import notes
 
 
 def test_same_message_id_in_two_chats(db, add_message):
@@ -54,7 +55,7 @@ def test_missing_reply_target_is_described(db, add_message):
     add_message(CHAT_ONE, 7, "ответ на что-то древнее", reply_to=1)
 
     _, messages = bot.get_context(db, CHAT_ONE)
-    note = bot.build_service_note(messages[-1]) or ""
+    note = notes.build_service_note(messages[-1]) or ""
 
     assert "которого нет в истории" in note
 
@@ -140,7 +141,7 @@ def test_attachment_kind_reaches_the_model(db, kind, expected):
     db.commit()
 
     _, messages = bot.get_context(db, CHAT_ONE)
-    note = bot.build_service_note(messages[0]) or ""
+    note = notes.build_service_note(messages[0]) or ""
 
     assert f"Вложение: {expected}" in note
 
@@ -151,9 +152,9 @@ def test_message_without_attachment_has_no_note(db, add_message):
 
     _, messages = bot.get_context(db, CHAT_ONE)
 
-    assert bot.build_service_note(messages[0]) is None
+    assert notes.build_service_note(messages[0]) is None
 
 
 def test_copied_attachment_note_is_stripped():
     """Если модель скопирует пометку о вложении, она срезается."""
-    assert bot.strip_service_prefixes("[Вложение: гифка] ответ") == "ответ"
+    assert notes.strip_service_prefixes("[Вложение: гифка] ответ") == "ответ"
