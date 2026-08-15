@@ -18,6 +18,7 @@ from conftest import (
     OTHER_MODEL,
     SHARED_KEY,
 )
+from karachur.storage import keys as key_store
 from karachur.storage import settings
 
 
@@ -28,29 +29,29 @@ def pool_for(conn, chat_id, daily_limit=250, model=MODEL):
 
 def test_keys_belong_to_their_chat(db):
     """Ключ виден только тому чату, которому его добавили."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
-    api_keys.add_key(db, CHAT_ONE, KEY_TWO)
-    api_keys.add_key(db, CHAT_TWO, KEY_THREE)
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.add_key(db, CHAT_ONE, KEY_TWO)
+    key_store.add_key(db, CHAT_TWO, KEY_THREE)
 
-    assert len(api_keys.list_chat_keys(db, CHAT_ONE, MODEL)) == 2
-    assert [key["api_key"] for key in api_keys.list_chat_keys(db, CHAT_TWO, MODEL)] == [
+    assert len(key_store.list_chat_keys(db, CHAT_ONE, MODEL)) == 2
+    assert [key["api_key"] for key in key_store.list_chat_keys(db, CHAT_TWO, MODEL)] == [
         KEY_THREE
     ]
 
 
 def test_adding_the_same_key_twice_is_noticed(db):
     """Повторное добавление ключа не плодит дублей."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
-    _, already = api_keys.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
+    _, already = key_store.add_key(db, CHAT_ONE, KEY_ONE)
 
     assert already
-    assert len(api_keys.list_chat_keys(db, CHAT_ONE, MODEL)) == 1
+    assert len(key_store.list_chat_keys(db, CHAT_ONE, MODEL)) == 1
 
 
 def test_counter_is_shared_between_chats(db):
     """У одного ключа в двух чатах общий дневной счетчик."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
-    api_keys.add_key(db, CHAT_TWO, KEY_ONE)
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.add_key(db, CHAT_TWO, KEY_ONE)
 
     pool_one, pool_two = pool_for(db, CHAT_ONE), pool_for(db, CHAT_TWO)
     pool_one.note_request(pool_one.active())
@@ -69,8 +70,8 @@ def test_counter_is_shared_between_chats(db):
 
 def test_daily_quota_moves_chat_to_the_next_key(db):
     """Выбранная дневная квота уводит чат на следующий ключ."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
-    api_keys.add_key(db, CHAT_ONE, KEY_TWO)
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.add_key(db, CHAT_ONE, KEY_TWO)
     pool = pool_for(db, CHAT_ONE)
 
     pool.mark_daily_exhausted(pool.active())
@@ -80,8 +81,8 @@ def test_daily_quota_moves_chat_to_the_next_key(db):
 
 def test_active_key_survives_restart(db):
     """Указатель активного ключа живет в базе, а не в памяти пула."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
-    api_keys.add_key(db, CHAT_ONE, KEY_TWO)
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.add_key(db, CHAT_ONE, KEY_TWO)
     pool = pool_for(db, CHAT_ONE)
     pool.mark_daily_exhausted(pool.active())
     pool.active()
@@ -93,7 +94,7 @@ def test_active_key_survives_restart(db):
 
 def test_local_limit_does_not_block_the_last_live_key(db):
     """Собственный счетчик - страховка: при живой квоте он не запрещает работу."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
     pool = pool_for(db, CHAT_ONE, daily_limit=2)
 
     key = pool.active()
@@ -105,8 +106,8 @@ def test_local_limit_does_not_block_the_last_live_key(db):
 
 def test_local_limit_prefers_a_fresher_key(db):
     """При выборе бот сначала обходит ключи, не выбравшие местный лимит."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
-    api_keys.add_key(db, CHAT_ONE, KEY_TWO)
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.add_key(db, CHAT_ONE, KEY_TWO)
     pool = pool_for(db, CHAT_ONE, daily_limit=2)
 
     first = pool.active()
@@ -118,8 +119,8 @@ def test_local_limit_prefers_a_fresher_key(db):
 
 def test_broken_key_is_skipped(db):
     """Отклоненный API ключ выбывает вместе с причиной."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
-    api_keys.add_key(db, CHAT_ONE, KEY_TWO)
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.add_key(db, CHAT_ONE, KEY_TWO)
     pool = pool_for(db, CHAT_ONE)
 
     pool.mark_broken(pool.active(), "403 PERMISSION_DENIED")
@@ -139,8 +140,8 @@ def test_empty_pool_explains_itself(db):
 
 def test_dead_pool_reports_what_happened(db):
     """Исчерпанный пул объясняет, кто выбыл по квоте, а кто отклонен."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
-    api_keys.add_key(db, CHAT_ONE, KEY_TWO)
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.add_key(db, CHAT_ONE, KEY_TWO)
     pool = pool_for(db, CHAT_ONE)
     pool.mark_daily_exhausted(pool.active())
     pool.mark_broken(pool.active(), "403 PERMISSION_DENIED")
@@ -155,8 +156,8 @@ def test_dead_pool_reports_what_happened(db):
 
 def test_rotate_moves_off_the_current_key(db):
     """Принудительная ротация уходит именно с текущего ключа."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
-    api_keys.add_key(db, CHAT_ONE, KEY_TWO)
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.add_key(db, CHAT_ONE, KEY_TWO)
     pool = pool_for(db, CHAT_ONE)
     pool.active()
 
@@ -168,17 +169,17 @@ def test_rotate_moves_off_the_current_key(db):
 
 def test_rotate_without_spare_keys_returns_nothing(db):
     """Ротировать единственный ключ не на что."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
 
     assert pool_for(db, CHAT_ONE).rotate("тест") is None
 
 
 def test_removed_key_disappears_with_its_counters(db):
     """Ключ, выпавший из всех чатов, удаляется вместе со счетчиками."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
-    key = api_keys.list_chat_keys(db, CHAT_ONE, MODEL)[0]
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
+    key = key_store.list_chat_keys(db, CHAT_ONE, MODEL)[0]
 
-    api_keys.remove_key(db, CHAT_ONE, key)
+    key_store.remove_key(db, CHAT_ONE, key)
 
     left = db.execute("SELECT COUNT(*) FROM api_keys").fetchone()[0]
     assert left == 0
@@ -186,53 +187,53 @@ def test_removed_key_disappears_with_its_counters(db):
 
 def test_key_used_elsewhere_survives_removal(db):
     """Ключ, оставшийся в другом чате, при удалении не пропадает."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
-    api_keys.add_key(db, CHAT_TWO, KEY_ONE)
-    key = api_keys.list_chat_keys(db, CHAT_ONE, MODEL)[0]
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.add_key(db, CHAT_TWO, KEY_ONE)
+    key = key_store.list_chat_keys(db, CHAT_ONE, MODEL)[0]
 
-    api_keys.remove_key(db, CHAT_ONE, key)
+    key_store.remove_key(db, CHAT_ONE, key)
 
-    assert not api_keys.list_chat_keys(db, CHAT_ONE, MODEL)
-    assert len(api_keys.list_chat_keys(db, CHAT_TWO, MODEL)) == 1
+    assert not key_store.list_chat_keys(db, CHAT_ONE, MODEL)
+    assert len(key_store.list_chat_keys(db, CHAT_TWO, MODEL)) == 1
 
 
 def test_shared_key_is_available_everywhere(db):
     """Общий ключ из конфига виден всем чатам и помечен как общий."""
-    api_keys.sync_shared_key(db, SHARED_KEY)
+    key_store.sync_shared_key(db, SHARED_KEY)
 
-    keys = api_keys.list_chat_keys(db, CHAT_TWO, MODEL)
+    keys = key_store.list_chat_keys(db, CHAT_TWO, MODEL)
 
     assert [key["api_key"] for key in keys] == [SHARED_KEY]
-    assert keys[0]["owner_chat_id"] == api_keys.SHARED_CHAT_ID
+    assert keys[0]["owner_chat_id"] == key_store.SHARED_CHAT_ID
 
 
 def test_shared_key_follows_the_config(db):
     """Замена ключа в конфиге отвязывает прежний общий ключ."""
-    api_keys.sync_shared_key(db, SHARED_KEY)
-    api_keys.sync_shared_key(db, KEY_TWO)
+    key_store.sync_shared_key(db, SHARED_KEY)
+    key_store.sync_shared_key(db, KEY_TWO)
 
-    keys = api_keys.list_chat_keys(db, CHAT_ONE, MODEL)
+    keys = key_store.list_chat_keys(db, CHAT_ONE, MODEL)
 
     assert [key["api_key"] for key in keys] == [KEY_TWO]
 
 
 def test_own_keys_come_before_the_shared_one(db):
     """Свои ключи чат тратит раньше общего."""
-    api_keys.sync_shared_key(db, SHARED_KEY)
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.sync_shared_key(db, SHARED_KEY)
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
 
     assert pool_for(db, CHAT_ONE).active()["api_key"] == KEY_ONE
 
 
 def test_yesterday_counters_are_reset(db):
     """Счетчики прошлых суток обнуляются при первом же обращении."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
     pool = pool_for(db, CHAT_ONE)
     pool.note_request(pool.active())
     db.execute("UPDATE key_quota SET quota_date = '2020-01-01', requests_today = 99")
     db.commit()
 
-    key = api_keys.list_chat_keys(db, CHAT_ONE, MODEL)[0]
+    key = key_store.list_chat_keys(db, CHAT_ONE, MODEL)[0]
 
     assert key["requests_today"] == 0
     assert not key["daily_exhausted"]
@@ -240,15 +241,15 @@ def test_yesterday_counters_are_reset(db):
 
 def found_key(keys, reference):
     """Ищет ключ по ссылке и возвращает сам ключ или None."""
-    found = api_keys.find_key(keys, reference)
+    found = key_store.find_key(keys, reference)
     return found["api_key"] if found else None
 
 
 def test_key_is_found_by_number_and_by_tail(db):
     """Ключ находится и по номеру в списке, и по хвосту самого ключа."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
-    api_keys.add_key(db, CHAT_ONE, KEY_TWO)
-    keys = api_keys.list_chat_keys(db, CHAT_ONE, MODEL)
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.add_key(db, CHAT_ONE, KEY_TWO)
+    keys = key_store.list_chat_keys(db, CHAT_ONE, MODEL)
 
     assert found_key(keys, "2") == KEY_TWO
     assert found_key(keys, KEY_ONE[-6:]) == KEY_ONE
@@ -258,7 +259,7 @@ def test_key_is_found_by_number_and_by_tail(db):
 
 def test_masked_key_hides_the_middle():
     """В чат и логи уходят только концы ключа."""
-    masked = api_keys.mask_key(KEY_ONE)
+    masked = key_store.mask_key(KEY_ONE)
 
     assert KEY_ONE not in masked
     assert masked.endswith(KEY_ONE[-4:])
@@ -290,7 +291,7 @@ def test_connection_errors_are_retryable():
 
 def test_quota_is_counted_per_model(db):
     """Счетчики одного ключа не смешиваются между моделями."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
     first = pool_for(db, CHAT_ONE, model=MODEL)
     second = pool_for(db, CHAT_ONE, model=OTHER_MODEL)
 
@@ -304,7 +305,7 @@ def test_quota_is_counted_per_model(db):
 
 def test_exhausted_model_does_not_disable_the_key_elsewhere(db):
     """Кончившаяся квота одной модели не выводит ключ из строя на других."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
     spent = pool_for(db, CHAT_ONE, model="модель-без-квоты")
     spent.mark_daily_exhausted(spent.active())
 
@@ -318,7 +319,7 @@ def test_exhausted_model_does_not_disable_the_key_elsewhere(db):
 def test_model_without_quota_does_not_burn_the_whole_pool(db):
     """Модель без бесплатной квоты не должна выжигать весь пул чата до полуночи."""
     for key in (KEY_ONE, KEY_TWO, KEY_THREE):
-        api_keys.add_key(db, CHAT_ONE, key)
+        key_store.add_key(db, CHAT_ONE, key)
 
     # Все три ключа спотыкаются об одну и ту же модель без квоты.
     doomed = pool_for(db, CHAT_ONE, model="модель-без-квоты")
@@ -334,7 +335,7 @@ def test_model_without_quota_does_not_burn_the_whole_pool(db):
 
 def test_dead_pool_names_the_model(db):
     """Отказ называет модель: дело может быть в ней, а не в ключах."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
     pool = pool_for(db, CHAT_ONE, model="модель-без-квоты")
     pool.mark_daily_exhausted(pool.active())
 
@@ -348,7 +349,7 @@ def test_dead_pool_names_the_model(db):
 
 def test_broken_key_stays_broken_for_every_model(db):
     """Отказ по самому ключу от модели не зависит."""
-    api_keys.add_key(db, CHAT_ONE, KEY_ONE)
+    key_store.add_key(db, CHAT_ONE, KEY_ONE)
     pool = pool_for(db, CHAT_ONE, model=MODEL)
     pool.mark_broken(pool.active(), "403 PERMISSION_DENIED")
 

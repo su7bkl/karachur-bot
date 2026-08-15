@@ -4,15 +4,15 @@
 Раньше это жило в bot.py вместе со всем остальным. Здесь именно форма таблиц и
 индексов - работа с данными в них остается в своих модулях: karachur.storage.messages
 (сообщения), karachur.storage.summaries (пересказы), karachur.storage.settings
-(настройки чата), api_keys (ключи).
+(настройки чата), karachur.storage.keys (ключи).
 """
 
 import logging
 import os
 import sqlite3
 
-import api_keys
 from karachur.storage import db, settings
+from karachur.storage import keys as key_store
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +73,7 @@ def init_db(db_file: str, media_dir: str) -> sqlite3.Connection:
             created_at TEXT
         )
     """)
-    api_keys.init_key_tables(cursor)
+    key_store.init_key_tables(cursor)
     settings.init_settings_table(cursor)
     conn.commit()
     return conn

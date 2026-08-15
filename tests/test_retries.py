@@ -14,13 +14,14 @@ import pytest
 import api_keys
 import bot
 from conftest import CHAT_ONE, KEY_ONE, KEY_TWO
+from karachur.storage import keys as key_store
 from karachur.storage import messages, settings, summaries
 
 
 def prepared_pool(conn, *keys, start_with=None, daily_limit=250, model="gemini-test"):
     """Заводит чату ключи и ставит указатель на нужный."""
     for key in keys:
-        api_keys.add_key(conn, CHAT_ONE, key)
+        key_store.add_key(conn, CHAT_ONE, key)
     if start_with:
         row = conn.execute(
             "SELECT id FROM api_keys WHERE api_key = ?", (start_with,)

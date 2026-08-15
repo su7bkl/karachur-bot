@@ -8,6 +8,7 @@
 import api_keys
 import commands
 from conftest import CHAT_ONE, KEY_ONE, KEY_TWO, MODEL, SHARED_KEY
+from karachur.storage import keys as key_store
 from karachur.storage import settings
 
 
@@ -121,12 +122,12 @@ def test_unknown_key_is_not_deleted(run_command):
 
 def test_shared_key_cannot_be_deleted_from_chat(run_command, db):
     """Общий ключ из конфига командой не убрать."""
-    api_keys.sync_shared_key(db, SHARED_KEY)
+    key_store.sync_shared_key(db, SHARED_KEY)
 
     answer = run_command.run(commands.delete_key_command, "1")
 
     assert "только оттуда" in answer
-    assert api_keys.list_chat_keys(db, CHAT_ONE, MODEL)
+    assert key_store.list_chat_keys(db, CHAT_ONE, MODEL)
 
 
 def test_model_is_shown_with_the_available_list(run_command):

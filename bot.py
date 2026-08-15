@@ -32,6 +32,7 @@ import api_keys
 import commands
 from karachur import config, media
 from karachur.session import ChatSession
+from karachur.storage import keys as key_store
 from karachur.storage import messages, schema, summaries
 from karachur.text import notes
 from karachur.text.html_splitter import split_html_message
@@ -1168,7 +1169,7 @@ def main():
     db_connection = schema.init_db(cfg.db_file, cfg.media_dir)
 
     # Ключ из конфига доступен всем чатам сразу; свои чат добавляет командой /addkey.
-    api_keys.sync_shared_key(db_connection, cfg.gemini_api_key)
+    key_store.sync_shared_key(db_connection, cfg.gemini_api_key)
     if not cfg.gemini_api_key:
         logger.info(
             "Общий ключ в config.cfg не задан - чаты работают только на своих ключах."

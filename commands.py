@@ -19,6 +19,7 @@ from telegram.ext import ContextTypes
 
 import api_keys
 from karachur.session import ChatSession
+from karachur.storage import keys as key_store
 from karachur.storage import settings
 
 logger = logging.getLogger(__name__)
@@ -160,7 +161,7 @@ async def keys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_id = None
 
     lines = [
-        api_keys.describe_key(key, index, active_id, pool.daily_limit)
+        key_store.describe_key(key, index, active_id, pool.daily_limit)
         for index, key in enumerate(keys, start=1)
     ]
     lines.append("")
@@ -197,10 +198,10 @@ async def add_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply(update, context, problem)
         return
 
-    key, already = api_keys.add_key(conn, chat_id, api_key)
+    key, already = key_store.add_key(conn, chat_id, api_key)
     if already:
         await _reply(
-            update, context, f"Ключ {api_keys.mask_key(api_key)} уже есть в пуле чата."
+            update, context, f"Ключ {key_store.mask_key(api_key)} уже есть в пуле чата."
         )
         return
 
@@ -208,7 +209,7 @@ async def add_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply(
         update,
         context,
-        f"Ключ {api_keys.mask_key(key['api_key'])} добавлен. Ключей в пуле: {total}.",
+        f"Ключ {key_store.mask_key(key['api_key'])} добавлен. Ключей в пуле: {total}.",
     )
 
 
@@ -258,7 +259,7 @@ async def delete_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _reply(update, context, "У чата нет ключей - удалять нечего.")
         return
 
-    key = api_keys.find_key(keys, context.args[0])
+    key = key_store.find_key(keys, context.args[0])
     if key is None:
         await _reply(
             update,
@@ -266,21 +267,21 @@ async def delete_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "Такого ключа в пуле чата нет. Актуальный список покажет /keys",
         )
         return
-    if key["owner_chat_id"] == api_keys.SHARED_CHAT_ID:
+    if key["owner_chat_id"] == key_store.SHARED_CHAT_ID:
         await _reply(
             update,
             context,
-            f"Ключ {api_keys.mask_key(key['api_key'])} общий для всех чатов и задан в "
+            f"Ключ {key_store.mask_key(key['api_key'])} общий для всех чатов и задан в "
             "настройках бота - убрать его можно только оттуда.",
         )
         return
 
-    api_keys.remove_key(conn, chat_id, key)
+    key_store.remove_key(conn, chat_id, key)
     left = len(_pool(context, chat_id).keys())
     await _reply(
         update,
         context,
-        f"Ключ {api_keys.mask_key(key['api_key'])} удален. Ключей в пуле: {left}.",
+        f"Ключ {key_store.mask_key(key['api_key'])} удален. Ключей в пуле: {left}.",
     )
 
 
@@ -320,7 +321,7 @@ async def rotate_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     await _reply(
-        update, context, f"Активный ключ теперь {api_keys.mask_key(key['api_key'])}."
+        update, context, f"Активный ключ теперь {key_store.mask_key(key['api_key'])}."
     )
 
 
