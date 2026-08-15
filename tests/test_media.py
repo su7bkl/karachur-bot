@@ -28,8 +28,8 @@ needs_ffmpeg = pytest.mark.skipif(FFMPEG_MISSING, reason="в системе не
         ("video/mp4", "video/mp4"),
         ("video/quicktime", "video/mp4"),
         ("image/gif", "video/mp4"),
-        ("audio/ogg", "audio/aac"),
-        ("audio/mpeg", "audio/aac"),
+        ("audio/ogg", "audio/ogg"),
+        ("audio/mpeg", "audio/ogg"),
         ("image/webp", "image/png"),
         ("image/heic", "image/png"),
         ("image/jpeg", None),
@@ -148,17 +148,45 @@ def test_broken_duration_is_repaired(tmp_path):
     assert abs(float(probed.stdout.strip()) - 6.0) < 0.5
 
 
+def codec_of(path):
+    """Возвращает кодек аудиодорожки файла."""
+    probed = subprocess.run(
+        ["ffprobe", "-loglevel", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", str(path)],
+        check=True, capture_output=True, text=True,
+    )
+    return probed.stdout.strip()
+
+
 @needs_ffmpeg
-def test_audio_becomes_aac(tmp_path):
-    """Голосовое переводится в aac."""
+def test_voice_is_remuxed_without_recompression(tmp_path):
+    """
+    Голосовое переливается в новый контейнер, но дорожка остается прежней.
+
+    Телеграм присылает opus, Gemini его принимает - пересжимать речь незачем, а
+    заголовки при переливке все равно пересобираются.
+    """
     source = tmp_path / "голос.ogg"
-    make_video(source, ["-f", "lavfi", "-i", "sine=frequency=440:duration=1"])
+    make_video(source, ["-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                        "-c:a", "libopus"])
 
     path, mime = media.normalize(str(source), "audio/ogg")
 
-    assert mime == "audio/aac"
-    assert path.endswith(".aac")
-    assert os.path.getsize(path) > 0
+    assert mime == "audio/ogg"
+    assert path.endswith(".ogg")
+    assert codec_of(path) == "opus"
+
+
+@needs_ffmpeg
+def test_audio_that_cannot_be_remuxed_is_recoded(tmp_path):
+    """То, что в ogg не переливается (wav и прочее), пережимается в opus."""
+    source = tmp_path / "запись.wav"
+    make_video(source, ["-f", "lavfi", "-i", "sine=frequency=440:duration=1"])
+
+    path, mime = media.normalize(str(source), "audio/wav")
+
+    assert mime == "audio/ogg"
+    assert codec_of(path) == "opus"
 
 
 @needs_ffmpeg

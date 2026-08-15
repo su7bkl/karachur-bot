@@ -14,7 +14,7 @@
 
 Что во что переводится:
     видео и gif  -> mp4  (H.264 + AAC)
-    аудио и голос -> aac
+    аудио и голос -> ogg (переливкой без потерь, если получится)
     webp, heic   -> png
     jpeg, png    -> остаются как есть
     pdf, текст и прочее - не трогаем, там перекодировать нечего
@@ -48,30 +48,38 @@ VIDEO_ARGS = [
     "-b:a", "96k",
     "-movflags", "+faststart",
 ]
-# Голосовые приходят в ogg/opus; aac понимают все модели, а кодировщик встроен в ffmpeg.
-AUDIO_ARGS = ["-vn", "-c:a", "aac", "-b:a", "96k", "-f", "adts"]
+# Голосовые приходят из Telegram в ogg/opus, и Gemini этот формат принимает. Поэтому
+# сначала пробуем просто перелить дорожку в новый контейнер: заголовки пересобираются, а
+# звук остается ровно тем же - для расшифровки речи это заметно лучше повторного сжатия.
+# Переливка не проходит с mp3 и прочим, что в ogg не укладывается: для них - libopus.
+AUDIO_ATTEMPTS = [
+    ["-vn", "-c:a", "copy", "-f", "ogg"],
+    ["-vn", "-c:a", "libopus", "-b:a", "64k", "-f", "ogg"],
+]
 # Из анимированного webp берем первый кадр: смысла в нем ровно на одну картинку.
 IMAGE_ARGS = ["-frames:v", "1"]
 
-# Во что переводить каждый тип. Ключ - начало mime, значение - (расширение, mime, аргументы).
+# Во что переводить каждый тип. Ключ - начало mime, значение - (расширение, mime,
+# способы). Способов может быть несколько: пробуем по очереди, пока какой-нибудь не выйдет.
 CONVERSIONS = {
-    "video/": ("mp4", "video/mp4", VIDEO_ARGS),
-    "image/gif": ("mp4", "video/mp4", VIDEO_ARGS),
-    "audio/": ("aac", "audio/aac", AUDIO_ARGS),
-    "image/webp": ("png", "image/png", IMAGE_ARGS),
-    "image/heic": ("png", "image/png", IMAGE_ARGS),
-    "image/heif": ("png", "image/png", IMAGE_ARGS),
+    "video/": ("mp4", "video/mp4", [VIDEO_ARGS]),
+    "image/gif": ("mp4", "video/mp4", [VIDEO_ARGS]),
+    "audio/": ("ogg", "audio/ogg", AUDIO_ATTEMPTS),
+    "image/webp": ("png", "image/png", [IMAGE_ARGS]),
+    "image/heic": ("png", "image/png", [IMAGE_ARGS]),
+    "image/heif": ("png", "image/png", [IMAGE_ARGS]),
 }
 
 
-def conversion_for(mime_type: str | None) -> tuple[str, str, list[str]] | None:
+def conversion_for(mime_type: str | None) -> tuple[str, str, list[list[str]]] | None:
     """
     Подбирает правило перекодирования по mime-типу.
 
     :param mime_type: mime исходного файла
     :type mime_type: str | None
-    :return: (расширение, новый mime, аргументы ffmpeg) или None, если трогать не надо
-    :rtype: tuple[str, str, list[str]] | None
+    :return: (расширение, новый mime, способы перекодирования) или None, если трогать
+        не надо
+    :rtype: tuple[str, str, list[list[str]]] | None
     """
     if not mime_type:
         return None
@@ -138,7 +146,7 @@ def normalize(path: str, mime_type: str | None) -> tuple[str, str | None]:
     if rule is None or not os.path.exists(path):
         return path, mime_type
 
-    extension, new_mime, args = rule
+    extension, new_mime, attempts = rule
     if shutil.which(FFMPEG) is None:
         logger.warning("ffmpeg не найден, %s уходит модели как есть.", path)
         return path, mime_type
@@ -149,7 +157,7 @@ def normalize(path: str, mime_type: str | None) -> tuple[str, str | None]:
     # цель может совпадать с ним по имени (mp4 в mp4 мы тоже пересобираем).
     staging = f"{base}.converting.{extension}"
 
-    if not run_ffmpeg(path, staging, args):
+    if not any(run_ffmpeg(path, staging, args) for args in attempts):
         _remove(staging)
         return path, mime_type
 
