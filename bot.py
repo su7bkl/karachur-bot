@@ -10,7 +10,6 @@
 # pylint: disable=too-many-lines
 
 import asyncio
-import configparser
 import logging
 import os
 import random
@@ -32,100 +31,22 @@ from telegram.ext import (
 
 import api_keys
 import commands
-from karachur import media
+from karachur import config, media
 from karachur.storage import settings
 from karachur.text import notes
 from karachur.text.html_splitter import split_html_message
 from karachur.text.markdown import markdown_to_telegram_html
 
 
-# --- ЧТЕНИЕ НАСТРОЕК ---
-# Путь к конфигу можно задать переменной окружения: бота запускают и не из его папки,
-# а тестам нужен свой конфиг, не трогающий рабочий.
-CONFIG_ENV_VAR = "KARACHUR_CONFIG"
+# --- НАСТРОЙКИ ---
+# Настройки живут в karachur.config и собираются в main(): дальше по коду они идут
+# явными аргументами, а не модульными глобалами. Модульным здесь остается только то,
+# что настройкой не является и никогда не меняется - тексты и регулярки.
 
-
-def load_config(config_path=None):
-    """
-    Загружает настройки из конфигурационного файла (UTF-8).
-
-    Args:
-        config_path (str | None): Путь к файлу конфигурации. Если не задан, берется из
-        переменной окружения KARACHUR_CONFIG, а по умолчанию - config.cfg рядом с ботом.
-
-    Returns:
-        dict: Словарь с настройками.
-    """
-    if config_path is None:
-        config_path = os.environ.get(CONFIG_ENV_VAR, "config.cfg")
-
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Файл конфигурации не найден: {config_path}")
-
-    config = configparser.ConfigParser()
-    with open(config_path, "r", encoding="utf-8") as f:
-        config.read_file(f)
-
-    config_values = {
-        "BOT_TOKEN": config.get("SETTINGS", "BOT_TOKEN"),
-        "DB_FILE": config.get("SETTINGS", "DB_FILE"),
-        "MEDIA_DIR": config.get("SETTINGS", "MEDIA_DIR"),
-        "TRIGGER_WORD": config.get("SETTINGS", "TRIGGER_WORD"),
-        "SYSTEM_PROMPT": config.get("SETTINGS", "SYSTEM_PROMPT"),
-        "MODEL": config.get("SETTINGS", "MODEL"),
-        # Необязательные параметры: у старых конфигов их нет, поэтому с запасными значениями.
-        # Ключ из конфига необязателен: чат может обойтись своими, добавленными /addkey.
-        "GEMINI_API_KEY": config.get("SETTINGS", "GEMINI_API_KEY", fallback="").strip(),
-        "MAX_CONTEXT_TOKENS": config.getint(
-            "SETTINGS", "MAX_CONTEXT_TOKENS", fallback=200_000
-        ),
-        "KEY_RPD_LIMIT": config.getint("SETTINGS", "KEY_RPD_LIMIT", fallback=250),
-    }
-
-    return config_values
-
-
-# Загружаем настройки
-FILE_UPLOAD_DELAY_PER_MB = 0.6
-CONFIG = load_config()
-BOT_TOKEN = CONFIG["BOT_TOKEN"]
-GEMINI_API_KEY = CONFIG["GEMINI_API_KEY"]
-DB_FILE = CONFIG["DB_FILE"]
-MEDIA_DIR = CONFIG["MEDIA_DIR"]
-TRIGGER_WORD = CONFIG["TRIGGER_WORD"]
-SYSTEM_PROMPT = CONFIG["SYSTEM_PROMPT"]
-MODEL = CONFIG["MODEL"]
-MAX_CONTEXT_TOKENS = CONFIG["MAX_CONTEXT_TOKENS"]
-KEY_RPD_LIMIT = CONFIG["KEY_RPD_LIMIT"]
-
-# --- НАСТРОЙКИ ПОВТОРНЫХ ПОПЫТОК ---
-# Сколько раз пробуем получить от модели корректный текст, прежде чем сдаться.
-MAX_RETRIES = 15
-# Пауза растет экспоненциально (2, 4, 8, ...) до потолка. Суммарно ~18 минут.
-RETRY_BASE_DELAY = 2.0
-RETRY_MAX_DELAY = 120.0
 # В деталях ошибки 429 Gemini присылает рекомендованную паузу: "retryDelay": "27s".
 RETRY_DELAY_PATTERN = re.compile(
     r"retry[-_]?delay[\"']?\s*[:=]\s*[\"']?(\d+(?:\.\d+)?)s", re.IGNORECASE
 )
-
-# --- НАСТРОЙКИ СЖАТИЯ КОНТЕКСТА ---
-# Когда история перестает влезать в MAX_CONTEXT_TOKENS, самая старая ее часть уходит
-# модели на пересказ, а пересказ занимает ее место в контексте следующих запросов.
-# Сжимаем с запасом: если целиться ровно в лимит, сжатие будет срабатывать почти на
-# каждое сообщение. Доля от лимита, в которую хотим уложиться после сжатия.
-CONTEXT_TARGET_RATIO = 0.5
-# Столько последних сообщений остаются в контексте дословно при любом сжатии.
-KEEP_RECENT_MESSAGES = 10
-# Больше этого числа проходов сжатия за один ответ не делаем.
-MAX_COMPRESSION_ROUNDS = 3
-# Точный подсчет токенов - лишний запрос к API, поэтому сначала прикидываем размер на
-# глаз и зовем count_tokens, только если грубая оценка подобралась к этой доле лимита.
-TOKEN_CHECK_RATIO = 0.5
-# Кириллица в токенайзере Gemini дает примерно 2-3 символа на токен, берем нижнюю границу.
-CHARS_PER_TOKEN = 2.0
-# Медиа в оценке считаем по верхней границе: недооценка дороже лишнего точного подсчета.
-MEDIA_TOKEN_ESTIMATE = 2000
 
 # --- СЛУЖЕБНЫЕ СООБЩЕНИЯ ---
 # Заглушка, которую бот шлет сразу и потом заменяет готовым ответом.
@@ -157,17 +78,21 @@ logger = logging.getLogger(__name__)
 # --- БЛОК РАБОТЫ С БАЗОЙ ДАННЫХ ---
 
 
-def init_db():
+def init_db(db_file: str, media_dir: str) -> sqlite3.Connection:
     """
     Инициализирует базу данных SQLite и создает необходимые таблицы.
 
-    Returns:
-        sqlite3.Connection: Соединение с базой данных.
+    :param db_file: путь к файлу базы
+    :type db_file: str
+    :param media_dir: каталог для скачанных медиафайлов, заводится заодно с базой
+    :type media_dir: str
+    :return: соединение с базой данных
+    :rtype: sqlite3.Connection
     """
-    os.makedirs(MEDIA_DIR, exist_ok=True)
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    os.makedirs(media_dir, exist_ok=True)
+    conn = sqlite3.connect(db_file, check_same_thread=False)
     cursor = conn.cursor()
-    check_legacy_schema(cursor)
+    check_legacy_schema(cursor, db_file)
     # message_id уникален только внутри чата: в двух разных чатах номера повторяются, и
     # без chat_id в ограничении сообщения одного чата затирали бы сообщения другого.
     cursor.execute("""
@@ -233,7 +158,7 @@ def add_missing_columns(cursor: sqlite3.Cursor):
             logger.info("В таблицу messages добавлена колонка %s.", name)
 
 
-def check_legacy_schema(cursor: sqlite3.Cursor):
+def check_legacy_schema(cursor: sqlite3.Cursor, db_file: str):
     """
     Отказывается работать с базой, созданной до разделения истории по чатам.
 
@@ -243,6 +168,8 @@ def check_legacy_schema(cursor: sqlite3.Cursor):
 
     :param cursor: курсор открытой базы
     :type cursor: sqlite3.Cursor
+    :param db_file: путь к файлу базы - его называем человеку в тексте отказа
+    :type db_file: str
     :raises RuntimeError: если база сделана прошлой версией бота
     """
     row = cursor.execute(
@@ -256,7 +183,7 @@ def check_legacy_schema(cursor: sqlite3.Cursor):
         return
 
     raise RuntimeError(
-        f"База {DB_FILE} сделана версией бота без поддержки нескольких чатов: "
+        f"База {db_file} сделана версией бота без поддержки нескольких чатов: "
         "в ней истории всех чатов лежат вперемешку, а message_id уникален глобально. "
         "Удалите или переименуйте файл базы - новая создастся сама."
     )
@@ -560,27 +487,30 @@ def get_extension_from_mime(mime: str | None) -> str:
 
 
 def get_media_path(
-    file_id: str, mime_type: str | None, original_name: str | None
+    media_dir: str, file_id: str, mime_type: str | None, original_name: str | None
 ) -> str | None:
     """
     Формирует путь к файлу для сохранения медиа.
 
-    Args:
-        file_id (str): Идентификатор файла в Telegram.
-        mime_type (str | None): MIME-тип файла.
-        original_name (str | None, optional): Оригинальное имя файла.
-
-    Returns:
-        str | None: Путь к файлу или None, если файл не может быть сохранен.
+    :param media_dir: каталог, в котором бот держит скачанные файлы
+    :type media_dir: str
+    :param file_id: идентификатор файла в Telegram
+    :type file_id: str
+    :param mime_type: MIME-тип файла
+    :type mime_type: str | None
+    :param original_name: оригинальное имя файла
+    :type original_name: str | None
+    :return: путь к файлу или None, если файл не может быть сохранен
+    :rtype: str | None
     """
     if original_name and original_name.isascii():
         safe_name = "".join(
             c for c in original_name if c.isalnum() or c in (" ", ".", "_", "-")
         ).strip()
-        return os.path.join(MEDIA_DIR, safe_name)
+        return os.path.join(media_dir, safe_name)
     if file_id:
         ext = get_extension_from_mime(mime_type)
-        return os.path.join(MEDIA_DIR, f"{file_id}.{ext}")
+        return os.path.join(media_dir, f"{file_id}.{ext}")
     return None
 
 
@@ -703,24 +633,30 @@ class GeminiRetryError(Exception):
     """Не удалось получить корректный ответ от Gemini за отведенное число попыток."""
 
 
-def get_backoff_delay(attempt: int, exc: Exception | None = None) -> float:
+def get_backoff_delay(
+    attempt: int, base_delay: float, max_delay: float, exc: Exception | None = None
+) -> float:
     """
     Считает паузу перед следующей попыткой.
 
     :param attempt: номер только что провалившейся попытки (начиная с единицы)
     :type attempt: int
+    :param base_delay: пауза после первой неудачи, дальше растет вдвое за попытку
+    :type base_delay: float
+    :param max_delay: потолок, выше которого пауза не поднимается
+    :type max_delay: float
     :param exc: исключение, если попытка упала с ошибкой API
     :type exc: Exception | None
     :return: длительность паузы в секундах
     :rtype: float
     """
-    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+    delay = base_delay * (2 ** (attempt - 1))
     if exc is not None:
         # Если API сам сказал, сколько ждать (429), слушаемся его.
         match = RETRY_DELAY_PATTERN.search(str(exc))
         if match:
             delay = float(match.group(1))
-    delay = min(delay, RETRY_MAX_DELAY)
+    delay = min(delay, max_delay)
     # Джиттер, чтобы повторы не выстраивались в ровную сетку.
     return delay + random.uniform(0, delay * 0.1)
 
@@ -753,7 +689,7 @@ def extract_response_text(response) -> tuple[str | None, str, bool]:
 
 
 def handle_api_failure(
-    pool: api_keys.KeyPool, key: dict, exc: Exception, attempt: int
+    pool: api_keys.KeyPool, key: dict, exc: Exception, attempt: int, max_retries: int
 ) -> Exception | None:
     """
     Разбирает ошибку API: помечает ключ и решает, стоит ли ждать перед повтором.
@@ -766,6 +702,8 @@ def handle_api_failure(
     :type exc: Exception
     :param attempt: номер попытки - уходит в текст неустранимой ошибки
     :type attempt: int
+    :param max_retries: всего попыток - тоже только ради текста ошибки
+    :type max_retries: int
     :return: исключение, если ошибка временная и перед повтором надо выждать паузу,
         или None, если ждать нечего: ключ уже помечен негодным и сменится сам
     :rtype: Exception | None
@@ -777,7 +715,7 @@ def handle_api_failure(
     if kind == api_keys.ERROR_KIND_FATAL:
         logger.error("Неустранимая ошибка Gemini (код %s): %s", code, exc)
         raise GeminiRetryError(
-            f"Неустранимая ошибка API на попытке {attempt} из {MAX_RETRIES} "
+            f"Неустранимая ошибка API на попытке {attempt} из {max_retries} "
             f"(код {code}): {exc}"
         ) from exc
 
@@ -792,18 +730,22 @@ def handle_api_failure(
     return exc
 
 
-async def generate_with_retries(pool: api_keys.KeyPool, make_contents) -> str:
+async def generate_with_retries(
+    cfg: config.Config, pool: api_keys.KeyPool, make_contents
+) -> str:
     """
     Запрашивает ответ у Gemini, повторяя попытки при сбоях и меняя выдохшиеся ключи.
 
-    Повторяет до MAX_RETRIES раз с экспоненциально растущей паузой. Ошибка ошибке рознь:
-    выбранная дневная квота и отвергнутый ключ означают, что надо брать следующий ключ и
-    идти дальше без паузы; минутный лимит - что ключ живой и надо просто подождать;
+    Повторяет до cfg.max_retries раз с экспоненциально растущей паузой. Ошибка ошибке
+    рознь: выбранная дневная квота и отвергнутый ключ означают, что надо брать следующий
+    ключ и идти дальше без паузы; минутный лимит - что ключ живой и надо просто подождать;
     кривой запрос или несуществующая модель не пройдут никогда, и на них бот сдается.
 
     Смена ключа тратит попытку. Так цикл не может закружиться на пуле из сотни мертвых
     ключей, а на живом пуле лишние попытки и не понадобятся.
 
+    :param cfg: настройки бота - отсюда берутся число попыток и длина пауз
+    :type cfg: config.Config
     :param pool: пул ключей чата, он же задает модель запроса
     :type pool: api_keys.KeyPool
     :param make_contents: корутина, собирающая содержимое запроса под переданный ключ
@@ -816,7 +758,7 @@ async def generate_with_retries(pool: api_keys.KeyPool, make_contents) -> str:
     contents = None
     contents_key_id = None
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, cfg.max_retries + 1):
         key = pool.active()
         if contents is None or contents_key_id != key["id"]:
             # Ссылки на выгруженные файлы принадлежат тому ключу, которым их выгружали,
@@ -834,43 +776,48 @@ async def generate_with_retries(pool: api_keys.KeyPool, make_contents) -> str:
             )
         except Exception as e:  # pylint: disable=broad-exception-caught
             last_reason = f"ошибка API {api_keys.get_error_code(e)}: {e}"
-            failure = handle_api_failure(pool, key, e, attempt)
+            failure = handle_api_failure(pool, key, e, attempt, cfg.max_retries)
         else:
             pool.note_request(key)
             text, reason, can_retry = extract_response_text(response)
             if text:
                 if attempt > 1:
                     logger.info(
-                        "Ответ получен с попытки %d из %d.", attempt, MAX_RETRIES
+                        "Ответ получен с попытки %d из %d.", attempt, cfg.max_retries
                     )
                 return text
             if not can_retry:
                 logger.error("Повтор бесполезен: %s", reason)
                 raise GeminiRetryError(
                     f"Повтор бесполезен, остановились на попытке {attempt} "
-                    f"из {MAX_RETRIES}: {reason}"
+                    f"из {cfg.max_retries}: {reason}"
                 )
             last_reason = reason
 
         logger.warning(
-            "Попытка %d из %d не удалась: %s", attempt, MAX_RETRIES, last_reason
+            "Попытка %d из %d не удалась: %s", attempt, cfg.max_retries, last_reason
         )
 
         # Ключ уже помечен негодным - ждать нечего, следующий виток возьмет другой.
         if not pool.is_usable(key, ignore_local_limit=True):
             continue
 
-        if attempt < MAX_RETRIES:
-            delay = get_backoff_delay(attempt, failure)
+        if attempt < cfg.max_retries:
+            delay = get_backoff_delay(
+                attempt, cfg.retry_base_delay, cfg.retry_max_delay, failure
+            )
             logger.info("Повтор через %.1f с.", delay)
             await asyncio.sleep(delay)
 
     raise GeminiRetryError(
-        f"Не удалось получить ответ за {MAX_RETRIES} попыток. Последняя причина: {last_reason}"
+        f"Не удалось получить ответ за {cfg.max_retries} попыток. "
+        f"Последняя причина: {last_reason}"
     )
 
 
-def build_message_parts(client: genai.Client, api_key: str, msg: dict) -> list:
+def build_message_parts(
+    client: genai.Client, api_key: str, msg: dict, media_dir: str = ""
+) -> list:
     """
     Превращает одно сообщение из БД в части запроса к модели.
 
@@ -880,6 +827,9 @@ def build_message_parts(client: genai.Client, api_key: str, msg: dict) -> list:
     :type api_key: str
     :param msg: строка таблицы messages в виде словаря
     :type msg: dict
+    :param media_dir: каталог медиа; нужен только сообщениям, сохраненным до появления
+        колонки media_path - у них путь к файлу приходится вычислять по mime заново
+    :type media_dir: str
     :return: список частей (текст плюс медиа, если оно есть)
     :rtype: list
     """
@@ -900,7 +850,7 @@ def build_message_parts(client: genai.Client, api_key: str, msg: dict) -> list:
         # расширение, и по mime его уже не вычислить. У сообщений, сохраненных до
         # перекодирования, колонка пуста - для них путь считается по-старому.
         raw_path = msg.get("media_path") or get_media_path(
-            msg["file_id"], msg["mime_type"], msg.get("file_name")
+            media_dir, msg["file_id"], msg["mime_type"], msg.get("file_name")
         )
         media_path = os.path.abspath(raw_path) if raw_path else None
         if media_path and os.path.exists(media_path):
@@ -952,7 +902,7 @@ def build_message_parts(client: genai.Client, api_key: str, msg: dict) -> list:
     return parts
 
 
-def build_history(key: dict, context_messages: list) -> list:
+def build_history(key: dict, context_messages: list, media_dir: str) -> list:
     """
     Готовит историю переписки в виде реплик для модели.
 
@@ -966,20 +916,22 @@ def build_history(key: dict, context_messages: list) -> list:
     :type key: dict
     :param context_messages: список сообщений контекста
     :type context_messages: list
+    :param media_dir: каталог медиа, откуда берутся файлы старых сообщений
+    :type media_dir: str
     :return: список словарей вида {"role", "parts", "source"}
     :rtype: list
     """
     client = api_keys.client_for_key(key["api_key"])
     history = []
     for msg in context_messages:
-        parts = build_message_parts(client, key["api_key"], msg)
+        parts = build_message_parts(client, key["api_key"], msg, media_dir)
         if parts:
             role = "model" if msg.get("is_bot") else "user"
             history.append({"role": role, "parts": parts, "source": msg})
     return history
 
 
-def build_contents(history: list, summary: str | None) -> list:
+def build_contents(history: list, summary: str | None, system_prompt: str) -> list:
     """
     Собирает итоговый запрос: системный промпт, пересказ и история.
 
@@ -990,12 +942,14 @@ def build_contents(history: list, summary: str | None) -> list:
     :type history: list
     :param summary: пересказ сжатой части истории или None
     :type summary: str | None
+    :param system_prompt: системный промпт, он же первая реплика запроса
+    :type system_prompt: str
     :return: содержимое запроса к модели
     :rtype: list
     """
     contents = [
         genai.types.ContentDict(
-            role="user", parts=[genai.types.PartDict(text=SYSTEM_PROMPT)]
+            role="user", parts=[genai.types.PartDict(text=system_prompt)]
         )
     ]
 
@@ -1022,10 +976,16 @@ def build_contents(history: list, summary: str | None) -> list:
 # --- БЛОК СЖАТИЯ КОНТЕКСТА ---
 
 
-def estimate_entry_tokens(entry: dict) -> float:
+def estimate_entry_tokens(cfg: config.Config, entry: dict) -> float:
     """
     Грубо оценивает размер одной реплики в токенах.
 
+    Прикидка и решение о границе сжатия завязаны сразу на несколько настроек, поэтому
+    сюда и соседям по блоку уезжает весь cfg: перечислять их поштучно в сигнатурах
+    вышло бы длиннее, чем сами функции.
+
+    :param cfg: настройки бота - отсюда берутся вес символа и вес медиа
+    :type cfg: config.Config
     :param entry: реплика из build_history
     :type entry: dict
     :return: примерное число токенов
@@ -1034,14 +994,18 @@ def estimate_entry_tokens(entry: dict) -> float:
     total = 0.0
     for part in entry["parts"]:
         text = getattr(part, "text", None)
-        total += len(text) / CHARS_PER_TOKEN if text else MEDIA_TOKEN_ESTIMATE
+        total += len(text) / cfg.chars_per_token if text else cfg.media_token_estimate
     return total
 
 
-def estimate_context_tokens(history: list, summary: str | None) -> float:
+def estimate_context_tokens(
+    cfg: config.Config, history: list, summary: str | None
+) -> float:
     """
     Грубо оценивает размер всего контекста, чтобы не дергать API на каждое сообщение.
 
+    :param cfg: настройки бота - отсюда берутся системный промпт и веса оценки
+    :type cfg: config.Config
     :param history: история переписки от build_history
     :type history: list
     :param summary: пересказ сжатой части истории или None
@@ -1049,10 +1013,10 @@ def estimate_context_tokens(history: list, summary: str | None) -> float:
     :return: примерное число токенов
     :rtype: float
     """
-    total = len(SYSTEM_PROMPT) / CHARS_PER_TOKEN
+    total = len(cfg.system_prompt) / cfg.chars_per_token
     if summary:
-        total += len(summary) / CHARS_PER_TOKEN
-    return total + sum(estimate_entry_tokens(entry) for entry in history)
+        total += len(summary) / cfg.chars_per_token
+    return total + sum(estimate_entry_tokens(cfg, entry) for entry in history)
 
 
 async def count_context_tokens(
@@ -1081,7 +1045,7 @@ async def count_context_tokens(
     return getattr(response, "total_tokens", None)
 
 
-def choose_cut_index(history: list, total_tokens: int) -> int:
+def choose_cut_index(cfg: config.Config, history: list, total_tokens: int) -> int:
     """
     Решает, сколько самых старых реплик отправить в пересказ.
 
@@ -1089,6 +1053,9 @@ def choose_cut_index(history: list, total_tokens: int) -> int:
     лимита. Вес реплик берем оценочный: точные размеры кусков нам взять неоткуда,
     а промах компенсирует повторный проход сжатия.
 
+    :param cfg: настройки бота - отсюда лимит контекста, целевая доля и неприкосновенный
+        хвост свежих сообщений
+    :type cfg: config.Config
     :param history: история переписки от build_history
     :type history: list
     :param total_tokens: точный размер контекста, который не влез в лимит
@@ -1096,9 +1063,9 @@ def choose_cut_index(history: list, total_tokens: int) -> int:
     :return: сколько реплик с начала истории надо сжать (0 - сжимать нечего)
     :rtype: int
     """
-    weights = [estimate_entry_tokens(entry) for entry in history]
+    weights = [estimate_entry_tokens(cfg, entry) for entry in history]
     keep_weight = sum(weights) * (
-        MAX_CONTEXT_TOKENS * CONTEXT_TARGET_RATIO / total_tokens
+        cfg.max_context_tokens * cfg.context_target_ratio / total_tokens
     )
 
     # Идем с конца и набираем хвост, который оставляем дословно.
@@ -1111,11 +1078,14 @@ def choose_cut_index(history: list, total_tokens: int) -> int:
         cut = index
 
     # Свежие реплики не сжимаем никогда, даже если одна из них весит больше лимита.
-    return min(cut, max(len(history) - KEEP_RECENT_MESSAGES, 0))
+    return min(cut, max(len(history) - cfg.keep_recent_messages, 0))
 
 
 async def summarize_history(
-    pool: api_keys.KeyPool, messages: list, previous_summary: str | None
+    cfg: config.Config,
+    pool: api_keys.KeyPool,
+    messages: list,
+    previous_summary: str | None,
 ) -> str:
     """
     Просит модель пересказать кусок истории одним текстом.
@@ -1123,6 +1093,8 @@ async def summarize_history(
     Предыдущий пересказ идет в запрос вместе с историей, чтобы он не потерялся:
     новый пересказ заменяет его целиком.
 
+    :param cfg: настройки бота
+    :type cfg: config.Config
     :param pool: пул ключей чата
     :type pool: api_keys.KeyPool
     :param messages: сообщения, которые надо сжать
@@ -1136,7 +1108,7 @@ async def summarize_history(
 
     async def make_contents(key: dict) -> list:
         """Собирает запрос на пересказ под конкретный ключ."""
-        entries = await asyncio.to_thread(build_history, key, messages)
+        entries = await asyncio.to_thread(build_history, key, messages, cfg.media_dir)
         contents = [
             genai.types.ContentDict(
                 role="user", parts=[genai.types.PartDict(text=SUMMARY_INSTRUCTION)]
@@ -1165,10 +1137,11 @@ async def summarize_history(
         return contents
 
     logger.info("Сжимаем %d самых старых сообщений в пересказ...", len(messages))
-    return (await generate_with_retries(pool, make_contents)).strip()
+    return (await generate_with_retries(cfg, pool, make_contents)).strip()
 
 
-async def compress_context(
+async def compress_context(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    cfg: config.Config,
     pool: api_keys.KeyPool,
     conn: sqlite3.Connection,
     chat_id: int,
@@ -1178,7 +1151,7 @@ async def compress_context(
     """
     Ужимает контекст чата до лимита и возвращает то, что в него уложилось.
 
-    Пока запрос не влезает в MAX_CONTEXT_TOKENS, самая старая часть истории уходит
+    Пока запрос не влезает в cfg.max_context_tokens, самая старая часть истории уходит
     модели на пересказ, пересказ попадает в БД и занимает ее место. Один проход не
     всегда доводит до цели (пересказ тоже занимает место), поэтому проходов может
     быть несколько.
@@ -1187,6 +1160,8 @@ async def compress_context(
     получить пересказ не вышло, отдаем контекст как есть и даем разбираться
     обычному механизму повторов.
 
+    :param cfg: настройки бота - отсюда лимит контекста и правила сжатия
+    :type cfg: config.Config
     :param pool: пул ключей чата, он же задает модель запроса
     :type pool: api_keys.KeyPool
     :param conn: соединение с базой данных
@@ -1201,50 +1176,54 @@ async def compress_context(
     :rtype: tuple[list, str | None]
     """
     key = pool.active()
-    history = await asyncio.to_thread(build_history, key, messages)
+    history = await asyncio.to_thread(build_history, key, messages, cfg.media_dir)
 
     # Дешевая прикидка на входе: обычный чат до лимита не дотягивает, и тратить на него
     # лишний запрос к API незачем. Дальше по кругу идем уже только с точным подсчетом -
     # ошибись прикидка, и сжатие остановилось бы, не дойдя до лимита.
-    if estimate_context_tokens(history, summary) < (
-        MAX_CONTEXT_TOKENS * TOKEN_CHECK_RATIO
+    if estimate_context_tokens(cfg, history, summary) < (
+        cfg.max_context_tokens * cfg.token_check_ratio
     ):
         return messages, summary
 
-    for _ in range(MAX_COMPRESSION_ROUNDS):
+    for _ in range(cfg.max_compression_rounds):
         # Пересказ мог упереться в квоту и сменить ключ: ссылки на выгруженные файлы
         # принадлежат прежнему ключу, поэтому историю приходится пересобрать.
         current_key = pool.active()
         if current_key["id"] != key["id"]:
             key = current_key
-            history = await asyncio.to_thread(build_history, key, messages)
+            history = await asyncio.to_thread(
+                build_history, key, messages, cfg.media_dir
+            )
 
         total_tokens = await count_context_tokens(
-            pool, key, build_contents(history, summary)
+            pool, key, build_contents(history, summary, cfg.system_prompt)
         )
         if total_tokens is None:
             return messages, summary
-        if total_tokens <= MAX_CONTEXT_TOKENS:
-            logger.info("Контекст: %d токенов из %d.", total_tokens, MAX_CONTEXT_TOKENS)
+        if total_tokens <= cfg.max_context_tokens:
+            logger.info(
+                "Контекст: %d токенов из %d.", total_tokens, cfg.max_context_tokens
+            )
             return messages, summary
 
-        cut = choose_cut_index(history, total_tokens)
+        cut = choose_cut_index(cfg, history, total_tokens)
         if cut <= 0:
             logger.warning(
                 "Контекст (%d токенов) больше лимита %d, но сжимать уже нечего.",
                 total_tokens,
-                MAX_CONTEXT_TOKENS,
+                cfg.max_context_tokens,
             )
             return messages, summary
 
         logger.info(
             "Контекст разросся до %d токенов при лимите %d, сжимаем.",
             total_tokens,
-            MAX_CONTEXT_TOKENS,
+            cfg.max_context_tokens,
         )
         compressed = [entry["source"] for entry in history[:cut]]
         try:
-            summary = await summarize_history(pool, compressed, summary)
+            summary = await summarize_history(cfg, pool, compressed, summary)
         except GeminiRetryError as e:
             logger.error("Не удалось сжать контекст, отправляем как есть: %s", e)
             return messages, summary
@@ -1254,30 +1233,36 @@ async def compress_context(
         messages = [entry["source"] for entry in history]
 
     logger.warning(
-        "Контекст не уложился в лимит за %d проходов.", MAX_COMPRESSION_ROUNDS
+        "Контекст не уложился в лимит за %d проходов.", cfg.max_compression_rounds
     )
     return messages, summary
 
 
 async def generate_gemini_response(
+    cfg: config.Config,
     pool: api_keys.KeyPool,
     conn: sqlite3.Connection,
     chat_id: int,
     context_messages: list,
     summary: str | None,
-):
+):  # pylint: disable=too-many-arguments,too-many-positional-arguments
     """
     Генерирует ответ с использованием модели Google Gemini AI на основе контекста чата.
 
-    Args:
-        pool (api_keys.KeyPool): Пул ключей этого чата, он же задает модель.
-        conn (sqlite3.Connection): Соединение с БД - нужно, чтобы сохранить пересказ.
-        chat_id (int): Идентификатор чата.
-        context_messages (list): Список сообщений контекста.
-        summary (str | None): Пересказ сжатой ранее части истории.
-
-    Returns:
-        str: Сгенерированный ответ.
+    :param cfg: настройки бота
+    :type cfg: config.Config
+    :param pool: пул ключей этого чата, он же задает модель
+    :type pool: api_keys.KeyPool
+    :param conn: соединение с БД - нужно, чтобы сохранить пересказ
+    :type conn: sqlite3.Connection
+    :param chat_id: идентификатор чата
+    :type chat_id: int
+    :param context_messages: список сообщений контекста
+    :type context_messages: list
+    :param summary: пересказ сжатой ранее части истории
+    :type summary: str | None
+    :return: сгенерированный ответ
+    :rtype: str
     """
     logger.info(
         "Чат %s: подготовка %d сообщений контекста для модели %s.",
@@ -1290,18 +1275,18 @@ async def generate_gemini_response(
         return "Не могу обработать пустой запрос."
 
     messages, summary = await compress_context(
-        pool, conn, chat_id, context_messages, summary
+        cfg, pool, conn, chat_id, context_messages, summary
     )
 
     async def make_contents(key: dict) -> list:
         """Собирает запрос под конкретный ключ: медиа выгружается от его имени."""
-        history = await asyncio.to_thread(build_history, key, messages)
-        return build_contents(history, summary)
+        history = await asyncio.to_thread(build_history, key, messages, cfg.media_dir)
+        return build_contents(history, summary, cfg.system_prompt)
 
     logger.info("Отправка запроса в Gemini...")
 
     # Генерируем ответ с новым API, повторяя попытки при сбоях
-    response_text = await generate_with_retries(pool, make_contents)
+    response_text = await generate_with_retries(cfg, pool, make_contents)
     return notes.strip_service_prefixes(response_text)
 
 
@@ -1422,11 +1407,16 @@ def chat_lock(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> asyncio.Lock:
 
 
 async def answer_chat(
-    context: ContextTypes.DEFAULT_TYPE, message: Message, transcribe_only: bool
+    cfg: config.Config,
+    context: ContextTypes.DEFAULT_TYPE,
+    message: Message,
+    transcribe_only: bool,
 ):
     """
     Собирает контекст чата, спрашивает модель и отправляет ответ.
 
+    :param cfg: настройки бота
+    :type cfg: config.Config
     :param context: контекст обработчика
     :type context: ContextTypes.DEFAULT_TYPE
     :param message: сообщение, на которое отвечаем
@@ -1451,15 +1441,15 @@ async def answer_chat(
                 f"Напиши расшифровку голосового сообщения. {current_content}"
             )
 
-    model = settings.get_model(db_conn, chat_id, MODEL)
-    pool = api_keys.KeyPool(db_conn, chat_id, model, KEY_RPD_LIMIT)
+    model = settings.get_model(db_conn, chat_id, cfg.model)
+    pool = api_keys.KeyPool(db_conn, chat_id, model, cfg.key_rpd_limit)
 
     placeholder = await send_placeholder(message)
     err = False
 
     try:
         response_text = await generate_gemini_response(
-            pool, db_conn, chat_id, context_messages, summary
+            cfg, pool, db_conn, chat_id, context_messages, summary
         )
     except api_keys.NoUsableKeys as e:
         # Не поломка, а исчерпанный пул: человеку нужен не трейсбек, а что делать дальше.
@@ -1479,23 +1469,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Главный обработчик сообщений Telegram.
 
-    Args:
-        update (Update): Объект обновления Telegram.
-        context (ContextTypes.DEFAULT_TYPE): Контекст обработчика.
+    Настройки берутся из bot_data: сигнатуру обработчика задает telegram.ext, передать
+    в нее что-то свое нельзя, а bot_data - штатное место для общих данных бота.
+
+    :param update: объект обновления Telegram
+    :type update: Update
+    :param context: контекст обработчика
+    :type context: ContextTypes.DEFAULT_TYPE
     """
     message = update.effective_message
     if not message or message.chat.type not in ("group", "supergroup", "private"):
         return
 
+    cfg = context.bot_data["cfg"]
     db_conn = context.bot_data["db_conn"]
-    trigger = TRIGGER_WORD.lower()
+    trigger = cfg.trigger_word.lower()
     triggered_by_text = (
         message.text and message.text.lower().startswith(trigger)
     ) or (message.caption and message.caption.lower().startswith(trigger))
 
     file_id, mime_type, file_name = save_message_to_db(db_conn, message, is_bot=False)
     if file_id:
-        file_path = get_media_path(file_id, mime_type, file_name)
+        file_path = get_media_path(cfg.media_dir, file_id, mime_type, file_name)
         if file_path:
             await download_media_file(context.application, file_id, file_path)
             await normalize_media(db_conn, message, file_path, mime_type)
@@ -1508,7 +1503,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # остальные. Сообщения при этом сохраняются сразу, до очереди, - история не отстает.
     async with chat_lock(context, message.chat_id):
         await answer_chat(
-            context, message, bool(message.voice) and not triggered_by_text
+            cfg, context, message, bool(message.voice) and not triggered_by_text
         )
 
 
@@ -1530,16 +1525,21 @@ COMMAND_HANDLERS = {
 def main():
     """
     Основная функция запуска бота.
-    Инициализирует подключения к базе данных и API, настраивает обработчики сообщений.
+
+    Здесь и только здесь читается конфиг: дальше настройки идут по коду аргументами, а
+    обработчикам достаются через bot_data. Поэтому импорт bot.py сам по себе ничего не
+    читает с диска и не требует существующего config.cfg.
     """
-    if not BOT_TOKEN:
+    cfg = config.load_config()
+
+    if not cfg.bot_token:
         raise ValueError("Пожалуйста, проверьте файл конфигурации: BOT_TOKEN не указан.")
 
-    db_connection = init_db()
+    db_connection = init_db(cfg.db_file, cfg.media_dir)
 
     # Ключ из конфига доступен всем чатам сразу; свои чат добавляет командой /addkey.
-    api_keys.sync_shared_key(db_connection, GEMINI_API_KEY)
-    if not GEMINI_API_KEY:
+    api_keys.sync_shared_key(db_connection, cfg.gemini_api_key)
+    if not cfg.gemini_api_key:
         logger.info(
             "Общий ключ в config.cfg не задан - чаты работают только на своих ключах."
         )
@@ -1547,12 +1547,11 @@ def main():
     # Чаты обслуживаются параллельно: ответ с повторами занимает минуты, и один чат не
     # должен становиться очередью для всех остальных. Порядок внутри чата держит замок.
     application = (
-        Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
+        Application.builder().token(cfg.bot_token).concurrent_updates(True).build()
     )
 
     application.bot_data["db_conn"] = db_connection
-    application.bot_data["default_model"] = MODEL
-    application.bot_data["key_rpd_limit"] = KEY_RPD_LIMIT
+    application.bot_data["cfg"] = cfg
 
     for name, handler in COMMAND_HANDLERS.items():
         application.add_handler(CommandHandler(name, handler))
@@ -1563,8 +1562,8 @@ def main():
 
     logger.info(
         "Модель по умолчанию: %s. Потолок запросов на ключ в сутки: %s.",
-        MODEL,
-        KEY_RPD_LIMIT or "не задан",
+        cfg.model,
+        cfg.key_rpd_limit or "не задан",
     )
     logger.info("Бот запускается...")
     application.run_polling()

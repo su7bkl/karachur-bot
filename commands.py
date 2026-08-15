@@ -60,8 +60,9 @@ def _pool(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> api_keys.KeyPool:
     :rtype: api_keys.KeyPool
     """
     conn = context.bot_data["db_conn"]
-    model = settings.get_model(conn, chat_id, context.bot_data["default_model"])
-    return api_keys.KeyPool(conn, chat_id, model, context.bot_data["key_rpd_limit"])
+    cfg = context.bot_data["cfg"]
+    model = settings.get_model(conn, chat_id, cfg.model)
+    return api_keys.KeyPool(conn, chat_id, model, cfg.key_rpd_limit)
 
 
 def list_models(api_key: str) -> list[str]:
@@ -334,7 +335,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     chat_id = update.effective_chat.id
     conn = context.bot_data["db_conn"]
-    default_model = context.bot_data["default_model"]
+    default_model = context.bot_data["cfg"].model
     current = settings.get_model(conn, chat_id, default_model)
 
     if not context.args:

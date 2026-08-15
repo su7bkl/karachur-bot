@@ -1,10 +1,10 @@
 """
-Общая оснастка тестов: конфиг, база и подделки Gemini с Telegram.
+Общая оснастка тестов: настройки, база и подделки Gemini с Telegram.
 
-bot.py читает конфиг на импорте, поэтому тестовый конфиг готовится прямо здесь, до
-всяких фикстур: conftest.py pytest импортирует раньше самих тестов. Путь передается
-через KARACHUR_CONFIG, так что рабочий config.cfg тесты не трогают и даже не требуют -
-на чистой машине с одним склонированным репозиторием они все равно проходят.
+Настройки собираются фикстурой cfg прямо в памяти: рабочий config.cfg тесты не трогают
+и даже не требуют - на чистой машине с одним склонированным репозиторием они все равно
+проходят. Раньше на это уходил временный config.cfg на диске, потому что bot.py читал
+конфиг на импорте; теперь конфиг читает только main(), и подкладывать файл незачем.
 
 Ни один тест не ходит в сеть: клиент Gemini подменяется подделкой, которая отвечает по
 заранее заданному сценарию, а Telegram сводится к паре объектов, запоминающих отправку.
@@ -15,33 +15,13 @@ bot.py читает конфиг на импорте, поэтому тесто�
 # pylint: disable=too-few-public-methods,unused-argument
 
 import asyncio
-import os
-import tempfile
-from pathlib import Path
 
 import pytest
 
-TEST_CONFIG = """[SETTINGS]
-BOT_TOKEN = 123456:TEST
-GEMINI_API_KEY =
-DB_FILE = tests.db
-MEDIA_DIR = media
-TRIGGER_WORD = Карачур
-MODEL = gemini-2.5-flash-lite
-MAX_CONTEXT_TOKENS = 200000
-KEY_RPD_LIMIT = 250
-SYSTEM_PROMPT = Тестовый системный промпт.
-"""
-
-_CONFIG_PATH = Path(tempfile.mkdtemp(prefix="karachur-tests-")) / "config.cfg"
-_CONFIG_PATH.write_text(TEST_CONFIG, encoding="utf-8")
-os.environ["KARACHUR_CONFIG"] = str(_CONFIG_PATH)
-
-# Модули бота импортируются только после того, как конфиг оказался на месте.
-# pylint: disable=wrong-import-position
-import api_keys  # noqa: E402
-import bot  # noqa: E402
-import commands  # noqa: E402
+import api_keys
+import bot
+import commands
+from karachur import config
 
 # Ключи в тестах намеренно непохожи на настоящие, но той же длины и формы.
 KEY_ONE = "AIzaTEST0000000000000000000000000000001"
@@ -52,9 +32,9 @@ SHARED_KEY = "AIzaSHARED000000000000000000000000000001"
 CHAT_ONE = -1001110000
 CHAT_TWO = -1002220000
 
-# Модель из тестового конфига. Квоты считаются на пару "ключ и модель", поэтому почти
+# Модель тестовых настроек. Квоты считаются на пару "ключ и модель", поэтому почти
 # всякая работа с пулом требует назвать модель.
-MODEL = bot.MODEL
+MODEL = "gemini-2.5-flash-lite"
 OTHER_MODEL = "gemini-3-pro"
 
 
@@ -287,33 +267,31 @@ class _FakeUpdate:
 class _FakeContext:
     """Контекст обработчика с общими данными бота."""
 
-    def __init__(self, conn, args: list, runner: "CommandRunner"):
+    def __init__(self, args: list, runner: "CommandRunner"):
         """
-        :param conn: соединение с базой
         :param args: аргументы команды
         :type args: list
-        :param runner: оснастка команд
+        :param runner: оснастка команд - у нее же берутся база и настройки
         :type runner: CommandRunner
         """
         self.bot = _RecordingBot(runner)
         self.args = args
-        self.bot_data = {
-            "db_conn": conn,
-            "default_model": bot.MODEL,
-            "key_rpd_limit": bot.KEY_RPD_LIMIT,
-        }
+        self.bot_data = {"db_conn": runner.conn, "cfg": runner.cfg}
 
 
 class CommandRunner:
     """Гоняет обработчики команд на поддельном контексте Telegram."""
 
-    def __init__(self, conn, chat_id: int = CHAT_ONE):
+    def __init__(self, conn, cfg: config.Config, chat_id: int = CHAT_ONE):
         """
         :param conn: соединение с базой
+        :param cfg: настройки бота, которые обработчики найдут в bot_data
+        :type cfg: config.Config
         :param chat_id: чат, от имени которого идут команды
         :type chat_id: int
         """
         self.conn = conn
+        self.cfg = cfg
         self.chat_id = chat_id
         self.sent = []
         self.deleted = 0
@@ -329,23 +307,45 @@ class CommandRunner:
         """
         self.sent = []
         update = _FakeUpdate(self.chat_id, self)
-        context = _FakeContext(self.conn, list(args), self)
+        context = _FakeContext(list(args), self)
         asyncio.run(handler(update, context))
         return self.sent[-1][1] if self.sent else ""
 
 
+@pytest.fixture(name="cfg")
+def cfg_fixture(tmp_path):
+    """
+    Настройки тестового бота: своя база и свой каталог медиа на каждый тест.
+
+    Паузы между попытками укорочены до неразличимых: ждать настоящие две, четыре и
+    восемь секунд тесту незачем, а зависший сценарий должен падать быстро.
+
+    :param tmp_path: временная директория теста
+    :return: настройки, с которыми работают остальные фикстуры
+    :rtype: config.Config
+    """
+    return config.Config(
+        bot_token="123456:TEST",
+        db_file=str(tmp_path / "test.db"),
+        media_dir=str(tmp_path / "media"),
+        trigger_word="Карачур",
+        system_prompt="Тестовый системный промпт.",
+        model=MODEL,
+        max_retries=4,
+        retry_base_delay=0.01,
+        retry_max_delay=0.05,
+    )
+
+
 @pytest.fixture(name="db")
-def db_fixture(tmp_path, monkeypatch):
+def db_fixture(cfg):  # pylint: disable=redefined-outer-name
     """
     Свежая база со схемой бота, своя на каждый тест.
 
-    :param tmp_path: временная директория теста
-    :param monkeypatch: штатная подмена атрибутов pytest
+    :param cfg: настройки теста - из них берутся пути к базе и каталогу медиа
     :return: открытое соединение с базой
     """
-    monkeypatch.setattr(bot, "DB_FILE", str(tmp_path / "test.db"))
-    monkeypatch.setattr(bot, "MEDIA_DIR", str(tmp_path / "media"))
-    conn = bot.init_db()
+    conn = bot.init_db(cfg.db_file, cfg.media_dir)
     yield conn
     conn.close()
 
@@ -353,7 +353,10 @@ def db_fixture(tmp_path, monkeypatch):
 @pytest.fixture(name="gemini")
 def gemini_fixture(monkeypatch):
     """
-    Подменяет клиента Gemini подделкой и укорачивает паузы между попытками.
+    Подменяет клиента Gemini подделкой.
+
+    Подменяется именно атрибут модуля api_keys: бот зовет client_for_key через модуль,
+    и подмена работает для всех, кто им пользуется.
 
     :param monkeypatch: штатная подмена атрибутов pytest
     :return: держатель сценариев ответов
@@ -361,10 +364,6 @@ def gemini_fixture(monkeypatch):
     """
     fake = FakeGemini()
     monkeypatch.setattr(api_keys, "client_for_key", fake.client_for_key)
-    # Ждать настоящие паузы незачем, а зависший сценарий должен падать быстро.
-    monkeypatch.setattr(bot, "MAX_RETRIES", 4)
-    monkeypatch.setattr(bot, "RETRY_BASE_DELAY", 0.01)
-    monkeypatch.setattr(bot, "RETRY_MAX_DELAY", 0.05)
     return fake
 
 
@@ -412,7 +411,7 @@ def add_message_fixture(db):  # pylint: disable=redefined-outer-name
 
 
 @pytest.fixture(name="run_command")
-def run_command_fixture(db, monkeypatch):  # pylint: disable=redefined-outer-name
+def run_command_fixture(db, cfg, monkeypatch):  # pylint: disable=redefined-outer-name
     """
     Отдает оснастку для команд с подмененным списком моделей.
 
@@ -420,11 +419,10 @@ def run_command_fixture(db, monkeypatch):  # pylint: disable=redefined-outer-nam
     в сеть и не зависеть от того, что Google выкатил сегодня.
 
     :param db: соединение с базой
+    :param cfg: настройки теста - обработчики найдут их в bot_data
     :param monkeypatch: штатная подмена атрибутов pytest
     :return: оснастка запуска команд
     :rtype: CommandRunner
     """
-    monkeypatch.setattr(
-        commands, "list_models", lambda api_key: ["gemini-2.5-flash-lite", "gemini-3-pro"]
-    )
-    return CommandRunner(db)
+    monkeypatch.setattr(commands, "list_models", lambda api_key: [MODEL, OTHER_MODEL])
+    return CommandRunner(db, cfg)

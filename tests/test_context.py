@@ -98,7 +98,7 @@ def test_latest_summary_wins(db):
     assert bot.get_latest_summary(db, CHAT_ONE) == "второй пересказ"
 
 
-def test_legacy_database_is_rejected(tmp_path, monkeypatch):
+def test_legacy_database_is_rejected(tmp_path):
     """База прошлой версии не открывается: в ней истории чатов вперемешку."""
     legacy_path = tmp_path / "legacy.db"
     legacy = sqlite3.connect(legacy_path)
@@ -108,11 +108,8 @@ def test_legacy_database_is_rejected(tmp_path, monkeypatch):
     legacy.commit()
     legacy.close()
 
-    monkeypatch.setattr(bot, "DB_FILE", str(legacy_path))
-    monkeypatch.setattr(bot, "MEDIA_DIR", str(tmp_path / "media"))
-
     with pytest.raises(RuntimeError, match="Удалите или переименуйте"):
-        bot.init_db()
+        bot.init_db(str(legacy_path), str(tmp_path / "media"))
 
 
 @pytest.mark.parametrize(

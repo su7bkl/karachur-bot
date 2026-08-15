@@ -3,14 +3,19 @@
 
 Опрос Telegram подменяется, поэтому тест никуда не ходит: проверяется только то, что
 бот собрал приложение, зарегистрировал команды и привязал общий ключ из конфига.
+
+Конфиг main() читает сама, поэтому тесту достаточно подменить load_config - файл на
+диск выкладывает только тот тест, который как раз про поиск этого файла.
 """
 
+import dataclasses
 import sqlite3
 
 from telegram.ext import Application, CommandHandler, MessageHandler
 
 import bot
 from conftest import SHARED_KEY
+from karachur import config
 
 EXPECTED_COMMANDS = {"help", "start", "keys", "addkey", "delkey", "rotatekey", "model"}
 
@@ -27,12 +32,10 @@ def collect_handlers(application):
     return commands_found, message_handlers
 
 
-def test_main_registers_handlers_and_shared_key(tmp_path, monkeypatch):
+def test_main_registers_handlers_and_shared_key(cfg, monkeypatch):
     """Запуск создает таблицы, вешает обработчики и привязывает ключ из конфига."""
-    db_path = tmp_path / "startup.db"
-    monkeypatch.setattr(bot, "DB_FILE", str(db_path))
-    monkeypatch.setattr(bot, "MEDIA_DIR", str(tmp_path / "media"))
-    monkeypatch.setattr(bot, "GEMINI_API_KEY", SHARED_KEY)
+    started_cfg = dataclasses.replace(cfg, gemini_api_key=SHARED_KEY)
+    monkeypatch.setattr(config, "load_config", lambda: started_cfg)
 
     started = {}
 
@@ -48,11 +51,11 @@ def test_main_registers_handlers_and_shared_key(tmp_path, monkeypatch):
 
     assert commands_found == EXPECTED_COMMANDS
     assert message_handlers == 1
-    assert application.bot_data["default_model"] == bot.MODEL
-    assert application.bot_data["key_rpd_limit"] == bot.KEY_RPD_LIMIT
+    # Настройки уезжают обработчикам целиком: модель и потолок запросов они берут оттуда.
+    assert application.bot_data["cfg"] is started_cfg
 
     # Свое соединение main() закрывает, выйдя из опроса, поэтому смотрим в файл заново.
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(started_cfg.db_file)
     try:
         tables = {
             row[0]
@@ -76,9 +79,11 @@ def test_main_registers_handlers_and_shared_key(tmp_path, monkeypatch):
     assert shared == 1
 
 
-def test_missing_token_stops_the_bot(monkeypatch):
+def test_missing_token_stops_the_bot(cfg, monkeypatch):
     """Без токена бот не запускается и говорит почему."""
-    monkeypatch.setattr(bot, "BOT_TOKEN", "")
+    monkeypatch.setattr(
+        config, "load_config", lambda: dataclasses.replace(cfg, bot_token="")
+    )
 
     try:
         bot.main()
@@ -90,17 +95,17 @@ def test_missing_token_stops_the_bot(monkeypatch):
 
 def test_config_path_comes_from_the_environment(tmp_path, monkeypatch):
     """Путь к конфигу берется из переменной окружения."""
-    config = tmp_path / "custom.cfg"
-    config.write_text(
+    config_file = tmp_path / "custom.cfg"
+    config_file.write_text(
         "[SETTINGS]\nBOT_TOKEN = t\nDB_FILE = d\nMEDIA_DIR = m\n"
         "TRIGGER_WORD = w\nSYSTEM_PROMPT = p\nMODEL = custom-model\n",
         encoding="utf-8",
     )
-    monkeypatch.setenv(bot.CONFIG_ENV_VAR, str(config))
+    monkeypatch.setenv(config.CONFIG_ENV_VAR, str(config_file))
 
-    settings = bot.load_config()
+    settings = config.load_config()
 
-    assert settings["MODEL"] == "custom-model"
+    assert settings.model == "custom-model"
     # Необязательные параметры получают запасные значения.
-    assert settings["GEMINI_API_KEY"] == ""
-    assert settings["KEY_RPD_LIMIT"] == 250
+    assert settings.gemini_api_key == ""
+    assert settings.key_rpd_limit == 250
