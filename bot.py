@@ -41,6 +41,7 @@ from telegram.ext import (
 import api_keys
 import chat_settings
 import commands
+import media
 from html_splitter import split_html_message
 from markdown_converter import markdown_to_telegram_html
 
@@ -227,9 +228,11 @@ def init_db():
             forward_origin TEXT,
             is_bot BOOLEAN DEFAULT 0,
             summarized INTEGER DEFAULT 0,
+            media_path TEXT,
             UNIQUE (chat_id, message_id)
         )
     """)
+    add_missing_columns(cursor)
     # Контекст собирается по одному чату, и почти всегда - по его несжатой части.
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS messages_chat_context
@@ -250,6 +253,24 @@ def init_db():
     chat_settings.init_settings_table(cursor)
     conn.commit()
     return conn
+
+
+# Колонки messages, появившиеся после того, как схема уже уехала на боевую машину.
+LATE_MESSAGE_COLUMNS = {"media_path": "TEXT"}
+
+
+def add_missing_columns(cursor: sqlite3.Cursor):
+    """
+    Дописывает в messages колонки, которых нет в базах прошлых версий.
+
+    :param cursor: курсор открытой базы
+    :type cursor: sqlite3.Cursor
+    """
+    columns = {row[1] for row in cursor.execute("PRAGMA table_info(messages)")}
+    for name, definition in LATE_MESSAGE_COLUMNS.items():
+        if name not in columns:
+            cursor.execute(f"ALTER TABLE messages ADD COLUMN {name} {definition}")
+            logger.info("В таблицу messages добавлена колонка %s.", name)
 
 
 def check_legacy_schema(cursor: sqlite3.Cursor):
@@ -780,6 +801,39 @@ def get_media_path(
     return None
 
 
+async def normalize_media(
+    conn: sqlite3.Connection, message: Message, file_path: str, mime_type: str | None
+):
+    """
+    Перекодирует скачанный файл под модель и запоминает, где он в итоге лег.
+
+    Путь пишем в базу, потому что после ffmpeg у файла другое расширение: вычислить его
+    по mime, как раньше, уже нельзя.
+
+    :param conn: соединение с базой данных
+    :type conn: sqlite3.Connection
+    :param message: сообщение, к которому относится файл
+    :type message: Message
+    :param file_path: путь к скачанному файлу
+    :type file_path: str
+    :param mime_type: mime, с которым файл пришел из Telegram
+    :type mime_type: str | None
+    """
+    if not os.path.exists(file_path):
+        return
+
+    # Перекодирование блокирует надолго, уводим его в поток.
+    path, mime = await asyncio.to_thread(media.normalize, file_path, mime_type)
+    conn.execute(
+        """
+        UPDATE messages SET media_path = ?, mime_type = ?
+        WHERE chat_id = ? AND message_id = ?
+        """,
+        (path, mime, message.chat_id, message.message_id),
+    )
+    conn.commit()
+
+
 async def download_media_file(application: Application, file_id: str, file_path: str):
     """
     Загружает медиа-файл из Telegram.
@@ -1059,7 +1113,10 @@ def build_message_parts(client: genai.Client, api_key: str, msg: dict) -> list:
         parts.append(genai.types.Part(text=f"{note}\n{text}" if note else text))
 
     if msg.get("file_id") and msg.get("mime_type"):
-        raw_path = get_media_path(
+        # Путь перекодированного файла лежит в базе: после ffmpeg у него другое
+        # расширение, и по mime его уже не вычислить. У сообщений, сохраненных до
+        # перекодирования, колонка пуста - для них путь считается по-старому.
+        raw_path = msg.get("media_path") or get_media_path(
             msg["file_id"], msg["mime_type"], msg.get("file_name")
         )
         media_path = os.path.abspath(raw_path) if raw_path else None
@@ -1658,6 +1715,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_path = get_media_path(file_id, mime_type, file_name)
         if file_path:
             await download_media_file(context.application, file_id, file_path)
+            await normalize_media(db_conn, message, file_path, mime_type)
 
     if not (triggered_by_text or message.voice):
         return
