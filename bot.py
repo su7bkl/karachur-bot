@@ -32,6 +32,7 @@ from telegram.ext import (
 import api_keys
 import commands
 from karachur import config, media
+from karachur.session import ChatSession
 from karachur.storage import settings
 from karachur.text import notes
 from karachur.text.html_splitter import split_html_message
@@ -1441,8 +1442,7 @@ async def answer_chat(
                 f"Напиши расшифровку голосового сообщения. {current_content}"
             )
 
-    model = settings.get_model(db_conn, chat_id, cfg.model)
-    pool = api_keys.KeyPool(db_conn, chat_id, model, cfg.key_rpd_limit)
+    pool = ChatSession.create(cfg, db_conn, chat_id).pool
 
     placeholder = await send_placeholder(message)
     err = False

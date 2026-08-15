@@ -18,6 +18,7 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 import api_keys
+from karachur.session import ChatSession
 from karachur.storage import settings
 
 logger = logging.getLogger(__name__)
@@ -61,8 +62,7 @@ def _pool(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> api_keys.KeyPool:
     """
     conn = context.bot_data["db_conn"]
     cfg = context.bot_data["cfg"]
-    model = settings.get_model(conn, chat_id, cfg.model)
-    return api_keys.KeyPool(conn, chat_id, model, cfg.key_rpd_limit)
+    return ChatSession.create(cfg, conn, chat_id).pool
 
 
 def list_models(api_key: str) -> list[str]:
