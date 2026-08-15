@@ -41,6 +41,7 @@ from telegram.ext import (
 import api_keys
 import chat_settings
 import commands
+import media
 from html_splitter import split_html_message
 from markdown_converter import markdown_to_telegram_html
 
@@ -177,6 +178,22 @@ QUOTE_NOTE_LEAD = "Процитирован фрагмент"
 # лежит в forward_origin, оттуда же берем и время оригинала: message.date у пересланного -
 # это момент пересылки.
 FORWARD_NOTE_LEAD = "Переслано"
+# Перед моделью все вложения выглядят одинаково: после перекодирования и стикер, и кружок,
+# и гифка приезжают одним и тем же mp4. Пометка возвращает то, что при этом теряется, -
+# чем это было в чате.
+MEDIA_NOTE_LEAD = "Вложение"
+MEDIA_LABELS = {
+    "photo": "фото",
+    "sticker": "стикер",
+    "animated_sticker": "анимированный стикер",
+    "video_sticker": "видео-стикер",
+    "animation": "гифка",
+    "video": "видео",
+    "video_note": "видеосообщение кружком",
+    "voice": "голосовое сообщение",
+    "audio": "аудиозапись",
+    "document": "файл",
+}
 # Сколько символов сообщения-адресата показываем: пометка должна давать его опознать,
 # а не пересказывать целиком - иначе популярное сообщение размножится по всему контексту.
 REPLY_SNIPPET_LIMIT = 300
@@ -184,7 +201,8 @@ REPLY_SNIPPET_LIMIT = 300
 QUOTE_SNIPPET_LIMIT = 1024
 # Страховка на случай, если модель начнет ответ с копии пометки.
 SERVICE_NOTE_PATTERN = re.compile(
-    rf"^\s*\[(?:{FORWARD_NOTE_LEAD}|{REPLY_NOTE_LEAD}|{QUOTE_NOTE_LEAD})[^\n]*\]\s*"
+    rf"^\s*\[(?:{FORWARD_NOTE_LEAD}|{REPLY_NOTE_LEAD}|{QUOTE_NOTE_LEAD}"
+    rf"|{MEDIA_NOTE_LEAD})[^\n]*\]\s*"
 )
 
 # --- ЛОГИРОВАНИЕ ---
@@ -227,9 +245,11 @@ def init_db():
             forward_origin TEXT,
             is_bot BOOLEAN DEFAULT 0,
             summarized INTEGER DEFAULT 0,
+            media_path TEXT,
             UNIQUE (chat_id, message_id)
         )
     """)
+    add_missing_columns(cursor)
     # Контекст собирается по одному чату, и почти всегда - по его несжатой части.
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS messages_chat_context
@@ -250,6 +270,24 @@ def init_db():
     chat_settings.init_settings_table(cursor)
     conn.commit()
     return conn
+
+
+# Колонки messages, появившиеся после того, как схема уже уехала на боевую машину.
+LATE_MESSAGE_COLUMNS = {"media_path": "TEXT"}
+
+
+def add_missing_columns(cursor: sqlite3.Cursor):
+    """
+    Дописывает в messages колонки, которых нет в базах прошлых версий.
+
+    :param cursor: курсор открытой базы
+    :type cursor: sqlite3.Cursor
+    """
+    columns = {row[1] for row in cursor.execute("PRAGMA table_info(messages)")}
+    for name, definition in LATE_MESSAGE_COLUMNS.items():
+        if name not in columns:
+            cursor.execute(f"ALTER TABLE messages ADD COLUMN {name} {definition}")
+            logger.info("В таблицу messages добавлена колонка %s.", name)
 
 
 def check_legacy_schema(cursor: sqlite3.Cursor):
@@ -433,6 +471,23 @@ def describe_forward_origin(origin: MessageOrigin | None) -> str | None:
     return f"из неизвестного источника (date:{date})"
 
 
+def describe_sticker(sticker) -> tuple[str, str, str]:
+    """
+    Разбирает стикер: какого он вида и с каким mime его сохранять.
+
+    Вид нужен только для служебной пометки - сам файл отправляется как раньше.
+
+    :param sticker: стикер из сообщения Telegram
+    :return: (вид вложения, file_id, mime)
+    :rtype: tuple[str, str, str]
+    """
+    if sticker.is_animated:
+        return "animated_sticker", sticker.file_id, "video/webm"
+    if sticker.is_video:
+        return "video_sticker", sticker.file_id, "video/webm"
+    return "sticker", sticker.file_id, "image/webp"
+
+
 def build_service_note(msg: dict) -> str | None:
     """
     Собирает служебную пометку перед репликой: откуда она переслана и чему отвечает.
@@ -457,6 +512,9 @@ def build_service_note(msg: dict) -> str | None:
     quote = shorten(msg.get("quote_text") or "", QUOTE_SNIPPET_LIMIT)
     if quote:
         notes.append(f"{QUOTE_NOTE_LEAD}: «{quote}»")
+    label = MEDIA_LABELS.get(msg.get("media_type") or "")
+    if label:
+        notes.append(f"{MEDIA_NOTE_LEAD}: {label}")
     return f"[{'. '.join(notes)}]" if notes else None
 
 
@@ -499,11 +557,13 @@ def save_message_to_db(  # pylint: disable=too-many-locals
             message.document.file_name,
         )
     elif message.sticker:
-        media_type, file_id = "sticker", message.sticker.file_id
-        mime_type = (
-            "image/webp"
-            if not message.sticker.is_animated and not message.sticker.is_video
-            else "video/webm"
+        media_type, file_id, mime_type = describe_sticker(message.sticker)
+    elif message.animation:
+        media_type, file_id, mime_type, file_name = (
+            "animation",
+            message.animation.file_id,
+            message.animation.mime_type,
+            message.animation.file_name,
         )
     elif message.video:
         media_type, file_id, mime_type, file_name = (
@@ -520,11 +580,11 @@ def save_message_to_db(  # pylint: disable=too-many-locals
             message.audio.file_name,
         )
     elif message.voice:
-        media_type, file_id, mime_type = "audio", message.voice.file_id, "audio/ogg"
+        media_type, file_id, mime_type = "voice", message.voice.file_id, "audio/ogg"
         content = f"[Голосовое сообщение by {message.from_user.username}]"
     elif message.video_note:
         media_type, file_id, mime_type = (
-            "video",
+            "video_note",
             message.video_note.file_id,
             "video/mp4",
         )
@@ -778,6 +838,39 @@ def get_media_path(
         ext = get_extension_from_mime(mime_type)
         return os.path.join(MEDIA_DIR, f"{file_id}.{ext}")
     return None
+
+
+async def normalize_media(
+    conn: sqlite3.Connection, message: Message, file_path: str, mime_type: str | None
+):
+    """
+    Перекодирует скачанный файл под модель и запоминает, где он в итоге лег.
+
+    Путь пишем в базу, потому что после ffmpeg у файла другое расширение: вычислить его
+    по mime, как раньше, уже нельзя.
+
+    :param conn: соединение с базой данных
+    :type conn: sqlite3.Connection
+    :param message: сообщение, к которому относится файл
+    :type message: Message
+    :param file_path: путь к скачанному файлу
+    :type file_path: str
+    :param mime_type: mime, с которым файл пришел из Telegram
+    :type mime_type: str | None
+    """
+    if not os.path.exists(file_path):
+        return
+
+    # Перекодирование блокирует надолго, уводим его в поток.
+    path, mime = await asyncio.to_thread(media.normalize, file_path, mime_type)
+    conn.execute(
+        """
+        UPDATE messages SET media_path = ?, mime_type = ?
+        WHERE chat_id = ? AND message_id = ?
+        """,
+        (path, mime, message.chat_id, message.message_id),
+    )
+    conn.commit()
 
 
 async def download_media_file(application: Application, file_id: str, file_path: str):
@@ -1059,7 +1152,10 @@ def build_message_parts(client: genai.Client, api_key: str, msg: dict) -> list:
         parts.append(genai.types.Part(text=f"{note}\n{text}" if note else text))
 
     if msg.get("file_id") and msg.get("mime_type"):
-        raw_path = get_media_path(
+        # Путь перекодированного файла лежит в базе: после ffmpeg у него другое
+        # расширение, и по mime его уже не вычислить. У сообщений, сохраненных до
+        # перекодирования, колонка пуста - для них путь считается по-старому.
+        raw_path = msg.get("media_path") or get_media_path(
             msg["file_id"], msg["mime_type"], msg.get("file_name")
         )
         media_path = os.path.abspath(raw_path) if raw_path else None
@@ -1658,6 +1754,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_path = get_media_path(file_id, mime_type, file_name)
         if file_path:
             await download_media_file(context.application, file_id, file_path)
+            await normalize_media(db_conn, message, file_path, mime_type)
 
     if not (triggered_by_text or message.voice):
         return

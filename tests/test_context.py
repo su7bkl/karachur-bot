@@ -112,3 +112,48 @@ def test_legacy_database_is_rejected(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="Удалите или переименуйте"):
         bot.init_db()
+
+
+@pytest.mark.parametrize(
+    "kind, expected",
+    [
+        ("animated_sticker", "анимированный стикер"),
+        ("video_sticker", "видео-стикер"),
+        ("animation", "гифка"),
+        ("video_note", "видеосообщение кружком"),
+        ("voice", "голосовое сообщение"),
+        ("photo", "фото"),
+        ("document", "файл"),
+    ],
+)
+def test_attachment_kind_reaches_the_model(db, kind, expected):
+    """Модель узнает, чем было вложение: после перекодирования это уже не видно."""
+    db.execute(
+        """
+        INSERT INTO messages (message_id, chat_id, username, content, media_type,
+                              file_id, mime_type, timestamp, is_bot, summarized)
+        VALUES (1, ?, 'tester', '', ?, 'FILE', 'video/mp4',
+                '2026-08-15T10:00:00', 0, 0)
+        """,
+        (CHAT_ONE, kind),
+    )
+    db.commit()
+
+    _, messages = bot.get_context(db, CHAT_ONE)
+    note = bot.build_service_note(messages[0]) or ""
+
+    assert f"Вложение: {expected}" in note
+
+
+def test_message_without_attachment_has_no_note(db, add_message):
+    """Обычной реплике без вложения помечать нечего."""
+    add_message(CHAT_ONE, 1, "просто текст")
+
+    _, messages = bot.get_context(db, CHAT_ONE)
+
+    assert bot.build_service_note(messages[0]) is None
+
+
+def test_copied_attachment_note_is_stripped():
+    """Если модель скопирует пометку о вложении, она срезается."""
+    assert bot.strip_service_prefixes("[Вложение: гифка] ответ") == "ответ"
