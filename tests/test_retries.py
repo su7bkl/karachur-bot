@@ -11,11 +11,12 @@ import dataclasses
 
 import pytest
 
-import bot
 from conftest import CHAT_ONE, KEY_ONE, KEY_TWO
+from karachur.gemini import compress
 
 # Модуль зовется key_pool, а не pool: имя pool в тестах занято самим пулом чата.
 from karachur.gemini import pool as key_pool
+from karachur.gemini import retries
 from karachur.storage import keys as key_store
 from karachur.storage import messages, settings, summaries
 
@@ -34,7 +35,7 @@ def prepared_pool(conn, *keys, start_with=None, daily_limit=250, model="gemini-t
 
 def ask(cfg, pool, gemini):
     """Прогоняет запрос через цикл повторов. Модель берется из самого пула."""
-    return asyncio.run(bot.generate_with_retries(cfg, pool, gemini.make_contents))
+    return asyncio.run(retries.generate_with_retries(cfg, pool, gemini.make_contents))
 
 
 def test_daily_quota_switches_key_and_rebuilds_request(cfg, db, gemini, api_error):
@@ -105,7 +106,7 @@ def test_fatal_error_does_not_burn_the_pool(cfg, db, gemini, api_error):
     gemini.script(KEY_ONE, api_error(404, "models/nope is not found"))
     gemini.script(KEY_TWO, "не должно понадобиться")
 
-    with pytest.raises(bot.GeminiRetryError, match="404"):
+    with pytest.raises(retries.GeminiRetryError, match="404"):
         ask(cfg, pool, gemini)
 
     assert gemini.calls == [KEY_ONE]
@@ -129,7 +130,7 @@ def test_attempts_run_out(cfg, db, gemini, api_error):
     pool = prepared_pool(db, KEY_ONE, start_with=KEY_ONE)
     gemini.script(KEY_ONE, *[api_error(500, "INTERNAL")] * cfg.max_retries)
 
-    with pytest.raises(bot.GeminiRetryError, match="Не удалось получить ответ"):
+    with pytest.raises(retries.GeminiRetryError, match="Не удалось получить ответ"):
         ask(cfg, pool, gemini)
 
 
@@ -174,7 +175,7 @@ def test_context_is_compressed_and_saved(cfg, db, gemini, add_message):
 
     _, context = messages.get_context(db, CHAT_ONE)
     kept, summary = asyncio.run(
-        bot.compress_context(cfg, pool, db, CHAT_ONE, context, None)
+        compress.compress_context(cfg, pool, db, CHAT_ONE, context, None)
     )
 
     assert summary == "пересказ старой части"
@@ -193,7 +194,7 @@ def test_small_context_is_left_alone(cfg, db, gemini, add_message):
 
     _, context = messages.get_context(db, CHAT_ONE)
     kept, summary = asyncio.run(
-        bot.compress_context(cfg, pool, db, CHAT_ONE, context, None)
+        compress.compress_context(cfg, pool, db, CHAT_ONE, context, None)
     )
 
     assert kept == context
