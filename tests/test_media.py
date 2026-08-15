@@ -269,7 +269,9 @@ def test_normalize_media_records_the_result(db, tmp_path, monkeypatch):
     stored = db.execute(
         "SELECT media_path, mime_type FROM messages WHERE message_id = 7"
     ).fetchone()
-    assert stored == (str(tmp_path / "и.mp4"), "video/mp4")
+    # tuple() нужен, потому что соединение отдает строки sqlite3.Row, а Row не равен
+    # кортежу даже с теми же значениями.
+    assert tuple(stored) == (str(tmp_path / "и.mp4"), "video/mp4")
 
 
 @needs_ffmpeg

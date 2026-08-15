@@ -33,7 +33,7 @@ import api_keys
 import commands
 from karachur import config, media
 from karachur.session import ChatSession
-from karachur.storage import settings
+from karachur.storage import db, schema
 from karachur.text import notes
 from karachur.text.html_splitter import split_html_message
 from karachur.text.markdown import markdown_to_telegram_html
@@ -77,117 +77,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- БЛОК РАБОТЫ С БАЗОЙ ДАННЫХ ---
-
-
-def init_db(db_file: str, media_dir: str) -> sqlite3.Connection:
-    """
-    Инициализирует базу данных SQLite и создает необходимые таблицы.
-
-    :param db_file: путь к файлу базы
-    :type db_file: str
-    :param media_dir: каталог для скачанных медиафайлов, заводится заодно с базой
-    :type media_dir: str
-    :return: соединение с базой данных
-    :rtype: sqlite3.Connection
-    """
-    os.makedirs(media_dir, exist_ok=True)
-    conn = sqlite3.connect(db_file, check_same_thread=False)
-    cursor = conn.cursor()
-    check_legacy_schema(cursor, db_file)
-    # message_id уникален только внутри чата: в двух разных чатах номера повторяются, и
-    # без chat_id в ограничении сообщения одного чата затирали бы сообщения другого.
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_id INTEGER,
-            chat_id INTEGER,
-            user_id INTEGER,
-            username TEXT,
-            content TEXT,
-            media_type TEXT,
-            mime_type TEXT,
-            file_id TEXT,
-            file_name TEXT,
-            timestamp TEXT,
-            reply_to_message_id INTEGER,
-            quote_text TEXT,
-            forward_origin TEXT,
-            is_bot BOOLEAN DEFAULT 0,
-            summarized INTEGER DEFAULT 0,
-            media_path TEXT,
-            UNIQUE (chat_id, message_id)
-        )
-    """)
-    add_missing_columns(cursor)
-    # Контекст собирается по одному чату, и почти всегда - по его несжатой части.
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS messages_chat_context
-        ON messages (chat_id, summarized, timestamp)
-    """)
-    # Пересказы сжатых кусков истории. Сами сообщения остаются в messages, но в контекст
-    # больше не попадают: их заменяет последний пересказ своего чата.
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS context_summaries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
-            summary TEXT,
-            covered_messages INTEGER,
-            created_at TEXT
-        )
-    """)
-    api_keys.init_key_tables(cursor)
-    settings.init_settings_table(cursor)
-    conn.commit()
-    return conn
-
-
-# Колонки messages, появившиеся после того, как схема уже уехала на боевую машину.
-LATE_MESSAGE_COLUMNS = {"media_path": "TEXT"}
-
-
-def add_missing_columns(cursor: sqlite3.Cursor):
-    """
-    Дописывает в messages колонки, которых нет в базах прошлых версий.
-
-    :param cursor: курсор открытой базы
-    :type cursor: sqlite3.Cursor
-    """
-    columns = {row[1] for row in cursor.execute("PRAGMA table_info(messages)")}
-    for name, definition in LATE_MESSAGE_COLUMNS.items():
-        if name not in columns:
-            cursor.execute(f"ALTER TABLE messages ADD COLUMN {name} {definition}")
-            logger.info("В таблицу messages добавлена колонка %s.", name)
-
-
-def check_legacy_schema(cursor: sqlite3.Cursor, db_file: str):
-    """
-    Отказывается работать с базой, созданной до разделения истории по чатам.
-
-    В старой схеме message_id уникален сам по себе, а пересказы не привязаны к чату:
-    подпереть это ALTER TABLE нельзя, а молча продолжить - значит перемешать истории
-    разных чатов. Поэтому просто говорим, что делать.
-
-    :param cursor: курсор открытой базы
-    :type cursor: sqlite3.Cursor
-    :param db_file: путь к файлу базы - его называем человеку в тексте отказа
-    :type db_file: str
-    :raises RuntimeError: если база сделана прошлой версией бота
-    """
-    row = cursor.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'"
-    ).fetchone()
-    if not row or not row[0]:
-        return
-
-    schema = " ".join(row[0].split()).lower()
-    if "unique (chat_id, message_id)" in schema:
-        return
-
-    raise RuntimeError(
-        f"База {db_file} сделана версией бота без поддержки нескольких чатов: "
-        "в ней истории всех чатов лежат вперемешку, а message_id уникален глобально. "
-        "Удалите или переименуйте файл базы - новая создастся сама."
-    )
+# Схема (создание таблиц, донастройка старых баз, отказ от совсем древних) вынесена в
+# karachur.storage.schema - здесь остается только работа с данными в уже готовых таблицах.
 
 
 def save_message_to_db(  # pylint: disable=too-many-locals
@@ -409,11 +300,7 @@ def attach_reply_targets(conn: sqlite3.Connection, chat_id: int, messages: list)
         """,
         (chat_id, *target_ids),
     )
-    columns = [description[0] for description in cursor.description]
-    targets = {}
-    for row in cursor.fetchall():
-        target = dict(zip(columns, row))
-        targets[target["message_id"]] = target
+    targets = {target["message_id"]: target for target in db.fetch_dicts(cursor)}
 
     for msg in messages:
         reply_to_id = msg.get("reply_to_message_id")
@@ -444,8 +331,7 @@ def get_context(conn: sqlite3.Connection, chat_id: int) -> tuple[str | None, lis
     """,
         (chat_id,),
     )
-    columns = [description[0] for description in cursor.description]
-    messages = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    messages = db.fetch_dicts(cursor)
     attach_reply_targets(conn, chat_id, messages)
     return get_latest_summary(conn, chat_id), messages
 
@@ -1535,7 +1421,7 @@ def main():
     if not cfg.bot_token:
         raise ValueError("Пожалуйста, проверьте файл конфигурации: BOT_TOKEN не указан.")
 
-    db_connection = init_db(cfg.db_file, cfg.media_dir)
+    db_connection = schema.init_db(cfg.db_file, cfg.media_dir)
 
     # Ключ из конфига доступен всем чатам сразу; свои чат добавляет командой /addkey.
     api_keys.sync_shared_key(db_connection, cfg.gemini_api_key)

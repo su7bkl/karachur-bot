@@ -19,9 +19,9 @@ import asyncio
 import pytest
 
 import api_keys
-import bot
 import commands
 from karachur import config
+from karachur.storage import schema
 
 # Ключи в тестах намеренно непохожи на настоящие, но той же длины и формы.
 KEY_ONE = "AIzaTEST0000000000000000000000000000001"
@@ -345,7 +345,7 @@ def db_fixture(cfg):  # pylint: disable=redefined-outer-name
     :param cfg: настройки теста - из них берутся пути к базе и каталогу медиа
     :return: открытое соединение с базой
     """
-    conn = bot.init_db(cfg.db_file, cfg.media_dir)
+    conn = schema.init_db(cfg.db_file, cfg.media_dir)
     yield conn
     conn.close()
 

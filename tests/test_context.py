@@ -12,6 +12,7 @@ import pytest
 
 import bot
 from conftest import CHAT_ONE, CHAT_TWO
+from karachur.storage import schema
 from karachur.text import notes
 
 
@@ -87,7 +88,9 @@ def test_summary_marks_only_its_own_messages(db, add_message):
     marked = db.execute(
         "SELECT chat_id FROM messages WHERE summarized = 1"
     ).fetchall()
-    assert marked == [(CHAT_ONE,)]
+    # row_factory отдает sqlite3.Row, а не кортеж - он с кортежем не равен даже при
+    # совпадении значений, поэтому сравниваем приведенные к tuple() строки.
+    assert [tuple(row) for row in marked] == [(CHAT_ONE,)]
 
 
 def test_latest_summary_wins(db):
@@ -109,7 +112,7 @@ def test_legacy_database_is_rejected(tmp_path):
     legacy.close()
 
     with pytest.raises(RuntimeError, match="Удалите или переименуйте"):
-        bot.init_db(str(legacy_path), str(tmp_path / "media"))
+        schema.init_db(str(legacy_path), str(tmp_path / "media"))
 
 
 @pytest.mark.parametrize(
