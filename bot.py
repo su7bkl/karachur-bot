@@ -30,23 +30,41 @@ from telegram import (
     Update,
 )
 from telegram.error import TelegramError
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
+import api_keys
+import chat_settings
+import commands
 from html_splitter import split_html_message
 from markdown_converter import markdown_to_telegram_html
 
 
 # --- ЧТЕНИЕ НАСТРОЕК ---
-def load_config(config_path="config.cfg"):
+# Путь к конфигу можно задать переменной окружения: бота запускают и не из его папки,
+# а тестам нужен свой конфиг, не трогающий рабочий.
+CONFIG_ENV_VAR = "KARACHUR_CONFIG"
+
+
+def load_config(config_path=None):
     """
     Загружает настройки из конфигурационного файла (UTF-8).
 
     Args:
-        config_path (str): Путь к файлу конфигурации.
+        config_path (str | None): Путь к файлу конфигурации. Если не задан, берется из
+        переменной окружения KARACHUR_CONFIG, а по умолчанию - config.cfg рядом с ботом.
 
     Returns:
         dict: Словарь с настройками.
     """
+    if config_path is None:
+        config_path = os.environ.get(CONFIG_ENV_VAR, "config.cfg")
+
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Файл конфигурации не найден: {config_path}")
 
@@ -56,17 +74,18 @@ def load_config(config_path="config.cfg"):
 
     settings = {
         "BOT_TOKEN": config.get("SETTINGS", "BOT_TOKEN"),
-        "GEMINI_API_KEY": config.get("SETTINGS", "GEMINI_API_KEY"),
         "DB_FILE": config.get("SETTINGS", "DB_FILE"),
         "MEDIA_DIR": config.get("SETTINGS", "MEDIA_DIR"),
         "TRIGGER_WORD": config.get("SETTINGS", "TRIGGER_WORD"),
         "SYSTEM_PROMPT": config.get("SETTINGS", "SYSTEM_PROMPT"),
         "MODEL": config.get("SETTINGS", "MODEL"),
         # Необязательные параметры: у старых конфигов их нет, поэтому с запасными значениями.
+        # Ключ из конфига необязателен: чат может обойтись своими, добавленными /addkey.
+        "GEMINI_API_KEY": config.get("SETTINGS", "GEMINI_API_KEY", fallback="").strip(),
         "MAX_CONTEXT_TOKENS": config.getint(
             "SETTINGS", "MAX_CONTEXT_TOKENS", fallback=200_000
         ),
-        "GOOGLE_SEARCH": config.getboolean("SETTINGS", "GOOGLE_SEARCH", fallback=True),
+        "KEY_RPD_LIMIT": config.getint("SETTINGS", "KEY_RPD_LIMIT", fallback=250),
     }
 
     return settings
@@ -83,20 +102,7 @@ TRIGGER_WORD = CONFIG["TRIGGER_WORD"]
 SYSTEM_PROMPT = CONFIG["SYSTEM_PROMPT"]
 MODEL = CONFIG["MODEL"]
 MAX_CONTEXT_TOKENS = CONFIG["MAX_CONTEXT_TOKENS"]
-GOOGLE_SEARCH = CONFIG["GOOGLE_SEARCH"]
-
-# --- ПОИСК В ГУГЛЕ ---
-# Инструмент поиска модель вызывает сама, на своей стороне: решает, нужны ли ей свежие
-# данные, ищет и отвечает уже с их учетом. Нам возвращается обычный текст.
-# Ставим его только на ответы в чат: пересказу истории искать нечего, там весь материал
-# уже лежит в запросе.
-REPLY_CONFIG = (
-    genai.types.GenerateContentConfig(
-        tools=[genai.types.Tool(google_search=genai.types.GoogleSearch())]
-    )
-    if GOOGLE_SEARCH
-    else None
-)
+KEY_RPD_LIMIT = CONFIG["KEY_RPD_LIMIT"]
 
 # --- НАСТРОЙКИ ПОВТОРНЫХ ПОПЫТОК ---
 # Сколько раз пробуем получить от модели корректный текст, прежде чем сдаться.
@@ -104,8 +110,6 @@ MAX_RETRIES = 15
 # Пауза растет экспоненциально (2, 4, 8, ...) до потолка. Суммарно ~18 минут.
 RETRY_BASE_DELAY = 2.0
 RETRY_MAX_DELAY = 120.0
-# Ошибки, которые сами не пройдут: кривой запрос, битый ключ, нет прав, нет модели.
-NON_RETRYABLE_CODES = frozenset({400, 401, 403, 404})
 # В деталях ошибки 429 Gemini присылает рекомендованную паузу: "retryDelay": "27s".
 RETRY_DELAY_PATTERN = re.compile(
     r"retry[-_]?delay[\"']?\s*[:=]\s*[\"']?(\d+(?:\.\d+)?)s", re.IGNORECASE
@@ -202,10 +206,13 @@ def init_db():
     os.makedirs(MEDIA_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     cursor = conn.cursor()
+    check_legacy_schema(cursor)
+    # message_id уникален только внутри чата: в двух разных чатах номера повторяются, и
+    # без chat_id в ограничении сообщения одного чата затирали бы сообщения другого.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_id INTEGER UNIQUE,
+            message_id INTEGER,
             chat_id INTEGER,
             user_id INTEGER,
             username TEXT,
@@ -219,44 +226,59 @@ def init_db():
             quote_text TEXT,
             forward_origin TEXT,
             is_bot BOOLEAN DEFAULT 0,
-            summarized INTEGER DEFAULT 0
+            summarized INTEGER DEFAULT 0,
+            UNIQUE (chat_id, message_id)
         )
     """)
+    # Контекст собирается по одному чату, и почти всегда - по его несжатой части.
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS messages_chat_context
+        ON messages (chat_id, summarized, timestamp)
+    """)
     # Пересказы сжатых кусков истории. Сами сообщения остаются в messages, но в контекст
-    # больше не попадают: их заменяет последний пересказ.
+    # больше не попадают: их заменяет последний пересказ своего чата.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS context_summaries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
             summary TEXT,
             covered_messages INTEGER,
             created_at TEXT
         )
     """)
-    add_missing_columns(cursor)
+    api_keys.init_key_tables(cursor)
+    chat_settings.init_settings_table(cursor)
     conn.commit()
     return conn
 
 
-# Колонки messages, которых нет в базах, созданных прошлыми версиями бота.
-LATE_MESSAGE_COLUMNS = {
-    "summarized": "INTEGER DEFAULT 0",
-    "quote_text": "TEXT",
-    "forward_origin": "TEXT",
-}
-
-
-def add_missing_columns(cursor: sqlite3.Cursor):
+def check_legacy_schema(cursor: sqlite3.Cursor):
     """
-    Дописывает в messages колонки, появившиеся после создания базы.
+    Отказывается работать с базой, созданной до разделения истории по чатам.
+
+    В старой схеме message_id уникален сам по себе, а пересказы не привязаны к чату:
+    подпереть это ALTER TABLE нельзя, а молча продолжить - значит перемешать истории
+    разных чатов. Поэтому просто говорим, что делать.
 
     :param cursor: курсор открытой базы
     :type cursor: sqlite3.Cursor
+    :raises RuntimeError: если база сделана прошлой версией бота
     """
-    columns = {row[1] for row in cursor.execute("PRAGMA table_info(messages)")}
-    for name, definition in LATE_MESSAGE_COLUMNS.items():
-        if name not in columns:
-            cursor.execute(f"ALTER TABLE messages ADD COLUMN {name} {definition}")
-            logger.info("В таблицу messages добавлена колонка %s.", name)
+    row = cursor.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'"
+    ).fetchone()
+    if not row or not row[0]:
+        return
+
+    schema = " ".join(row[0].split()).lower()
+    if "unique (chat_id, message_id)" in schema:
+        return
+
+    raise RuntimeError(
+        f"База {DB_FILE} сделана версией бота без поддержки нескольких чатов: "
+        "в ней истории всех чатов лежат вперемешку, а message_id уникален глобально. "
+        "Удалите или переименуйте файл базы - новая создастся сама."
+    )
 
 
 def build_author_tag(name: str, username: str | None, date: str) -> str:
@@ -565,25 +587,32 @@ def save_message_to_db(  # pylint: disable=too-many-locals
     return file_id, mime_type, file_name
 
 
-def get_latest_summary(conn: sqlite3.Connection) -> str | None:
+def get_latest_summary(conn: sqlite3.Connection, chat_id: int) -> str | None:
     """
-    Возвращает последний пересказ сжатой части истории.
+    Возвращает последний пересказ сжатой части истории этого чата.
 
     Каждый следующий пересказ вбирает в себя предыдущий, поэтому актуален всегда
     только самый свежий.
 
     :param conn: соединение с базой данных
     :type conn: sqlite3.Connection
+    :param chat_id: идентификатор чата
+    :type chat_id: int
     :return: текст пересказа или None, если сжатия еще не было
     :rtype: str | None
     """
     cursor = conn.cursor()
-    cursor.execute("SELECT summary FROM context_summaries ORDER BY id DESC LIMIT 1")
+    cursor.execute(
+        "SELECT summary FROM context_summaries WHERE chat_id = ? ORDER BY id DESC LIMIT 1",
+        (chat_id,),
+    )
     row = cursor.fetchone()
     return row[0] if row else None
 
 
-def save_summary(conn: sqlite3.Connection, summary: str, message_ids: list):
+def save_summary(
+    conn: sqlite3.Connection, chat_id: int, summary: str, message_ids: list
+):
     """
     Сохраняет пересказ и помечает вошедшие в него сообщения как сжатые.
 
@@ -593,6 +622,8 @@ def save_summary(conn: sqlite3.Connection, summary: str, message_ids: list):
 
     :param conn: соединение с базой данных
     :type conn: sqlite3.Connection
+    :param chat_id: идентификатор чата
+    :type chat_id: int
     :param summary: текст пересказа
     :type summary: str
     :param message_ids: message_id сообщений, вошедших в пересказ
@@ -601,28 +632,32 @@ def save_summary(conn: sqlite3.Connection, summary: str, message_ids: list):
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO context_summaries (summary, covered_messages, created_at)
-        VALUES (?, ?, ?)
+        INSERT INTO context_summaries (chat_id, summary, covered_messages, created_at)
+        VALUES (?, ?, ?, ?)
     """,
-        (summary, len(message_ids), datetime.now(timezone.utc).isoformat()),
+        (chat_id, summary, len(message_ids), datetime.now(timezone.utc).isoformat()),
     )
+    # message_id уникален только внутри чата, поэтому помечаем строго свои сообщения.
     cursor.executemany(
-        "UPDATE messages SET summarized = 1 WHERE message_id = ?",
-        [(message_id,) for message_id in message_ids],
+        "UPDATE messages SET summarized = 1 WHERE chat_id = ? AND message_id = ?",
+        [(chat_id, message_id) for message_id in message_ids],
     )
     conn.commit()
-    logger.info("Сохранен пересказ %d сообщений.", len(message_ids))
+    logger.info("Чат %s: сохранен пересказ %d сообщений.", chat_id, len(message_ids))
 
 
-def attach_reply_targets(conn: sqlite3.Connection, messages: list):
+def attach_reply_targets(conn: sqlite3.Connection, chat_id: int, messages: list):
     """
     Подкладывает к каждой реплике-ответу сообщение, которому она отвечает.
 
-    Ищем по всей таблице, а не по переданному куску истории: адресат мог остаться далеко
-    позади и уже уйти в пересказ, но пометка о нем все равно нужна.
+    Ищем по всей истории чата, а не по переданному куску: адресат мог остаться далеко
+    позади и уже уйти в пересказ, но пометка о нем все равно нужна. За пределы чата не
+    выходим - там лежат чужие разговоры с такими же номерами сообщений.
 
     :param conn: соединение с базой данных
     :type conn: sqlite3.Connection
+    :param chat_id: идентификатор чата
+    :type chat_id: int
     :param messages: сообщения контекста; в отвечающие добавляется ключ "reply_target"
         со строкой адресата или None, если такого сообщения в базе нет
     :type messages: list
@@ -636,8 +671,11 @@ def attach_reply_targets(conn: sqlite3.Connection, messages: list):
     cursor = conn.cursor()
     # В строку запроса подставляем только число "?" - сами идентификаторы идут параметрами.
     cursor.execute(
-        f"SELECT * FROM messages WHERE message_id IN ({','.join('?' * len(target_ids))})",
-        tuple(target_ids),
+        f"""
+        SELECT * FROM messages
+        WHERE chat_id = ? AND message_id IN ({",".join("?" * len(target_ids))})
+        """,
+        (chat_id, *target_ids),
     )
     columns = [description[0] for description in cursor.description]
     targets = {}
@@ -651,32 +689,40 @@ def attach_reply_targets(conn: sqlite3.Connection, messages: list):
             msg["reply_target"] = targets.get(reply_to_id)
 
 
-def get_context(conn: sqlite3.Connection) -> tuple[str | None, list]:
+def get_context(conn: sqlite3.Connection, chat_id: int) -> tuple[str | None, list]:
     """
-    Получает контекст для модели: пересказ старой части истории и сообщения после нее.
+    Получает контекст чата: пересказ старой части истории и сообщения после нее.
 
-    Пока сжатия не было, пересказ пуст и возвращается вся история.
+    Пока сжатия не было, пересказ пуст и возвращается вся история чата. Чужие чаты в
+    контекст не попадают: у каждого своя история, свой пересказ и свои ключи.
 
     Args:
         conn (sqlite3.Connection): Соединение с базой данных.
+        chat_id (int): Идентификатор чата.
 
     Returns:
         tuple: (текст пересказа или None, список словарей с информацией о сообщениях;
         у реплик-ответов в ключе "reply_target" лежит сообщение, которому они отвечают).
     """
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT * FROM messages WHERE summarized = 0
+    cursor.execute(
+        """
+        SELECT * FROM messages WHERE chat_id = ? AND summarized = 0
         ORDER BY timestamp ASC, message_id ASC
-    """)
+    """,
+        (chat_id,),
+    )
     columns = [description[0] for description in cursor.description]
     messages = [dict(zip(columns, row)) for row in cursor.fetchall()]
-    attach_reply_targets(conn, messages)
-    return get_latest_summary(conn), messages
+    attach_reply_targets(conn, chat_id, messages)
+    return get_latest_summary(conn, chat_id), messages
 
 
 # --- БЛОК УТИЛИТ ДЛЯ МЕДИА ---
 
+# Файлы, выгруженные в Files API. Ключ кэша - пара (ключ Gemini, путь к файлу): выгрузка
+# принадлежит проекту того ключа, которым ее делали, и после ротации ссылка на нее
+# становится чужой. Поэтому для каждого ключа файл выгружается заново.
 uploaded_files = {}
 
 
@@ -757,40 +803,45 @@ async def download_media_file(application: Application, file_id: str, file_path:
 # --- БЛОК ИНТЕГРАЦИИ С GEMINI ---
 
 
-def check_file_validity(client: genai.Client, media_path: str):
+def check_file_validity(client: genai.Client, api_key: str, media_path: str):
     """
     Проверяет валидность файла
 
     :param client: клиент ИИ
     :type client: genai.Client
+    :param api_key: ключ Gemini, которым файл выгружали
+    :type api_key: str
     :param media_path: путь к файлу
     :type media_path: str
     """
-    if media_path in uploaded_files:
+    cache_key = (api_key, media_path)
+    if cache_key in uploaded_files:
         try:
-            remote_file = client.files.get(name=uploaded_files[media_path].name)
+            remote_file = client.files.get(name=uploaded_files[cache_key].name)
             if remote_file.state.name != "ACTIVE":
                 logger.info(
                     "Файл %s в состоянии %s, требуется перевыгрузка",
                     media_path,
                     remote_file.state.name,
                 )
-                del uploaded_files[media_path]
+                del uploaded_files[cache_key]
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.warning(
                 "Не удалось проверить статус файла %s, перевыгружаем: %s",
                 media_path,
                 e,
             )
-            del uploaded_files[media_path]
+            del uploaded_files[cache_key]
 
 
-def upload_file(client: genai.Client, media_path):
+def upload_file(client: genai.Client, api_key: str, media_path):
     """
     Загружает файл
 
     :param client: клиент ИИ
     :type client: genai.Client
+    :param api_key: ключ Gemini, от имени которого идет выгрузка
+    :type api_key: str
     :param media_path: путь к файлу
     :type media_path: str
     """
@@ -802,7 +853,7 @@ def upload_file(client: genai.Client, media_path):
         uploaded_file = client.files.get(name=uploaded_file.name)
 
     if uploaded_file.state.name == "ACTIVE":
-        uploaded_files[media_path] = uploaded_file
+        uploaded_files[(api_key, media_path)] = uploaded_file
     else:
         logger.error(
             "Файл %s после загрузки перешел в состояние %s",
@@ -813,44 +864,6 @@ def upload_file(client: genai.Client, media_path):
 
 class GeminiRetryError(Exception):
     """Не удалось получить корректный ответ от Gemini за отведенное число попыток."""
-
-
-def get_error_code(exc: Exception) -> int | None:
-    """
-    Определяет HTTP-код ошибки Gemini API.
-
-    :param exc: пойманное исключение
-    :type exc: Exception
-    :return: код ответа или None, если определить не удалось (например, обрыв связи)
-    :rtype: int | None
-    """
-    for attr in ("code", "status_code"):
-        value = getattr(exc, attr, None)
-        if isinstance(value, bool):
-            continue
-        if isinstance(value, int):
-            return value
-        if isinstance(value, str) and value.isdigit():
-            return int(value)
-    # В разных версиях SDK текст ошибки начинается с кода: "429 RESOURCE_EXHAUSTED ..."
-    match = re.match(r"\s*(\d{3})\b", str(exc))
-    return int(match.group(1)) if match else None
-
-
-def is_retryable_error(exc: Exception) -> bool:
-    """
-    Решает, имеет ли смысл повторять запрос после этой ошибки.
-
-    :param exc: пойманное исключение
-    :type exc: Exception
-    :return: True, если ошибка похожа на временную
-    :rtype: bool
-    """
-    code = get_error_code(exc)
-    if code is None:
-        # Таймауты и обрывы связи кода не имеют - их повторяем.
-        return True
-    return code not in NON_RETRYABLE_CODES
 
 
 def get_backoff_delay(attempt: int, exc: Exception | None = None) -> float:
@@ -902,50 +915,95 @@ def extract_response_text(response) -> tuple[str | None, str, bool]:
     return None, f"модель вернула пустой текст (finish_reason={finish})", True
 
 
+def handle_api_failure(
+    pool: api_keys.KeyPool, key: dict, exc: Exception, attempt: int
+) -> Exception | None:
+    """
+    Разбирает ошибку API: помечает ключ и решает, стоит ли ждать перед повтором.
+
+    :param pool: пул ключей чата
+    :type pool: api_keys.KeyPool
+    :param key: ключ, на котором упал запрос
+    :type key: dict
+    :param exc: пойманное исключение
+    :type exc: Exception
+    :param attempt: номер попытки - уходит в текст неустранимой ошибки
+    :type attempt: int
+    :return: исключение, если ошибка временная и перед повтором надо выждать паузу,
+        или None, если ждать нечего: ключ уже помечен негодным и сменится сам
+    :rtype: Exception | None
+    :raises GeminiRetryError: если повторять бессмысленно
+    """
+    kind = api_keys.classify_api_error(exc)
+    code = api_keys.get_error_code(exc)
+
+    if kind == api_keys.ERROR_KIND_FATAL:
+        logger.error("Неустранимая ошибка Gemini (код %s): %s", code, exc)
+        raise GeminiRetryError(
+            f"Неустранимая ошибка API на попытке {attempt} из {MAX_RETRIES} "
+            f"(код {code}): {exc}"
+        ) from exc
+
+    if kind == api_keys.ERROR_KIND_DAILY:
+        pool.mark_daily_exhausted(key)
+        return None
+    if kind == api_keys.ERROR_KIND_KEY:
+        pool.mark_broken(key, exc)
+        return None
+
+    # Минутный лимит и временные сбои: ключ живой, надо просто подождать.
+    return exc
+
+
 async def generate_with_retries(
-    client: genai.Client, contents: list, config=None
+    pool: api_keys.KeyPool, model: str, make_contents
 ) -> str:
     """
-    Запрашивает ответ у Gemini, повторяя попытки при сбоях и пустых ответах.
+    Запрашивает ответ у Gemini, повторяя попытки при сбоях и меняя выдохшиеся ключи.
 
-    Повторяет до MAX_RETRIES раз с экспоненциально растущей паузой. Не повторяет
-    ошибки, которые сами не исправятся (неверный ключ, недоступная модель,
-    некорректный запрос), и блокировку запроса фильтрами безопасности.
+    Повторяет до MAX_RETRIES раз с экспоненциально растущей паузой. Ошибка ошибке рознь:
+    выбранная дневная квота и отвергнутый ключ означают, что надо брать следующий ключ и
+    идти дальше без паузы; минутный лимит - что ключ живой и надо просто подождать;
+    кривой запрос или несуществующая модель не пройдут никогда, и на них бот сдается.
 
-    :param client: клиент ИИ
-    :type client: genai.Client
-    :param contents: подготовленное содержимое запроса
-    :type contents: list
-    :param config: настройки генерации (инструменты и прочее) или None
-    :type config: genai.types.GenerateContentConfig | None
+    Смена ключа тратит попытку. Так цикл не может закружиться на пуле из сотни мертвых
+    ключей, а на живом пуле лишние попытки и не понадобятся.
+
+    :param pool: пул ключей чата
+    :type pool: api_keys.KeyPool
+    :param model: имя модели Gemini
+    :type model: str
+    :param make_contents: корутина, собирающая содержимое запроса под переданный ключ
     :return: текст ответа модели
     :rtype: str
     :raises GeminiRetryError: если попытки исчерпаны
+    :raises api_keys.NoUsableKeys: если в чате не осталось рабочих ключей
     """
     last_reason = "причина неизвестна"
+    contents = None
+    contents_key_id = None
 
     for attempt in range(1, MAX_RETRIES + 1):
+        key = pool.active()
+        if contents is None or contents_key_id != key["id"]:
+            # Ссылки на выгруженные файлы принадлежат тому ключу, которым их выгружали,
+            # поэтому после смены ключа запрос собирается заново.
+            contents = await make_contents(key)
+            contents_key_id = key["id"]
+
         failure = None
         try:
             # Вызов синхронный, уводим его в поток, чтобы не морозить event loop.
             response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=MODEL,
+                pool.client(key).models.generate_content,
+                model=model,
                 contents=contents,
-                config=config,
             )
         except Exception as e:  # pylint: disable=broad-exception-caught
-            if not is_retryable_error(e):
-                logger.error(
-                    "Неустранимая ошибка Gemini (код %s): %s", get_error_code(e), e
-                )
-                raise GeminiRetryError(
-                    f"Неустранимая ошибка API на попытке {attempt} из {MAX_RETRIES} "
-                    f"(код {get_error_code(e)}): {e}"
-                ) from e
-            failure = e
-            last_reason = f"ошибка API {get_error_code(e)}: {e}"
+            last_reason = f"ошибка API {api_keys.get_error_code(e)}: {e}"
+            failure = handle_api_failure(pool, key, e, attempt)
         else:
+            pool.note_request(key)
             text, reason, can_retry = extract_response_text(response)
             if text:
                 if attempt > 1:
@@ -965,6 +1023,10 @@ async def generate_with_retries(
             "Попытка %d из %d не удалась: %s", attempt, MAX_RETRIES, last_reason
         )
 
+        # Ключ уже помечен негодным - ждать нечего, следующий виток возьмет другой.
+        if not pool.is_usable(key, ignore_local_limit=True):
+            continue
+
         if attempt < MAX_RETRIES:
             delay = get_backoff_delay(attempt, failure)
             logger.info("Повтор через %.1f с.", delay)
@@ -975,12 +1037,14 @@ async def generate_with_retries(
     )
 
 
-def build_message_parts(client: genai.Client, msg: dict) -> list:
+def build_message_parts(client: genai.Client, api_key: str, msg: dict) -> list:
     """
     Превращает одно сообщение из БД в части запроса к модели.
 
     :param client: клиент ИИ
     :type client: genai.Client
+    :param api_key: ключ Gemini, которым работает клиент
+    :type api_key: str
     :param msg: строка таблицы messages в виде словаря
     :type msg: dict
     :return: список частей (текст плюс медиа, если оно есть)
@@ -1007,20 +1071,22 @@ def build_message_parts(client: genai.Client, msg: dict) -> list:
             try:
                 file_size = os.path.getsize(media_path)
                 if file_size < 20 * 1024 * 1024:
+                    # Выгрузка принадлежит ключу, поэтому и кэш ведется по паре с ним.
+                    cache_key = (api_key, media_path)
                     # Проверяем, есть ли файл в кэше и валиден ли он
-                    check_file_validity(client, media_path)
+                    check_file_validity(client, api_key, media_path)
 
                     # Загрузка, если файла нет в кэше (или он был удален выше)
-                    if media_path not in uploaded_files:
-                        upload_file(client, media_path)
+                    if cache_key not in uploaded_files:
+                        upload_file(client, api_key, media_path)
 
                     # Если файл успешно загружен и активен
-                    if media_path in uploaded_files:
+                    if cache_key in uploaded_files:
                         parts.append(
                             genai.types.Part(
                                 file_data=genai.types.FileData(
-                                    file_uri=uploaded_files[media_path].uri,
-                                    mime_type=uploaded_files[media_path].mime_type,
+                                    file_uri=uploaded_files[cache_key].uri,
+                                    mime_type=uploaded_files[cache_key].mime_type,
                                 )
                             )
                         )
@@ -1050,23 +1116,27 @@ def build_message_parts(client: genai.Client, msg: dict) -> list:
     return parts
 
 
-def build_history(client: genai.Client, context_messages: list) -> list:
+def build_history(key: dict, context_messages: list) -> list:
     """
     Готовит историю переписки в виде реплик для модели.
 
     Рядом с ролью и частями кладем исходную строку БД: по ней сжатие потом определяет,
     на каком сообщении провести границу.
 
-    :param client: клиент ИИ
-    :type client: genai.Client
+    Медиа по дороге выгружается в Files API, то есть функция ходит в сеть и может
+    занять заметное время - зовите ее через asyncio.to_thread.
+
+    :param key: строка ключа Gemini из пула чата
+    :type key: dict
     :param context_messages: список сообщений контекста
     :type context_messages: list
     :return: список словарей вида {"role", "parts", "source"}
     :rtype: list
     """
+    client = api_keys.client_for_key(key["api_key"])
     history = []
     for msg in context_messages:
-        parts = build_message_parts(client, msg)
+        parts = build_message_parts(client, key["api_key"], msg)
         if parts:
             role = "model" if msg.get("is_bot") else "user"
             history.append({"role": role, "parts": parts, "source": msg})
@@ -1149,12 +1219,18 @@ def estimate_context_tokens(history: list, summary: str | None) -> float:
     return total + sum(estimate_entry_tokens(entry) for entry in history)
 
 
-async def count_context_tokens(client: genai.Client, contents: list) -> int | None:
+async def count_context_tokens(
+    pool: api_keys.KeyPool, key: dict, model: str, contents: list
+) -> int | None:
     """
     Считает точный размер запроса токенайзером Gemini.
 
-    :param client: клиент ИИ
-    :type client: genai.Client
+    :param pool: пул ключей чата
+    :type pool: api_keys.KeyPool
+    :param key: ключ, которым идем в API
+    :type key: dict
+    :param model: имя модели Gemini
+    :type model: str
     :param contents: подготовленное содержимое запроса
     :type contents: list
     :return: число токенов или None, если посчитать не вышло
@@ -1163,7 +1239,7 @@ async def count_context_tokens(client: genai.Client, contents: list) -> int | No
     try:
         # Вызов синхронный, уводим его в поток, чтобы не морозить event loop.
         response = await asyncio.to_thread(
-            client.models.count_tokens, model=MODEL, contents=contents
+            pool.client(key).models.count_tokens, model=model, contents=contents
         )
     except Exception as e:  # pylint: disable=broad-exception-caught
         logger.warning("Не удалось посчитать токены контекста: %s", e)
@@ -1205,7 +1281,7 @@ def choose_cut_index(history: list, total_tokens: int) -> int:
 
 
 async def summarize_history(
-    client: genai.Client, entries: list, previous_summary: str | None
+    pool: api_keys.KeyPool, model: str, messages: list, previous_summary: str | None
 ) -> str:
     """
     Просит модель пересказать кусок истории одним текстом.
@@ -1213,52 +1289,63 @@ async def summarize_history(
     Предыдущий пересказ идет в запрос вместе с историей, чтобы он не потерялся:
     новый пересказ заменяет его целиком.
 
-    :param client: клиент ИИ
-    :type client: genai.Client
-    :param entries: реплики, которые надо сжать
-    :type entries: list
+    :param pool: пул ключей чата
+    :type pool: api_keys.KeyPool
+    :param model: имя модели Gemini
+    :type model: str
+    :param messages: сообщения, которые надо сжать
+    :type messages: list
     :param previous_summary: прошлый пересказ или None, если сжимаем впервые
     :type previous_summary: str | None
     :return: текст нового пересказа
     :rtype: str
     :raises GeminiRetryError: если модель так и не ответила
     """
-    contents = [
-        genai.types.ContentDict(
-            role="user", parts=[genai.types.PartDict(text=SUMMARY_INSTRUCTION)]
-        )
-    ]
-    if previous_summary:
+
+    async def make_contents(key: dict) -> list:
+        """Собирает запрос на пересказ под конкретный ключ."""
+        entries = await asyncio.to_thread(build_history, key, messages)
+        contents = [
+            genai.types.ContentDict(
+                role="user", parts=[genai.types.PartDict(text=SUMMARY_INSTRUCTION)]
+            )
+        ]
+        if previous_summary:
+            contents.append(
+                genai.types.ContentDict(
+                    role="user",
+                    parts=[
+                        genai.types.PartDict(
+                            text=f"{SUMMARY_HEADER}\n{previous_summary}"
+                        )
+                    ],
+                )
+            )
+        for entry in entries:
+            contents.append(
+                genai.types.ContentDict(role=entry["role"], parts=entry["parts"])
+            )
         contents.append(
             genai.types.ContentDict(
-                role="user",
-                parts=[
-                    genai.types.PartDict(text=f"{SUMMARY_HEADER}\n{previous_summary}")
-                ],
+                role="user", parts=[genai.types.PartDict(text=SUMMARY_REQUEST)]
             )
         )
-    for entry in entries:
-        contents.append(
-            genai.types.ContentDict(role=entry["role"], parts=entry["parts"])
-        )
-    contents.append(
-        genai.types.ContentDict(
-            role="user", parts=[genai.types.PartDict(text=SUMMARY_REQUEST)]
-        )
-    )
+        return contents
 
-    logger.info("Сжимаем %d самых старых сообщений в пересказ...", len(entries))
-    return (await generate_with_retries(client, contents)).strip()
+    logger.info("Сжимаем %d самых старых сообщений в пересказ...", len(messages))
+    return (await generate_with_retries(pool, model, make_contents)).strip()
 
 
-async def compress_context(
-    client: genai.Client,
+async def compress_context(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    pool: api_keys.KeyPool,
+    model: str,
     conn: sqlite3.Connection,
-    history: list,
+    chat_id: int,
+    messages: list,
     summary: str | None,
-) -> list:
+) -> tuple[list, str | None]:
     """
-    Ужимает контекст до лимита и возвращает готовое содержимое запроса.
+    Ужимает контекст чата до лимита и возвращает то, что в него уложилось.
 
     Пока запрос не влезает в MAX_CONTEXT_TOKENS, самая старая часть истории уходит
     модели на пересказ, пересказ попадает в БД и занимает ее место. Один проход не
@@ -1266,21 +1353,26 @@ async def compress_context(
     быть несколько.
 
     Сжатие - это оптимизация, а не обязательный шаг: если посчитать токены или
-    получить пересказ не вышло, отправляем контекст как есть и даем разбираться
+    получить пересказ не вышло, отдаем контекст как есть и даем разбираться
     обычному механизму повторов.
 
-    :param client: клиент ИИ
-    :type client: genai.Client
+    :param pool: пул ключей чата
+    :type pool: api_keys.KeyPool
+    :param model: имя модели Gemini
+    :type model: str
     :param conn: соединение с базой данных
     :type conn: sqlite3.Connection
-    :param history: история переписки от build_history (непустая)
-    :type history: list
+    :param chat_id: идентификатор чата
+    :type chat_id: int
+    :param messages: сообщения контекста (непустой список)
+    :type messages: list
     :param summary: пересказ сжатой ранее части истории или None
     :type summary: str | None
-    :return: содержимое запроса, влезающее в лимит (или максимально к нему близкое)
-    :rtype: list
+    :return: (оставшиеся дословно сообщения, актуальный пересказ)
+    :rtype: tuple[list, str | None]
     """
-    contents = build_contents(history, summary)
+    key = pool.active()
+    history = await asyncio.to_thread(build_history, key, messages)
 
     # Дешевая прикидка на входе: обычный чат до лимита не дотягивает, и тратить на него
     # лишний запрос к API незачем. Дальше по кругу идем уже только с точным подсчетом -
@@ -1288,15 +1380,24 @@ async def compress_context(
     if estimate_context_tokens(history, summary) < (
         MAX_CONTEXT_TOKENS * TOKEN_CHECK_RATIO
     ):
-        return contents
+        return messages, summary
 
     for _ in range(MAX_COMPRESSION_ROUNDS):
-        total_tokens = await count_context_tokens(client, contents)
+        # Пересказ мог упереться в квоту и сменить ключ: ссылки на выгруженные файлы
+        # принадлежат прежнему ключу, поэтому историю приходится пересобрать.
+        current_key = pool.active()
+        if current_key["id"] != key["id"]:
+            key = current_key
+            history = await asyncio.to_thread(build_history, key, messages)
+
+        total_tokens = await count_context_tokens(
+            pool, key, model, build_contents(history, summary)
+        )
         if total_tokens is None:
-            return contents
+            return messages, summary
         if total_tokens <= MAX_CONTEXT_TOKENS:
             logger.info("Контекст: %d токенов из %d.", total_tokens, MAX_CONTEXT_TOKENS)
-            return contents
+            return messages, summary
 
         cut = choose_cut_index(history, total_tokens)
         if cut <= 0:
@@ -1305,62 +1406,75 @@ async def compress_context(
                 total_tokens,
                 MAX_CONTEXT_TOKENS,
             )
-            return contents
+            return messages, summary
 
         logger.info(
             "Контекст разросся до %d токенов при лимите %d, сжимаем.",
             total_tokens,
             MAX_CONTEXT_TOKENS,
         )
+        compressed = [entry["source"] for entry in history[:cut]]
         try:
-            summary = await summarize_history(client, history[:cut], summary)
+            summary = await summarize_history(pool, model, compressed, summary)
         except GeminiRetryError as e:
             logger.error("Не удалось сжать контекст, отправляем как есть: %s", e)
-            return contents
+            return messages, summary
 
-        save_summary(
-            conn, summary, [entry["source"]["message_id"] for entry in history[:cut]]
-        )
+        save_summary(conn, chat_id, summary, [msg["message_id"] for msg in compressed])
         history = history[cut:]
-        contents = build_contents(history, summary)
+        messages = [entry["source"] for entry in history]
 
     logger.warning(
         "Контекст не уложился в лимит за %d проходов.", MAX_COMPRESSION_ROUNDS
     )
-    return contents
+    return messages, summary
 
 
-async def generate_gemini_response(
-    client: genai.Client,
+async def generate_gemini_response(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    pool: api_keys.KeyPool,
+    model: str,
     conn: sqlite3.Connection,
+    chat_id: int,
     context_messages: list,
     summary: str | None,
 ):
     """
-    Генерирует ответ с использованием модели Google Gemini AI на основе контекста сообщений.
+    Генерирует ответ с использованием модели Google Gemini AI на основе контекста чата.
 
     Args:
-        client (genai.GenerativeModel): Клиент Google Gemini AI.
+        pool (api_keys.KeyPool): Пул ключей этого чата.
+        model (str): Имя модели Gemini, выбранное чатом.
         conn (sqlite3.Connection): Соединение с БД - нужно, чтобы сохранить пересказ.
+        chat_id (int): Идентификатор чата.
         context_messages (list): Список сообщений контекста.
         summary (str | None): Пересказ сжатой ранее части истории.
 
     Returns:
         str: Сгенерированный ответ.
     """
-    logger.info("Подготовка %d сообщений контекста для Gemini.", len(context_messages))
-    history = build_history(client, context_messages)
-
-    if not history:
+    logger.info(
+        "Чат %s: подготовка %d сообщений контекста для модели %s.",
+        chat_id,
+        len(context_messages),
+        model,
+    )
+    if not context_messages:
         logger.warning("Контекст для Gemini пуст. Отмена запроса.")
         return "Не могу обработать пустой запрос."
 
-    contents = await compress_context(client, conn, history, summary)
+    messages, summary = await compress_context(
+        pool, model, conn, chat_id, context_messages, summary
+    )
+
+    async def make_contents(key: dict) -> list:
+        """Собирает запрос под конкретный ключ: медиа выгружается от его имени."""
+        history = await asyncio.to_thread(build_history, key, messages)
+        return build_contents(history, summary)
 
     logger.info("Отправка запроса в Gemini...")
 
     # Генерируем ответ с новым API, повторяя попытки при сбоях
-    response_text = await generate_with_retries(client, contents, REPLY_CONFIG)
+    response_text = await generate_with_retries(pool, model, make_contents)
     return strip_service_prefixes(response_text)
 
 
@@ -1463,9 +1577,78 @@ async def deliver_response(
             )
 
 
-async def handle_message(  # pylint: disable=too-many-locals
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+def chat_lock(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> asyncio.Lock:
+    """
+    Возвращает замок этого чата, заводя его при первом обращении.
+
+    :param context: контекст обработчика
+    :type context: ContextTypes.DEFAULT_TYPE
+    :param chat_id: идентификатор чата
+    :type chat_id: int
+    :return: замок, под которым чат готовит свой ответ
+    :rtype: asyncio.Lock
+    """
+    locks = context.bot_data.setdefault("chat_locks", {})
+    if chat_id not in locks:
+        locks[chat_id] = asyncio.Lock()
+    return locks[chat_id]
+
+
+async def answer_chat(
+    context: ContextTypes.DEFAULT_TYPE, message: Message, transcribe_only: bool
 ):
+    """
+    Собирает контекст чата, спрашивает модель и отправляет ответ.
+
+    :param context: контекст обработчика
+    :type context: ContextTypes.DEFAULT_TYPE
+    :param message: сообщение, на которое отвечаем
+    :type message: Message
+    :param transcribe_only: это голосовое без триггера, нужна одна расшифровка
+    :type transcribe_only: bool
+    """
+    db_conn = context.bot_data["db_conn"]
+    chat_id = message.chat_id
+    summary, context_messages = get_context(db_conn, chat_id)
+
+    if transcribe_only:
+        # Расшифровке чужая история не нужна - ни сообщения, ни пересказ.
+        context_messages = context_messages[-1:]
+        summary = None
+        if (
+            context_messages
+            and context_messages[-1].get("message_id") == message.message_id
+        ):
+            current_content = context_messages[-1].get("content", "")
+            context_messages[-1]["content"] = (
+                f"Напиши расшифровку голосового сообщения. {current_content}"
+            )
+
+    pool = api_keys.KeyPool(db_conn, chat_id, KEY_RPD_LIMIT)
+    model = chat_settings.get_model(db_conn, chat_id, MODEL)
+
+    placeholder = await send_placeholder(message)
+    err = False
+
+    try:
+        response_text = await generate_gemini_response(
+            pool, model, db_conn, chat_id, context_messages, summary
+        )
+    except api_keys.NoUsableKeys as e:
+        # Не поломка, а исчерпанный пул: человеку нужен не трейсбек, а что делать дальше.
+        logger.warning("Чат %s остался без рабочего ключа: %s", chat_id, e)
+        response_text = f"Не могу ответить: {e}"
+        err = True
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.error("Ошибка при вызове Gemini API: %s", e)
+        # В чат уходит полный текст ошибки вместе с числом попыток.
+        response_text = f"Произошла ошибка при обращении к нейросети: {e}"
+        err = True
+
+    await deliver_response(db_conn, message, placeholder, response_text, err)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Главный обработчик сообщений Telegram.
 
@@ -1474,18 +1657,14 @@ async def handle_message(  # pylint: disable=too-many-locals
         context (ContextTypes.DEFAULT_TYPE): Контекст обработчика.
     """
     message = update.effective_message
-    if not message or (
-        message.chat.type not in ("group", "supergroup")
-        and not message.chat.type == "private"
-    ):
+    if not message or message.chat.type not in ("group", "supergroup", "private"):
         return
 
-    err = False
-
     db_conn = context.bot_data["db_conn"]
+    trigger = TRIGGER_WORD.lower()
     triggered_by_text = (
-        message.text and message.text.lower().startswith(TRIGGER_WORD.lower())
-    ) or (message.caption and message.caption.lower().startswith(TRIGGER_WORD.lower()))
+        message.text and message.text.lower().startswith(trigger)
+    ) or (message.caption and message.caption.lower().startswith(trigger))
 
     file_id, mime_type, file_name = save_message_to_db(db_conn, message, is_bot=False)
     if file_id:
@@ -1493,42 +1672,31 @@ async def handle_message(  # pylint: disable=too-many-locals
         if file_path:
             await download_media_file(context.application, file_id, file_path)
 
-    if triggered_by_text or bool(message.voice):
-        summary, context_messages = get_context(db_conn)
-        gemini_client = context.bot_data["gemini_client"]
+    if not (triggered_by_text or message.voice):
+        return
 
-        if bool(message.voice) and not triggered_by_text:
-            # Расшифровке чужая история не нужна - ни сообщения, ни пересказ.
-            context_messages = context_messages[-1:]
-            summary = None
-            if (
-                context_messages
-                and context_messages[-1].get("message_id") == message.message_id
-            ):
-                current_content = context_messages[-1].get("content", "")
-                context_messages[-1][
-                    "content"
-                ] = f"Напиши расшифровку голосового сообщения. {current_content}"
-
-        placeholder = await send_placeholder(message)
-
-        try:
-            response_text = await generate_gemini_response(
-                gemini_client,
-                db_conn,
-                context_messages,
-                summary,
-            )
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            logger.error("Ошибка при вызове Gemini API: %s", e)
-            # В чат уходит полный текст ошибки вместе с числом попыток.
-            response_text = f"Произошла ошибка при обращении к нейросети: {e}"
-            err = True
-
-        await deliver_response(db_conn, message, placeholder, response_text, err)
+    # Внутри чата ответы идут по очереди, а разные чаты друг друга не ждут: запрос к
+    # модели с повторами растягивается на минуты, и одному чату незачем держать все
+    # остальные. Сообщения при этом сохраняются сразу, до очереди, - история не отстает.
+    async with chat_lock(context, message.chat_id):
+        await answer_chat(
+            context, message, bool(message.voice) and not triggered_by_text
+        )
 
 
 # --- ТОЧКА ВХОДА ---
+
+
+# Команды бота: имя в Telegram и обработчик.
+COMMAND_HANDLERS = {
+    "help": commands.help_command,
+    "start": commands.help_command,
+    "keys": commands.keys_command,
+    "addkey": commands.add_key_command,
+    "delkey": commands.delete_key_command,
+    "rotatekey": commands.rotate_key_command,
+    "model": commands.model_command,
+}
 
 
 def main():
@@ -1536,26 +1704,40 @@ def main():
     Основная функция запуска бота.
     Инициализирует подключения к базе данных и API, настраивает обработчики сообщений.
     """
-    if not BOT_TOKEN or not GEMINI_API_KEY:
-        raise ValueError(
-            "Пожалуйста, проверьте файл конфигурации. BOT_TOKEN или GEMINI_API_KEY не указаны."
-        )
+    if not BOT_TOKEN:
+        raise ValueError("Пожалуйста, проверьте файл конфигурации: BOT_TOKEN не указан.")
 
     db_connection = init_db()
 
-    # Новый способ конфигурации клиента
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    # Ключ из конфига доступен всем чатам сразу; свои чат добавляет командой /addkey.
+    api_keys.sync_shared_key(db_connection, GEMINI_API_KEY)
+    if not GEMINI_API_KEY:
+        logger.info(
+            "Общий ключ в config.cfg не задан - чаты работают только на своих ключах."
+        )
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Чаты обслуживаются параллельно: ответ с повторами занимает минуты, и один чат не
+    # должен становиться очередью для всех остальных. Порядок внутри чата держит замок.
+    application = (
+        Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
+    )
 
     application.bot_data["db_conn"] = db_connection
-    application.bot_data["gemini_client"] = client
+    application.bot_data["default_model"] = MODEL
+    application.bot_data["key_rpd_limit"] = KEY_RPD_LIMIT
+
+    for name, handler in COMMAND_HANDLERS.items():
+        application.add_handler(CommandHandler(name, handler))
 
     application.add_handler(
         MessageHandler(filters.ALL & ~filters.COMMAND, handle_message)
     )
 
-    logger.info("Поиск в Гугле %s.", "включен" if GOOGLE_SEARCH else "выключен")
+    logger.info(
+        "Модель по умолчанию: %s. Потолок запросов на ключ в сутки: %s.",
+        MODEL,
+        KEY_RPD_LIMIT or "не задан",
+    )
     logger.info("Бот запускается...")
     application.run_polling()
 
