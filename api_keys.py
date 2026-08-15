@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 from google import genai
 
-import chat_settings
+from karachur.storage import settings
 
 logger = logging.getLogger(__name__)
 
@@ -530,7 +530,7 @@ class KeyPool:
         :return: идентификатор ключа или None
         :rtype: int | None
         """
-        return chat_settings.get_active_key_id(self.conn, self.chat_id)
+        return settings.get_active_key_id(self.conn, self.chat_id)
 
     def is_usable(self, key: dict, ignore_local_limit: bool = False) -> bool:
         """
@@ -572,7 +572,7 @@ class KeyPool:
         :type key: dict
         """
         if self.active_key_id() != key["id"]:
-            chat_settings.set_active_key_id(self.conn, self.chat_id, key["id"])
+            settings.set_active_key_id(self.conn, self.chat_id, key["id"])
             logger.info(
                 "Чат %s переключился на ключ %s.", self.chat_id, mask_key(key["api_key"])
             )

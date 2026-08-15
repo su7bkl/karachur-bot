@@ -1,7 +1,7 @@
 # Karachur Bot
 
 ## О боте
-Karachur Bot — Telegram-бот для групповых чатов с интеграцией Google Gemini AI. Один запущенный бот обслуживает сколько угодно чатов, и у каждого своя история, свой пул ключей Gemini и своя модель. Бот обрабатывает сообщения и файлы, сохраняет контекст переписки в SQLite и генерирует ответы с помощью моделей Gemini (мультимодальная поддержка). Поддерживает базовое форматирование Markdown → Telegram HTML (безопасная конвертация через markdown_converter.py) и режет длинные ответы по лимиту Telegram, не ломая теги (html_splitter.py).
+Karachur Bot — Telegram-бот для групповых чатов с интеграцией Google Gemini AI. Один запущенный бот обслуживает сколько угодно чатов, и у каждого своя история, свой пул ключей Gemini и своя модель. Бот обрабатывает сообщения и файлы, сохраняет контекст переписки в SQLite и генерирует ответы с помощью моделей Gemini (мультимодальная поддержка). Поддерживает базовое форматирование Markdown → Telegram HTML (безопасная конвертация через karachur/text/markdown.py) и режет длинные ответы по лимиту Telegram, не ломая теги (karachur/text/html_splitter.py).
 
 ## Функциональность
 
@@ -174,11 +174,14 @@ Karachur Bot — Telegram-бот для групповых чатов с инт�
 karachur-bot/
 ├── bot.py
 ├── api_keys.py                # Пул ключей Gemini, ротация и разбор ошибок API
-├── media.py                   # Перекодирование скачанного медиа через ffmpeg
-├── chat_settings.py           # Настройки чата: модель и активный ключ
 ├── commands.py                # Команды Telegram: ключи и выбор модели
-├── markdown_converter.py      # Конвертация Markdown → Telegram HTML
-├── html_splitter.py           # Нарезка длинного HTML на сообщения Telegram
+├── karachur/                  # Пакет: сюда постепенно переезжает код из плоских модулей
+│   ├── media.py                    # Перекодирование скачанного медиа через ffmpeg
+│   ├── storage/
+│   │   └── settings.py             # Настройки чата: модель и активный ключ
+│   └── text/
+│       ├── markdown.py             # Конвертация Markdown → Telegram HTML
+│       └── html_splitter.py        # Нарезка длинного HTML на сообщения Telegram
 ├── conftest.py                # Оснастка тестов: конфиг, база, подделки Gemini и Telegram
 ├── tests/                     # Тесты (pytest)
 ├── pytest.ini

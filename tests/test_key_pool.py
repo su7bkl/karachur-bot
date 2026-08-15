@@ -8,7 +8,6 @@
 import pytest
 
 import api_keys
-import chat_settings
 from conftest import (
     CHAT_ONE,
     CHAT_TWO,
@@ -19,6 +18,7 @@ from conftest import (
     OTHER_MODEL,
     SHARED_KEY,
 )
+from karachur.storage import settings
 
 
 def pool_for(conn, chat_id, daily_limit=250, model=MODEL):
@@ -88,7 +88,7 @@ def test_active_key_survives_restart(db):
 
     # Новый пул - как после перезапуска бота: ничего, кроме базы, не осталось.
     assert pool_for(db, CHAT_ONE).active()["api_key"] == KEY_TWO
-    assert chat_settings.get_active_key_id(db, CHAT_ONE) is not None
+    assert settings.get_active_key_id(db, CHAT_ONE) is not None
 
 
 def test_local_limit_does_not_block_the_last_live_key(db):

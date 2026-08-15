@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 import bot
-import media
+from karachur import media
 
 FFMPEG_MISSING = shutil.which("ffmpeg") is None
 needs_ffmpeg = pytest.mark.skipif(FFMPEG_MISSING, reason="в системе нет ffmpeg")

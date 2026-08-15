@@ -18,7 +18,7 @@ from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 import api_keys
-import chat_settings
+from karachur.storage import settings
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ def _pool(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> api_keys.KeyPool:
     :rtype: api_keys.KeyPool
     """
     conn = context.bot_data["db_conn"]
-    model = chat_settings.get_model(conn, chat_id, context.bot_data["default_model"])
+    model = settings.get_model(conn, chat_id, context.bot_data["default_model"])
     return api_keys.KeyPool(conn, chat_id, model, context.bot_data["key_rpd_limit"])
 
 
@@ -335,7 +335,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     conn = context.bot_data["db_conn"]
     default_model = context.bot_data["default_model"]
-    current = chat_settings.get_model(conn, chat_id, default_model)
+    current = settings.get_model(conn, chat_id, default_model)
 
     if not context.args:
         await _reply(update, context, await _describe_models(context, chat_id, current))
@@ -343,7 +343,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     requested = context.args[0].strip().removeprefix("models/")
     if requested.lower() in DEFAULT_MODEL_ALIASES:
-        chat_settings.reset_model(conn, chat_id)
+        settings.reset_model(conn, chat_id)
         await _reply(
             update, context, f"Чат вернулся к модели по умолчанию: {default_model}"
         )
@@ -359,7 +359,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    chat_settings.set_model(conn, chat_id, requested)
+    settings.set_model(conn, chat_id, requested)
     await _reply(update, context, f"Модель чата: {requested}")
 
 

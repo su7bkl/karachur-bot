@@ -12,8 +12,8 @@ import pytest
 
 import api_keys
 import bot
-import chat_settings
 from conftest import CHAT_ONE, KEY_ONE, KEY_TWO
+from karachur.storage import settings
 
 
 def prepared_pool(conn, *keys, start_with=None, daily_limit=250, model="gemini-test"):
@@ -24,7 +24,7 @@ def prepared_pool(conn, *keys, start_with=None, daily_limit=250, model="gemini-t
         row = conn.execute(
             "SELECT id FROM api_keys WHERE api_key = ?", (start_with,)
         ).fetchone()
-        chat_settings.set_active_key_id(conn, CHAT_ONE, row[0])
+        settings.set_active_key_id(conn, CHAT_ONE, row[0])
     return api_keys.KeyPool(conn, CHAT_ONE, model, daily_limit)
 
 

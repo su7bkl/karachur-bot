@@ -39,11 +39,11 @@ from telegram.ext import (
 )
 
 import api_keys
-import chat_settings
 import commands
-import media
-from html_splitter import split_html_message
-from markdown_converter import markdown_to_telegram_html
+from karachur import media
+from karachur.storage import settings
+from karachur.text.html_splitter import split_html_message
+from karachur.text.markdown import markdown_to_telegram_html
 
 
 # --- ЧТЕНИЕ НАСТРОЕК ---
@@ -73,7 +73,7 @@ def load_config(config_path=None):
     with open(config_path, "r", encoding="utf-8") as f:
         config.read_file(f)
 
-    settings = {
+    config_values = {
         "BOT_TOKEN": config.get("SETTINGS", "BOT_TOKEN"),
         "DB_FILE": config.get("SETTINGS", "DB_FILE"),
         "MEDIA_DIR": config.get("SETTINGS", "MEDIA_DIR"),
@@ -89,7 +89,7 @@ def load_config(config_path=None):
         "KEY_RPD_LIMIT": config.getint("SETTINGS", "KEY_RPD_LIMIT", fallback=250),
     }
 
-    return settings
+    return config_values
 
 
 # Загружаем настройки
@@ -267,7 +267,7 @@ def init_db():
         )
     """)
     api_keys.init_key_tables(cursor)
-    chat_settings.init_settings_table(cursor)
+    settings.init_settings_table(cursor)
     conn.commit()
     return conn
 
@@ -1707,7 +1707,7 @@ async def answer_chat(
                 f"Напиши расшифровку голосового сообщения. {current_content}"
             )
 
-    model = chat_settings.get_model(db_conn, chat_id, MODEL)
+    model = settings.get_model(db_conn, chat_id, MODEL)
     pool = api_keys.KeyPool(db_conn, chat_id, model, KEY_RPD_LIMIT)
 
     placeholder = await send_placeholder(message)

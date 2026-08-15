@@ -7,9 +7,9 @@
 
 import api_keys
 import bot
-import chat_settings
 import commands
 from conftest import CHAT_ONE, KEY_ONE, KEY_TWO, SHARED_KEY
+from karachur.storage import settings
 
 
 def test_empty_pool_suggests_adding_a_key(run_command):
@@ -147,7 +147,7 @@ def test_model_is_switched(run_command, db):
     answer = run_command.run(commands.model_command, "gemini-3-pro")
 
     assert answer == "Модель чата: gemini-3-pro"
-    assert chat_settings.get_model(db, CHAT_ONE, "запасная") == "gemini-3-pro"
+    assert settings.get_model(db, CHAT_ONE, "запасная") == "gemini-3-pro"
 
 
 def test_model_prefix_is_trimmed(run_command, db):
@@ -156,7 +156,7 @@ def test_model_prefix_is_trimmed(run_command, db):
 
     run_command.run(commands.model_command, "models/gemini-3-pro")
 
-    assert chat_settings.get_model(db, CHAT_ONE, "запасная") == "gemini-3-pro"
+    assert settings.get_model(db, CHAT_ONE, "запасная") == "gemini-3-pro"
 
 
 def test_unknown_model_is_rejected(run_command, db):
@@ -167,7 +167,7 @@ def test_unknown_model_is_rejected(run_command, db):
     answer = run_command.run(commands.model_command, "gemini-выдуманная")
 
     assert "нет среди доступных" in answer
-    assert chat_settings.get_model(db, CHAT_ONE, "запасная") == "gemini-3-pro"
+    assert settings.get_model(db, CHAT_ONE, "запасная") == "gemini-3-pro"
 
 
 def test_model_resets_to_default(run_command, db):
@@ -191,7 +191,7 @@ def test_model_without_a_key_is_still_settable(run_command, db):
     assert "получить не удалось" in answer
 
     run_command.run(commands.model_command, "gemini-3-pro")
-    assert chat_settings.get_model(db, CHAT_ONE, "запасная") == "gemini-3-pro"
+    assert settings.get_model(db, CHAT_ONE, "запасная") == "gemini-3-pro"
 
 
 def test_help_lists_every_command(run_command):
