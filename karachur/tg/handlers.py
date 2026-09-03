@@ -39,6 +39,7 @@ from karachur.gemini import answer
 # Модуль зовется key_pool, а не pool: имя pool по всему коду занято самим пулом чата
 # (аргументы обработчиков, поле сессии), и модуль под тем же именем ими бы перекрывался.
 from karachur.gemini import pool as key_pool
+from karachur.gemini import retries
 from karachur.media import paths, policy
 from karachur.session import ChatSession
 from karachur.storage import messages
@@ -139,10 +140,24 @@ async def answer_chat(
         logger.warning("Чат %s остался без рабочего ключа: %s", chat_id, e)
         response_text = f"Не могу ответить: {e}"
         err = True
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        logger.error("Ошибка при вызове Gemini API: %s", e)
-        # В чат уходит полный текст ошибки вместе с числом попыток.
+    except retries.GeminiRetryError as e:
+        # Тоже ожидаемый исход, а не поломка: попытки честно кончились, и текст ошибки
+        # сам по себе осмысленный - в нем и сколько раз пробовали, и почему сдались. Его
+        # есть смысл показать как есть, вместе с числом попыток.
+        logger.warning(
+            "Чат %s: Gemini не ответила за отведенные попытки: %s", chat_id, e
+        )
         response_text = f"Произошла ошибка при обращении к нейросети: {e}"
+        err = True
+    except Exception:  # pylint: disable=broad-exception-caught
+        # А вот это уже непредвиденное: не типичный отказ самой Gemini, а что-то в
+        # нашем собственном коде - TypeError, AttributeError, KeyError после неудачной
+        # правки. Текст такого исключения может нести что угодно из внутренностей
+        # запроса (пути файлов, куски истории), и всем участникам чата ему не место -
+        # поэтому наружу уходит только короткая фраза, а полный стек кладется в лог
+        # через logger.exception (он пишет его целиком, а не одной строкой, как error).
+        logger.exception("Непредвиденная ошибка при ответе чату %s.", chat_id)
+        response_text = "Не могу ответить: внутренняя ошибка бота, подробности в логе."
         err = True
 
     await delivery.deliver_response(db_conn, message, placeholder, response_text, err)
