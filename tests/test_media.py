@@ -19,11 +19,11 @@ from types import SimpleNamespace
 
 import pytest
 
-import bot
 from karachur import media
 from karachur.gemini import contents, files
 from karachur.media import ffmpeg
 from karachur.storage import messages
+from karachur.tg import handlers
 
 FFMPEG_MISSING = shutil.which("ffmpeg") is None
 needs_ffmpeg = pytest.mark.skipif(FFMPEG_MISSING, reason="в системе нет ffmpeg")
@@ -268,7 +268,7 @@ def test_normalize_media_records_the_result(db, tmp_path, monkeypatch):
     monkeypatch.setattr(media, "normalize", lambda p, m: (str(tmp_path / "и.mp4"), "video/mp4"))
     message = SimpleNamespace(chat_id=-100, message_id=7)
 
-    asyncio.run(bot.normalize_media(db, message, str(source), "video/webm"))
+    asyncio.run(handlers.normalize_media(db, message, str(source), "video/webm"))
 
     stored = db.execute(
         "SELECT media_path, mime_type FROM messages WHERE message_id = 7"

@@ -18,12 +18,12 @@ import asyncio
 
 import pytest
 
-import commands
 from karachur import config
 
 # Модуль зовется key_pool, а не pool: имя pool в тестах занято самим пулом чата.
 from karachur.gemini import pool as key_pool
 from karachur.storage import schema
+from karachur.tg import commands
 
 # Ключи в тестах намеренно непохожи на настоящие, но той же длины и формы.
 KEY_ONE = "AIzaTEST0000000000000000000000000000001"

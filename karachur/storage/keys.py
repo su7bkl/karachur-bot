@@ -348,36 +348,3 @@ def sync_shared_key(conn: sqlite3.Connection, api_key: str | None):
         _, already = add_key(conn, SHARED_CHAT_ID, api_key)
         if not already:
             logger.info("Общий ключ из config.cfg добавлен в базу.")
-
-
-def describe_key(key: dict, index: int, active_id: int | None, daily_limit: int) -> str:
-    """
-    Описывает состояние ключа одной строкой для команды /keys.
-
-    :param key: строка ключа из list_chat_keys
-    :type key: dict
-    :param index: номер в списке (с единицы)
-    :type index: int
-    :param active_id: идентификатор активного ключа чата
-    :type active_id: int | None
-    :param daily_limit: местный потолок запросов в сутки на ключ
-    :type daily_limit: int
-    :return: строка для вывода в чат
-    :rtype: str
-    """
-    marks = []
-    if key["id"] == active_id:
-        marks.append("активный")
-    if key["owner_chat_id"] == SHARED_CHAT_ID:
-        marks.append("общий из config.cfg")
-
-    if key["broken_reason"]:
-        state = f"отклонен API: {key['broken_reason']}"
-    elif key["daily_exhausted"]:
-        state = f"квота на эту модель выбрана, сброс в {describe_quota_reset()}"
-    else:
-        limit = f" из {daily_limit}" if daily_limit else ""
-        state = f"запросов сегодня: {key['requests_today']}{limit}"
-
-    suffix = f" ({', '.join(marks)})" if marks else ""
-    return f"{index}. {mask_key(key['api_key'])}{suffix} - {state}"

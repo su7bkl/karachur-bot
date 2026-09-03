@@ -19,11 +19,12 @@ from telegram import Message
 
 from karachur.storage import db, summaries
 from karachur.text import notes
+from karachur.tg import extract
 
 logger = logging.getLogger(__name__)
 
 
-def save_message_to_db(  # pylint: disable=too-many-locals
+def save_message_to_db(
     conn: sqlite3.Connection,
     message: Message,
     is_bot: bool = False,
@@ -51,54 +52,9 @@ def save_message_to_db(  # pylint: disable=too-many-locals
     cursor = conn.cursor()
     content = message.text or message.caption or ""
 
-    media_type, mime_type, file_id, file_name = None, None, None, None
-
-    if message.photo:
-        media_type, file_id, mime_type = (
-            "photo",
-            message.photo[-1].file_id,
-            "image/jpeg",
-        )
-    elif message.document:
-        media_type, file_id, mime_type, file_name = (
-            "document",
-            message.document.file_id,
-            message.document.mime_type,
-            message.document.file_name,
-        )
-    elif message.sticker:
-        media_type, file_id, mime_type = notes.describe_sticker(message.sticker)
-    elif message.animation:
-        media_type, file_id, mime_type, file_name = (
-            "animation",
-            message.animation.file_id,
-            message.animation.mime_type,
-            message.animation.file_name,
-        )
-    elif message.video:
-        media_type, file_id, mime_type, file_name = (
-            "video",
-            message.video.file_id,
-            message.video.mime_type,
-            message.video.file_name,
-        )
-    elif message.audio:
-        media_type, file_id, mime_type, file_name = (
-            "audio",
-            message.audio.file_id,
-            message.audio.mime_type,
-            message.audio.file_name,
-        )
-    elif message.voice:
-        media_type, file_id, mime_type = "voice", message.voice.file_id, "audio/ogg"
-        content = f"[Голосовое сообщение by {message.from_user.username}]"
-    elif message.video_note:
-        media_type, file_id, mime_type = (
-            "video_note",
-            message.video_note.file_id,
-            "video/mp4",
-        )
-        content = f"[Видео сообщение by {message.from_user.username}]"
+    attachment = extract.extract_attachment(message)
+    if attachment.content_override is not None:
+        content = attachment.content_override
 
     if content_override is not None:
         content = content_override
@@ -141,10 +97,10 @@ def save_message_to_db(  # pylint: disable=too-many-locals
             user_id,
             user_prompt,
             content,
-            media_type,
-            mime_type,
-            file_id,
-            file_name,
+            attachment.media_type,
+            attachment.mime_type,
+            attachment.file_id,
+            attachment.file_name,
             timestamp,
             reply_to_id,
             quote_text,
@@ -154,7 +110,7 @@ def save_message_to_db(  # pylint: disable=too-many-locals
     )
     conn.commit()
     logger.info("Сохранено сообщение %s в БД.", message.message_id)  # lazy logging
-    return file_id, mime_type, file_name
+    return attachment.file_id, attachment.mime_type, attachment.file_name
 
 
 def set_media_path(

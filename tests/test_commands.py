@@ -5,13 +5,13 @@
 /addkey: команда доступна всем участникам, и ключ не должен оставаться в истории.
 """
 
-import commands
 from conftest import CHAT_ONE, KEY_ONE, KEY_TWO, MODEL, SHARED_KEY
 
 # Модуль зовется key_pool, а не pool: имя pool в тестах занято самим пулом чата.
 from karachur.gemini import pool as key_pool
 from karachur.storage import keys as key_store
 from karachur.storage import settings
+from karachur.tg import commands
 
 
 def test_empty_pool_suggests_adding_a_key(run_command):
