@@ -21,7 +21,7 @@ import pytest
 
 from karachur import media
 from karachur.gemini import contents, files
-from karachur.media import ffmpeg
+from karachur.media import ffmpeg, paths
 from karachur.storage import messages
 from karachur.tg import handlers
 
@@ -300,3 +300,40 @@ def test_audio_codec_is_detected(tmp_path):
 
     assert ffmpeg.audio_codec(str(source)) == "opus"
     assert ffmpeg.audio_attempts(str(source))[0] == ffmpeg.AUDIO_COPY
+
+
+def test_get_media_path_avoids_name_collisions():
+    """
+    Два документа с одинаковым original_name не должны лечь по одному пути.
+
+    Раньше путь строился как <media_dir>/<очищенное имя>, и второй report.pdf в чате
+    получал ровно тот же путь, что и первый - download_media_file существующий файл
+    повторно не качает, так что модели вместо второго файла уходило содержимое первого.
+    """
+    first = paths.get_media_path("/media", "AAA111", "application/pdf", "report.pdf")
+    second = paths.get_media_path("/media", "BBB222", "application/pdf", "report.pdf")
+
+    assert first != second
+    # Читаемая часть имени и расширение остаются на месте - по каталогу media все равно
+    # видно, что это за файл, даже когда лезешь туда руками.
+    assert os.path.basename(first) == "report.AAA111.pdf"
+    assert os.path.basename(second) == "report.BBB222.pdf"
+
+
+def test_get_media_path_keeps_readable_name_and_extension():
+    """Читаемая часть имени и расширение сохраняются при подмешивании file_id."""
+    path = paths.get_media_path(
+        "/media", "FILE_ID_XYZ", "application/pdf", "annual report.pdf"
+    )
+
+    assert os.path.basename(path) == "annual report.FILE_ID_XYZ.pdf"
+
+
+def test_get_media_path_non_ascii_name_uses_file_id_branch():
+    """
+    Не-ascii имя по-прежнему обрабатывается прежней веткой - собирается из file_id и
+    расширения по mime, само имя вложения в пути не участвует вовсе.
+    """
+    path = paths.get_media_path("/media", "FILE1", "application/pdf", "отчет.pdf")
+
+    assert path == os.path.join("/media", "FILE1.pdf")
