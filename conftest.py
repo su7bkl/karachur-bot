@@ -12,13 +12,18 @@
 
 # Подделки повторяют форму настоящих объектов Gemini и Telegram: отсюда классы с одним
 # методом и аргументы вроде model, которые тесту не нужны, но есть в исходной сигнатуре.
-# pylint: disable=too-few-public-methods,unused-argument
+# Атрибутов у FakeGemini много по той же причине: она не только отвечает по сценарию, но
+# и ведет журналы всего, о чем ее спросили, - на них и держатся проверки тестов.
+# pylint: disable=too-few-public-methods,unused-argument,too-many-instance-attributes
 
 import asyncio
+import datetime
+import types
 
 import pytest
 
 from karachur import config
+from karachur.gemini import files
 
 # Модуль зовется key_pool, а не pool: имя pool в тестах занято самим пулом чата.
 from karachur.gemini import pool as key_pool
@@ -79,6 +84,109 @@ class ApiError(Exception):
     def bad_key(cls) -> "ApiError":
         """Возвращает отказ по ключу."""
         return cls(403, "PERMISSION_DENIED: API key expired")
+
+    @classmethod
+    def stale_file(cls, name: str = "files/protuhla") -> "ApiError":
+        """
+        Возвращает отказ по ссылке на файл - слово в слово как настоящий.
+
+        Код тот же 403, что и у отвергнутого ключа: на этом сходстве бот и хоронил
+        собственные ключи за чужую вину.
+
+        :param name: имя ресурса в Files API
+        :type name: str
+        :return: ошибка про недоступный файл
+        :rtype: ApiError
+        """
+        return cls(
+            403,
+            "PERMISSION_DENIED. You do not have permission to access the File "
+            f"{name} or it may not exist.",
+        )
+
+
+class FakeFile:
+    """
+    Объект File из Files API: кэшу выгрузок нужны имя, ссылка, mime, состояние и срок.
+
+    Срок задается смещением от текущего момента - так тест говорит "выгрузка протухла
+    час назад" или "живет еще сутки", не подменяя часы.
+    """
+
+    def __init__(
+        self,
+        name: str = "files/test",
+        mime_type: str = "image/png",
+        state: str = "ACTIVE",
+        expires_in: float | None = 48 * 60 * 60,
+    ):
+        """
+        :param name: имя ресурса в Files API
+        :type name: str
+        :param mime_type: mime выгруженного файла
+        :type mime_type: str
+        :param state: состояние выгрузки - ACTIVE, PROCESSING или FAILED
+        :type state: str
+        :param expires_in: через сколько секунд Files API удалит файл; None - срок не
+            назван, как у настоящего File без expiration_time
+        :type expires_in: float | None
+        """
+        self.name = name
+        self.uri = f"https://files.example/{name}"
+        self.mime_type = mime_type
+        self.state = types.SimpleNamespace(name=state)
+        self.expiration_time = None
+        if expires_in is not None:
+            self.expiration_time = datetime.datetime.now(
+                datetime.timezone.utc
+            ) + datetime.timedelta(seconds=expires_in)
+
+
+class _FakeFiles:
+    """
+    Подделка client.files: помнит, что лежит на стороне Google, и считает обращения.
+
+    Счет обращений тут не для красоты: главное свойство кэша выгрузок - не спрашивать
+    Files API попусту, а доказывается оно только счетчиком.
+    """
+
+    def __init__(self, gemini: "FakeGemini"):
+        """
+        :param gemini: общий держатель состояния подделки
+        :type gemini: FakeGemini
+        """
+        self.gemini = gemini
+
+    def get(self, name):
+        """
+        Отдает выгрузку, если она еще существует.
+
+        :param name: имя ресурса в Files API
+        :return: поддельный File
+        :rtype: FakeFile
+        :raises ApiError: если файла на стороне Google нет
+        """
+        self.gemini.file_gets.append(name)
+        remote = self.gemini.remote_files.get(name)
+        if remote is None:
+            raise ApiError.stale_file(name)
+        return remote
+
+    def upload(self, file):
+        """
+        Выгружает файл и запоминает его как существующий на стороне Google.
+
+        :param file: путь к файлу на диске
+        :return: поддельный File
+        :rtype: FakeFile
+        """
+        self.gemini.file_uploads.append(file)
+        remote = self.gemini.next_upload or FakeFile(
+            name=f"files/upload{len(self.gemini.file_uploads)}"
+        )
+        self.gemini.next_upload = None
+        self.gemini.remote_files[remote.name] = remote
+        return remote
 
 
 class _FakeResponse:
@@ -165,6 +273,7 @@ class _FakeClient:
         :type gemini: FakeGemini
         """
         self.models = _FakeModels(api_key, gemini)
+        self.files = _FakeFiles(gemini)
 
 
 class FakeGemini:
@@ -173,6 +282,9 @@ class FakeGemini:
 
     Сценарий на ключ - список шагов. Строка означает успешный ответ, исключение -
     ошибку с этой попытки.
+
+    Files API живет в тех же объектах: remote_files - то, что якобы лежит на стороне
+    Google, file_gets и file_uploads - обращения к нему.
     """
 
     def __init__(self):
@@ -182,6 +294,25 @@ class FakeGemini:
         self.models_used = []
         self.contents_sent = []
         self.built_for = []
+        # Что лежит в Files API: имя ресурса - объект FakeFile.
+        self.remote_files = {}
+        # Имена, о состоянии которых спрашивали, и пути, которые выгружали.
+        self.file_gets = []
+        self.file_uploads = []
+        # Чем ответить на следующую выгрузку, если тесту нужен особенный файл.
+        self.next_upload = None
+
+    def publish(self, remote: FakeFile) -> FakeFile:
+        """
+        Кладет готовый файл в Files API, минуя выгрузку.
+
+        :param remote: поддельный File
+        :type remote: FakeFile
+        :return: он же, чтобы тест мог сослаться на него дальше
+        :rtype: FakeFile
+        """
+        self.remote_files[remote.name] = remote
+        return remote
 
     def script(self, api_key: str, *steps):
         """
@@ -370,6 +501,24 @@ def gemini_fixture(monkeypatch):
     fake = FakeGemini()
     monkeypatch.setattr(key_pool, "client_for_key", fake.client_for_key)
     return fake
+
+
+@pytest.fixture(name="uploads_cache", autouse=True)
+def uploads_cache_fixture():
+    """
+    Держит кэш выгрузок Files API пустым на входе в каждый тест и на выходе из него.
+
+    Кэш - глобальный словарь модуля, и таким он и должен быть: его смысл в том, чтобы
+    переживать запросы. Но переживать чужие тесты он не должен, поэтому фикстура
+    автоматическая - иначе один тест, положивший туда выгрузку, менял бы поведение
+    соседнего.
+
+    :return: сам словарь кэша
+    :rtype: dict
+    """
+    files.uploaded_files.clear()
+    yield files.uploaded_files
+    files.uploaded_files.clear()
 
 
 @pytest.fixture(name="api_error")

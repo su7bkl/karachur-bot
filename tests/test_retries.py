@@ -8,11 +8,16 @@
 
 import asyncio
 import dataclasses
+import time
 
 import pytest
 
-from conftest import CHAT_ONE, KEY_ONE, KEY_TWO
-from karachur.gemini import compress
+from conftest import CHAT_ONE, KEY_ONE, KEY_TWO, ApiError, FakeFile
+from karachur.gemini import compress, files
+
+# Модуль зовется request_contents, а не contents: имя contents тут занято самими
+# собираемыми списками содержимого запроса - ровно как в karachur.gemini.answer.
+from karachur.gemini import contents as request_contents
 
 # Модуль зовется key_pool, а не pool: имя pool в тестах занято самим пулом чата.
 from karachur.gemini import pool as key_pool
@@ -114,6 +119,114 @@ def test_fatal_error_does_not_burn_the_pool(cfg, db, gemini, api_error):
         "SELECT COUNT(*) FROM api_keys WHERE broken_reason IS NULL"
     ).fetchone()[0]
     assert intact == 2
+
+
+def test_stale_file_error_spares_the_key(cfg, db, gemini, api_error):
+    """
+    Ошибка про пропавший файл не трогает ключ - ни mark_broken, ни выбранной квоты.
+
+    Ради этого все и затевалось. Пока такой 403 читался как отказ по ключу, бот на
+    каждую мертвую ссылку хоронил очередной ключ чата, брал следующий, отправлял ту же
+    ссылку - и хоронил и его. Одной старой картинки в истории хватало на весь пул.
+    """
+    pool = prepared_pool(db, KEY_ONE, KEY_TWO, start_with=KEY_ONE)
+    gemini.script(KEY_ONE, api_error.stale_file(), "ответ после перевыгрузки")
+
+    answer = ask(cfg, pool, gemini)
+
+    assert answer == "ответ после перевыгрузки"
+    # Ключ не сменился: менять его было не на что и незачем.
+    assert gemini.calls == [KEY_ONE, KEY_ONE]
+    intact = db.execute(
+        "SELECT COUNT(*) FROM api_keys WHERE broken_reason IS NULL"
+    ).fetchone()[0]
+    assert intact == 2
+    exhausted = db.execute(
+        "SELECT COUNT(*) FROM key_quota WHERE daily_exhausted = 1"
+    ).fetchone()[0]
+    assert exhausted == 0
+
+
+def test_stale_file_error_rebuilds_the_request(cfg, db, gemini, api_error):
+    """
+    После ошибки про файл запрос собирается заново, а не уходит теми же ссылками.
+
+    Ключ при этом тот же, а обычно запрос пересобирается только при смене ключа - без
+    отдельного сброса повтор отправил бы ровно ту мертвую ссылку, на которой споткнулся.
+    """
+    pool = prepared_pool(db, KEY_ONE, start_with=KEY_ONE)
+    gemini.script(KEY_ONE, api_error.stale_file(), "ответ после перевыгрузки")
+
+    ask(cfg, pool, gemini)
+
+    assert gemini.built_for == [KEY_ONE, KEY_ONE]
+
+
+def test_stale_file_error_sends_the_cache_for_recheck(cfg, db, gemini, api_error):
+    """Кэш выгрузок после такой ошибки помечается на перепроверку."""
+    entry = files.Upload(file=FakeFile(), expires_at=time.time() + 10 * 60 * 60)
+    files.uploaded_files[(KEY_ONE, "/media/фото.png")] = entry
+    pool = prepared_pool(db, KEY_ONE, start_with=KEY_ONE)
+    gemini.script(KEY_ONE, api_error.stale_file(), "готово")
+
+    ask(cfg, pool, gemini)
+
+    assert entry.suspect
+
+
+def test_dead_link_is_replaced_by_a_live_one(cfg, db, gemini, tmp_path):
+    """
+    Сквозная проверка: после отказа по файлу второй запрос уходит с новой ссылкой.
+
+    Здесь запрос собирается не подделкой, а настоящей сборкой, поэтому видно то, ради
+    чего все и делалось: в первом запросе уезжает мертвая ссылка из кэша, в ответ
+    прилетает 403 про File, а во втором на ее месте оказывается свежая выгрузка - тем же
+    ключом, без всякой ротации.
+    """
+    photo = tmp_path / "фото.png"
+    photo.write_bytes(b"png")
+    # Выгрузка, которой на стороне Google уже нет: в gemini.remote_files ее не кладем.
+    stale = FakeFile(name="files/протухшая")
+    files.uploaded_files[(KEY_ONE, str(photo))] = files.Upload(
+        file=stale, expires_at=time.time() + 10 * 60 * 60
+    )
+    message = {
+        "username": "tester",
+        "content": "лови картинку",
+        "file_id": "FILEID",
+        "mime_type": "image/png",
+        "media_path": str(photo),
+    }
+    gemini.next_upload = FakeFile(name="files/новая")
+
+    async def make_contents(key):
+        """Собирает запрос так же, как это делает karachur.gemini.answer."""
+        history = request_contents.build_history(key, [message], cfg.media_dir)
+        return request_contents.build_contents(history, None, cfg.system_prompt)
+
+    pool = prepared_pool(db, KEY_ONE, start_with=KEY_ONE)
+    gemini.script(KEY_ONE, ApiError.stale_file(), "разглядел картинку")
+
+    answer = asyncio.run(retries.generate_with_retries(cfg, pool, make_contents))
+
+    assert answer == "разглядел картинку"
+    sent = [request[-1]["parts"][-1].file_data.file_uri for request in gemini.contents_sent]
+    assert sent == [stale.uri, "https://files.example/files/новая"]
+
+
+def test_ordinary_failure_reuses_the_request(cfg, db, gemini, api_error):
+    """
+    Обычный сбой запрос не пересобирает.
+
+    Обратная сторона той же границы: сборка ходит в Files API по каждому вложению
+    истории, и повторять ее из-за пятисотки незачем.
+    """
+    pool = prepared_pool(db, KEY_ONE, start_with=KEY_ONE)
+    gemini.script(KEY_ONE, api_error(500, "INTERNAL"), "получилось со второй")
+
+    ask(cfg, pool, gemini)
+
+    assert gemini.built_for == [KEY_ONE]
 
 
 def test_transient_error_is_retried(cfg, db, gemini, api_error):

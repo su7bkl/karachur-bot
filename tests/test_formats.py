@@ -525,6 +525,56 @@ def test_supported_format_still_goes_up(tmp_path, monkeypatch):
     assert uploaded == [str(source), str(source)]
 
 
+# --- ЧТО СБОРКА ВЛОЖЕНИЯ ГЛОТАЕТ, А ЧТО НЕТ ---
+
+
+def test_outside_failure_costs_only_the_attachment(tmp_path, monkeypatch):
+    """
+    Чужая беда - диск, Files API, оборванная связь - стоит вложения, но не ответа.
+
+    Сообщение доходит до модели без картинки: ронять из-за одного файла весь ответ чату
+    было бы хуже, чем ответить, не посмотрев на вложение.
+    """
+    source = tmp_path / "инструкция.pdf"
+    source.write_bytes(b"%PDF-1.7 ")
+
+    def unreadable(client, api_key, media_path):
+        """Изображает пропавший файл на диске."""
+        raise OSError("диск отвалился")
+
+    monkeypatch.setattr(files, "check_file_validity", unreadable)
+
+    parts = contents.build_message_parts(
+        None, "ключ", media_message(source, "application/pdf")
+    )
+
+    assert len(parts) == 1
+    assert "лови файл" in parts[0].text
+
+
+def test_our_own_bug_is_not_swallowed(tmp_path, monkeypatch):
+    """
+    Ошибка нашего кода падает громко, а не превращается в "вложения не было".
+
+    Раньше вокруг сборки части стоял except Exception, и KeyError с TypeError уходили в
+    ту же ветку, что и сбой сети: в логе оставалась строчка, вложение молча пропадало, а
+    искать причину было негде.
+    """
+    source = tmp_path / "инструкция.pdf"
+    source.write_bytes(b"%PDF-1.7 ")
+
+    def buggy(client, api_key, media_path):
+        """Изображает опечатку в нашем собственном коде."""
+        raise KeyError("expiration_time")
+
+    monkeypatch.setattr(files, "check_file_validity", buggy)
+
+    with pytest.raises(KeyError):
+        contents.build_message_parts(
+            None, "ключ", media_message(source, "application/pdf")
+        )
+
+
 # --- РАННИЙ ОТКАЗ ДО СКАЧИВАНИЯ ---
 
 

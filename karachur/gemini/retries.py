@@ -9,15 +9,22 @@ karachur.gemini.errors, состояние ключей ведет karachur.gemi
 Пустой ответ - такая же неудача, как исключение: модель иногда отвечает без текста, и
 снаружи это ничем не лучше ошибки API. Поэтому разбор ответа живет тут же, рядом с
 повторами, а не у того, кто запрос заказывал.
+
+Особняком стоит ошибка про файл (ERROR_KIND_FILE): единственная, после которой виноват
+не ключ и не модель, а собранный нами запрос - в нем осталась ссылка на выгрузку,
+которой в Files API уже нет. Ключ такая ошибка не тратит и не портит, зато требует двух
+вещей сразу: отправить кэш выгрузок на перепроверку (karachur.gemini.files) и заставить
+собрать запрос заново тем же ключом, иначе на следующем витке уйдут те же мертвые ссылки.
 """
 
 import asyncio
 import logging
 import random
 import re
+import typing
 
 from karachur import config
-from karachur.gemini import errors
+from karachur.gemini import errors, files
 
 # Модуль зовется key_pool, а не pool: имя pool по всему коду занято самим пулом чата
 # (аргументы обработчиков, поле сессии), и модуль под тем же именем ими бы перекрывался.
@@ -33,6 +40,24 @@ RETRY_DELAY_PATTERN = re.compile(
 
 class GeminiRetryError(Exception):
     """Не удалось получить корректный ответ от Gemini за отведенное число попыток."""
+
+
+class RetryPlan(typing.NamedTuple):
+    """
+    Что циклу повторов делать после разобранной ошибки.
+
+    Разбор ошибки и сам повтор разнесены: handle_api_failure решает, чья вина, а цикл
+    исполняет решение. Раньше между ними ходило одно исключение ("ждать или не ждать"),
+    но с ошибками про файлы этого перестало хватать - понадобилось еще и сказать циклу,
+    что собранный запрос устарел.
+
+    :ivar wait_for: исключение, по которому считается пауза перед повтором; None -
+        ждать нечего (ключ уже помечен негодным и на следующем витке сменится сам)
+    :ivar rebuild_contents: собрать запрос заново, даже если ключ не менялся
+    """
+
+    wait_for: Exception | None
+    rebuild_contents: bool = False
 
 
 def get_backoff_delay(
@@ -92,9 +117,9 @@ def extract_response_text(response) -> tuple[str | None, str, bool]:
 
 def handle_api_failure(
     pool: key_pool.KeyPool, key: dict, exc: Exception, attempt: int, max_retries: int
-) -> Exception | None:
+) -> RetryPlan:
     """
-    Разбирает ошибку API: помечает ключ и решает, стоит ли ждать перед повтором.
+    Разбирает ошибку API: помечает ключ и решает, что делать перед повтором.
 
     :param pool: пул ключей чата
     :type pool: key_pool.KeyPool
@@ -106,9 +131,8 @@ def handle_api_failure(
     :type attempt: int
     :param max_retries: всего попыток - тоже только ради текста ошибки
     :type max_retries: int
-    :return: исключение, если ошибка временная и перед повтором надо выждать паузу,
-        или None, если ждать нечего: ключ уже помечен негодным и сменится сам
-    :rtype: Exception | None
+    :return: план следующего витка: ждать ли паузу и пересобирать ли запрос
+    :rtype: RetryPlan
     :raises GeminiRetryError: если повторять бессмысленно
     """
     kind = errors.classify_api_error(exc)
@@ -123,13 +147,30 @@ def handle_api_failure(
 
     if kind == errors.ERROR_KIND_DAILY:
         pool.mark_daily_exhausted(key)
-        return None
+        return RetryPlan(None)
     if kind == errors.ERROR_KIND_KEY:
         pool.mark_broken(key, exc)
-        return None
+        return RetryPlan(None)
+
+    if kind == errors.ERROR_KIND_FILE:
+        # Ключ ни при чем: протухла ссылка на выгрузку, и это наша беда, а не его.
+        # Поэтому ни mark_broken, ни mark_daily_exhausted - ключ остается рабочим.
+        logger.warning(
+            "Gemini не нашла файл из запроса (код %s), перепроверяем выгрузки: %s",
+            code,
+            exc,
+        )
+        files.recheck_uploads(key["api_key"])
+        # Паузу берем обычную, хотя ждать тут вроде бы нечего - ни API, ни ключ не
+        # виноваты. Причин две. Повтор не бесплатен: он заново опрашивает Files API по
+        # каждому файлу истории и часть из них выгружает, так что торопиться некуда. И
+        # если ошибка почему-то повторяется (например, выгрузка падает раз за разом),
+        # без паузы цикл прожег бы все попытки за доли секунды - с паузой у него хотя бы
+        # остается шанс, что временная беда успеет пройти.
+        return RetryPlan(exc, rebuild_contents=True)
 
     # Минутный лимит и временные сбои: ключ живой, надо просто подождать.
-    return exc
+    return RetryPlan(exc)
 
 
 async def generate_with_retries(
@@ -141,10 +182,15 @@ async def generate_with_retries(
     Повторяет до cfg.max_retries раз с экспоненциально растущей паузой. Ошибка ошибке
     рознь: выбранная дневная квота и отвергнутый ключ означают, что надо брать следующий
     ключ и идти дальше без паузы; минутный лимит - что ключ живой и надо просто подождать;
-    кривой запрос или несуществующая модель не пройдут никогда, и на них бот сдается.
+    кривой запрос или несуществующая модель не пройдут никогда, и на них бот сдается;
+    пропавший файл - что ключ трогать не надо, а вот запрос надо собрать заново.
 
     Смена ключа тратит попытку. Так цикл не может закружиться на пуле из сотни мертвых
     ключей, а на живом пуле лишние попытки и не понадобятся.
+
+    Собранный запрос переиспользуется между попытками, пока цел его ключ: сборка ходит в
+    Files API по каждому вложению, и делать это на каждый повтор незачем. Пересобрать
+    заставляют ровно две вещи - смена ключа и ошибка про пропавший файл.
 
     :param cfg: настройки бота - отсюда берутся число попыток и длина пауз
     :type cfg: config.Config
@@ -168,7 +214,9 @@ async def generate_with_retries(
             contents = await make_contents(key)
             contents_key_id = key["id"]
 
-        failure = None
+        # Пустой ответ разбирается ниже сам и в плане не нуждается: ключ живой, запрос
+        # цел, ждать перед повтором нечего сверх обычной паузы.
+        plan = RetryPlan(None)
         try:
             # Вызов синхронный, уводим его в поток, чтобы не морозить event loop.
             response = await asyncio.to_thread(
@@ -178,7 +226,7 @@ async def generate_with_retries(
             )
         except Exception as e:  # pylint: disable=broad-exception-caught
             last_reason = f"ошибка API {errors.get_error_code(e)}: {e}"
-            failure = handle_api_failure(pool, key, e, attempt, cfg.max_retries)
+            plan = handle_api_failure(pool, key, e, attempt, cfg.max_retries)
         else:
             pool.note_request(key)
             text, reason, can_retry = extract_response_text(response)
@@ -200,13 +248,21 @@ async def generate_with_retries(
             "Попытка %d из %d не удалась: %s", attempt, cfg.max_retries, last_reason
         )
 
+        if plan.rebuild_contents:
+            # Кэш выгрузок уже отправлен на перепроверку, но собранный запрос об этом
+            # не знает: в нем так и лежат мертвые ссылки. Сбрасываем его, чтобы
+            # следующий виток собрал заново - тем же ключом, без всякой ротации.
+            # Без этой строки условие ниже сочло бы запрос годным (ключ-то не менялся) и
+            # отправило бы ровно те же ссылки, на которых мы только что споткнулись.
+            contents = None
+
         # Ключ уже помечен негодным - ждать нечего, следующий виток возьмет другой.
         if not pool.is_usable(key, ignore_local_limit=True):
             continue
 
         if attempt < cfg.max_retries:
             delay = get_backoff_delay(
-                attempt, cfg.retry_base_delay, cfg.retry_max_delay, failure
+                attempt, cfg.retry_base_delay, cfg.retry_max_delay, plan.wait_for
             )
             logger.info("Повтор через %.1f с.", delay)
             await asyncio.sleep(delay)

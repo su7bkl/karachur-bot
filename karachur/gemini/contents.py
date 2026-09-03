@@ -21,6 +21,7 @@ asyncio.to_thread.
 import logging
 import os
 
+import httpx
 from google import genai
 
 from karachur.gemini import files
@@ -39,6 +40,11 @@ SUMMARY_HEADER = "[Сжатый пересказ более ранней час�
 # Потолок Files API. Файл крупнее туда просто не уедет, и проверять это дешевле, чем
 # получать отказ на выгрузке.
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024
+
+# Чужие беды, из-за которых вложение не удается приложить: диск, Files API и транспорт.
+# httpx тут не случайный гость - это транспорт самого google-genai, и обрывы связи
+# прилетают наружу именно его исключениями, мимо genai.errors.
+MEDIA_PART_FAILURES = (OSError, genai.errors.APIError, httpx.HTTPError)
 
 
 def _build_media_part(
@@ -91,23 +97,22 @@ def _build_media_part(
             text=f"[Файл формата {mime_type} модель не читает - пропущено]"
         )
 
-    # Выгрузка принадлежит ключу, поэтому и кэш ведется по паре с ним.
-    cache_key = (api_key, media_path)
-    # Проверяем, есть ли файл в кэше и валиден ли он
+    # Проверяем, есть ли файл в кэше и валиден ли он. Выгрузка принадлежит ключу,
+    # поэтому и кэш ведется по паре с ним - отсюда api_key в аргументах.
     files.check_file_validity(client, api_key, media_path)
 
     # Загрузка, если файла нет в кэше (или он был удален выше)
-    if cache_key not in files.uploaded_files:
+    if files.cached_file(api_key, media_path) is None:
         files.upload_file(client, api_key, media_path)
 
     # Если файл успешно загружен и активен
-    if cache_key not in files.uploaded_files:
+    uploaded = files.cached_file(api_key, media_path)
+    if uploaded is None:
         return genai.types.Part(text="[Ошибка обработки файла - не удалось активировать]")
 
     return genai.types.Part(
         file_data=genai.types.FileData(
-            file_uri=files.uploaded_files[cache_key].uri,
-            mime_type=files.uploaded_files[cache_key].mime_type,
+            file_uri=uploaded.uri, mime_type=uploaded.mime_type
         )
     )
 
@@ -155,7 +160,16 @@ def build_message_parts(
                 parts.append(
                     _build_media_part(client, api_key, media_path, msg["mime_type"])
                 )
-            except Exception as e:  # pylint: disable=broad-exception-caught
+            except MEDIA_PART_FAILURES as e:
+                # Ловим ровно то, что прилетает извне: файл на диске исчез или не
+                # читается (OSError), Files API отказал (APIError), связь оборвалась
+                # (httpx). На все это ответ один - обойтись без вложения, потому что
+                # ронять из-за одной картинки весь ответ чату жалко.
+                #
+                # Широкого except Exception тут больше нет намеренно. Он глотал и наши
+                # собственные KeyError с TypeError: ошибка в сборке части молча
+                # превращалась в "вложения не было", и найти ее было негде. Пусть такие
+                # падают громко.
                 logger.error(
                     "Ошибка при работе с медиафайлом %s: %s",
                     media_path,

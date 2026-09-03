@@ -273,7 +273,10 @@ def test_masked_key_hides_the_middle():
     [
         (429, "quotaId: GenerateRequestsPerDayPerProjectPerModel", "daily"),
         (429, "quotaId: GenerateRequestsPerMinute retryDelay: 27s", "rate"),
-        (403, "PERMISSION_DENIED", "key"),
+        # За 403 стоит не одна беда: ключ виноват, только если про это сказано прямо, а
+        # неопознанный отказ ключа не хоронит. Разбор всех случаев - в test_errors.py.
+        (403, "PERMISSION_DENIED: API key not valid", "key"),
+        (403, "PERMISSION_DENIED: причина не разобрана", "transient"),
         (401, "UNAUTHENTICATED", "key"),
         (400, "API key not valid. Please pass a valid API key.", "key"),
         (400, "Requests ending with a model turn are not supported", "fatal"),
