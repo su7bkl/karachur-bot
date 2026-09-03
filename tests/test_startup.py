@@ -6,6 +6,9 @@
 
 Конфиг main() читает сама, поэтому тесту достаточно подменить load_config - файл на
 диск выкладывает только тот тест, который как раз про поиск этого файла.
+
+main() живет в karachur.app - корневой bot.py лишь зовет ее, ничего не добавляя, поэтому
+тест обращается прямо к app и саму обертку отдельно не проверяет.
 """
 
 import dataclasses
@@ -13,9 +16,8 @@ import sqlite3
 
 from telegram.ext import Application, CommandHandler, MessageHandler
 
-import bot
 from conftest import SHARED_KEY
-from karachur import config
+from karachur import app, config
 
 EXPECTED_COMMANDS = {"help", "start", "keys", "addkey", "delkey", "rotatekey", "model"}
 
@@ -44,7 +46,7 @@ def test_main_registers_handlers_and_shared_key(cfg, monkeypatch):
         started["application"] = self
 
     monkeypatch.setattr(Application, "run_polling", fake_polling)
-    bot.main()
+    app.main()
 
     application = started["application"]
     commands_found, message_handlers = collect_handlers(application)
@@ -86,7 +88,7 @@ def test_missing_token_stops_the_bot(cfg, monkeypatch):
     )
 
     try:
-        bot.main()
+        app.main()
     except ValueError as error:
         assert "BOT_TOKEN" in str(error)
     else:
