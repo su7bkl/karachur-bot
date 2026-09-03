@@ -13,9 +13,9 @@ ERROR_CONTEXT_NOTE: длинный текст ошибки в истории т�
 запросе, полезной информации в нем для нее нет.
 """
 
+import asyncio
 import logging
 import sqlite3
-import time
 
 from telegram import Message
 from telegram.error import TelegramError
@@ -28,6 +28,10 @@ from karachur.text.markdown import markdown_to_telegram_html
 GENERATING_PLACEHOLDER = "⏳ Генерирую ответ..."
 # В чат уходит полный текст ошибки, а в контекст модели - только эта короткая пометка.
 ERROR_CONTEXT_NOTE = "ошибка gemini api"
+# Пауза между кусками длинного ответа. Когда ответ разбит больше чем на четыре сообщения,
+# они уходят в чат подряд одно за другим, и Telegram на такой частоте начинает отбивать
+# запросы по лимиту сообщений в чат - без паузы часть кусков просто не доставляется.
+CHUNK_PAUSE = 10
 
 logger = logging.getLogger(__name__)
 
@@ -116,8 +120,8 @@ async def deliver_response(
         else:
             bot_reply = await message.reply_text(chunk, parse_mode="HTML")
 
-        if len(message_chunks) > 4:
-            time.sleep(10)
+        if len(message_chunks) > 4 and index < len(message_chunks) - 1:
+            await asyncio.sleep(CHUNK_PAUSE)
 
         # Ответ модели сохраняем как есть, ошибку - одной короткой пометкой и один раз.
         if not err:
