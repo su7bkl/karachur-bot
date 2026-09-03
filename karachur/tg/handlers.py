@@ -17,6 +17,10 @@ delivery. Сам модуль не решает ни одной из этих з
 вот разным чатам ждать друг друга незачем: один долгий запрос не должен превращаться в
 очередь для всех остальных.
 
+Третье: вложение, которое karachur.media.policy отвергает уже по mime и имени, сюда не
+скачивается вовсе. Сообщение при этом сохраняется как обычно - пропадает только файл,
+которому все равно нечего делать в запросе к модели.
+
 Настройки обработчики берут из context.bot_data: сигнатуру задает telegram.ext, передать
 в нее что-то свое нельзя, а bot_data - штатное место для общих данных бота.
 """
@@ -35,7 +39,7 @@ from karachur.gemini import answer
 # Модуль зовется key_pool, а не pool: имя pool по всему коду занято самим пулом чата
 # (аргументы обработчиков, поле сессии), и модуль под тем же именем ими бы перекрывался.
 from karachur.gemini import pool as key_pool
-from karachur.media import paths
+from karachur.media import paths, policy
 from karachur.session import ChatSession
 from karachur.storage import messages
 from karachur.tg import delivery
@@ -171,10 +175,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_conn, message, is_bot=False
     )
     if file_id:
-        file_path = paths.get_media_path(cfg.media_dir, file_id, mime_type, file_name)
-        if file_path:
-            await paths.download_media_file(context.application, file_id, file_path)
-            await normalize_media(db_conn, message, file_path, mime_type)
+        # Само сообщение в базе уже есть - пропустить можно только скачивание. Если
+        # политика форматов отвергает вложение (архив, установщик, двоичный мусор),
+        # качать его незачем: до модели оно все равно не доедет, а место на диске и
+        # время на перекодирование займет. Решение тут принимается по одним mime и
+        # имени - содержимого, по которому политика умеет разбираться дальше, до
+        # скачивания просто нет, и ответ "не знаю" (None) означает "качай".
+        if policy.decide_without_content(mime_type, file_name) is policy.Action.SKIP:
+            logger.info(
+                "Вложение %s (%s) модели не годится - не скачиваем.",
+                file_name or file_id,
+                mime_type,
+            )
+        else:
+            file_path = paths.get_media_path(
+                cfg.media_dir, file_id, mime_type, file_name
+            )
+            if file_path:
+                await paths.download_media_file(context.application, file_id, file_path)
+                await normalize_media(db_conn, message, file_path, mime_type)
 
     if not (triggered_by_text or message.voice):
         return

@@ -3,9 +3,11 @@
 
 Три уровня, каждый со своей заботой. build_message_parts берет одно сообщение и делает
 из него части реплики: текст с пометкой, кто это написал, и, если было вложение, ссылку
-на выгруженный файл. build_history проходит этим по всему контексту чата и раскладывает
-реплики по ролям "user" и "model". build_contents ставит перед историей системный промпт
-и пересказ сжатой части и отдает то, что уже можно слать в API.
+на выгруженный файл - либо, если файл выгружать нельзя, текстовую пометку вместо него
+(почему выгружать можно не всё - в _build_media_part). build_history проходит этим по
+всему контексту чата и раскладывает реплики по ролям "user" и "model". build_contents
+ставит перед историей системный промпт и пересказ сжатой части и отдает то, что уже
+можно слать в API.
 
 Сборка привязана к ключу, а не к чату: ссылки на выгруженные файлы принадлежат проекту
 того ключа, которым их выгружали (см. karachur.gemini.files), поэтому после ротации
@@ -26,13 +28,88 @@ from karachur.gemini import files
 # Модуль зовется key_pool, а не pool: имя pool по всему коду занято самим пулом чата
 # (аргументы обработчиков, поле сессии), и модуль под тем же именем ими бы перекрывался.
 from karachur.gemini import pool as key_pool
-from karachur.media import paths
+from karachur.media import paths, policy
 from karachur.text import notes
 
 logger = logging.getLogger(__name__)
 
 # Заголовок, под которым сжатая история уходит в контекст следующих запросов.
 SUMMARY_HEADER = "[Сжатый пересказ более ранней части чата]"
+
+# Потолок Files API. Файл крупнее туда просто не уедет, и проверять это дешевле, чем
+# получать отказ на выгрузке.
+MAX_UPLOAD_SIZE = 20 * 1024 * 1024
+
+
+def _build_media_part(
+    client: genai.Client, api_key: str, media_path: str, mime_type: str
+) -> genai.types.Part:
+    """
+    Готовит часть запроса с вложением: ссылку на выгруженный файл либо пометку о пропуске.
+
+    Перед выгрузкой стоят два барьера, и оба заканчиваются текстовой пометкой вместо
+    файла - модель должна узнать, что вложение было, но его не показали.
+
+    Первый барьер - размер: в Files API помещается 20 МБ.
+
+    Второй - формат, и он намеренно дублирует karachur.media.policy. Политика уже решала
+    судьбу этого файла при скачивании, но её решение могло не исполниться: без
+    LibreOffice docx остаётся docx, без ffmpeg битое видео остаётся битым. Такой файл
+    Gemini отвергает ошибкой 400, а 400 разбирается как неустранимая (см.
+    karachur.gemini.errors): ни повтора, ни смены ключа не будет. Файл при этом остаётся
+    в истории чата, и следующий запрос упрётся в него снова - выйти нельзя даже сжатием,
+    потому что пересказ собирается по тому же контексту и падает там же. Один такой файл
+    глушит чат до ручной правки базы, поэтому дешевле не выгружать его вовсе.
+
+    :param client: клиент ИИ
+    :type client: genai.Client
+    :param api_key: ключ Gemini, которым работает клиент
+    :type api_key: str
+    :param media_path: путь к файлу на диске (файл существует)
+    :type media_path: str
+    :param mime_type: mime, с которым файл ушёл бы модели
+    :type mime_type: str
+    :return: часть запроса - ссылка на файл или текстовая пометка
+    :rtype: genai.types.Part
+    """
+    file_size = os.path.getsize(media_path)
+    if file_size >= MAX_UPLOAD_SIZE:
+        logger.warning(
+            "Файл %s слишком большой (%.2f МБ), пропускаем",
+            media_path,
+            file_size / 1024 / 1024,
+        )
+        return genai.types.Part(text="[Файл слишком большой для обработки - пропущено]")
+
+    if not policy.is_supported(mime_type):
+        logger.warning(
+            "Файл %s остался в формате %s, который модель не читает, - не выгружаем",
+            media_path,
+            mime_type,
+        )
+        return genai.types.Part(
+            text=f"[Файл формата {mime_type} модель не читает - пропущено]"
+        )
+
+    # Выгрузка принадлежит ключу, поэтому и кэш ведется по паре с ним.
+    cache_key = (api_key, media_path)
+    # Проверяем, есть ли файл в кэше и валиден ли он
+    files.check_file_validity(client, api_key, media_path)
+
+    # Загрузка, если файла нет в кэше (или он был удален выше)
+    if cache_key not in files.uploaded_files:
+        files.upload_file(client, api_key, media_path)
+
+    # Если файл успешно загружен и активен
+    if cache_key not in files.uploaded_files:
+        return genai.types.Part(text="[Ошибка обработки файла - не удалось активировать]")
+
+    return genai.types.Part(
+        file_data=genai.types.FileData(
+            file_uri=files.uploaded_files[cache_key].uri,
+            mime_type=files.uploaded_files[cache_key].mime_type,
+        )
+    )
 
 
 def build_message_parts(
@@ -75,44 +152,9 @@ def build_message_parts(
         media_path = os.path.abspath(raw_path) if raw_path else None
         if media_path and os.path.exists(media_path):
             try:
-                file_size = os.path.getsize(media_path)
-                if file_size < 20 * 1024 * 1024:
-                    # Выгрузка принадлежит ключу, поэтому и кэш ведется по паре с ним.
-                    cache_key = (api_key, media_path)
-                    # Проверяем, есть ли файл в кэше и валиден ли он
-                    files.check_file_validity(client, api_key, media_path)
-
-                    # Загрузка, если файла нет в кэше (или он был удален выше)
-                    if cache_key not in files.uploaded_files:
-                        files.upload_file(client, api_key, media_path)
-
-                    # Если файл успешно загружен и активен
-                    if cache_key in files.uploaded_files:
-                        parts.append(
-                            genai.types.Part(
-                                file_data=genai.types.FileData(
-                                    file_uri=files.uploaded_files[cache_key].uri,
-                                    mime_type=files.uploaded_files[cache_key].mime_type,
-                                )
-                            )
-                        )
-                    else:
-                        parts.append(
-                            genai.types.Part(
-                                text="[Ошибка обработки файла - не удалось активировать]"
-                            )
-                        )
-                else:
-                    logger.warning(
-                        "Файл %s слишком большой (%.2f МБ), пропускаем",
-                        media_path,
-                        file_size / 1024 / 1024,
-                    )
-                    parts.append(
-                        genai.types.Part(
-                            text="[Файл слишком большой для обработки - пропущено]"
-                        )
-                    )
+                parts.append(
+                    _build_media_part(client, api_key, media_path, msg["mime_type"])
+                )
             except Exception as e:  # pylint: disable=broad-exception-caught
                 logger.error(
                     "Ошибка при работе с медиафайлом %s: %s",

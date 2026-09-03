@@ -1,7 +1,7 @@
 """
 Тесты работы с форматами, которые Gemini не понимает.
 
-Три слоя, снизу вверх. Первый - политика: decide() раскладывает пары (mime, имя файла)
+Пять слоев, снизу вверх. Первый - политика: decide() раскладывает пары (mime, имя файла)
 по пяти действиям, ничего не конвертируя и почти не трогая сам файл. Второй - конвертация
 документов в PDF через LibreOffice: живая проверка идет настоящим вызовом soffice на .rtf,
 который читается LibreOffice и собирается голым текстом, а остальные грабли (профиль,
@@ -9,23 +9,34 @@ HOME, честная проверка результата, убийство з�
 чтобы не зависеть от машины. Третий - media.normalize целиком: именно ее зовет обработчик
 сообщений, и именно ее контракт (путь, mime) не должен меняться.
 
+Четвертый и пятый - два места, где решение политики наконец исполняется. Барьер перед
+выгрузкой в Files API (karachur.gemini.contents): формат вне белого списка не уезжает к
+модели, а превращается в текстовую пометку. Ранний отказ до скачивания
+(karachur.tg.handlers): отвергнутое политикой вложение не качается вовсе. Оба нужны
+против одного и того же: Gemini отвечает на нечитаемый файл неустранимой ошибкой 400, и
+файл, оставшийся в истории, глушит чат на всех последующих запросах.
+
 Отдельное внимание двум ловушкам: точное совпадение mime должно перехватываться раньше
 группового префикса, а определение текста по содержимому не должно спотыкаться о
 многобайтовый символ, разрезанный границей чтения в 8 КБ. Если soffice в системе нет,
 живые тесты пропускаются: бот без LibreOffice тоже работает, просто без конвертации.
 """
 
+import asyncio
 import os
 import shutil
 import subprocess
 import zipfile
+from types import SimpleNamespace
 
 import pytest
 
 from karachur import media
+from karachur.gemini import contents, files
 from karachur.media import documents, policy
 from karachur.media.ffmpeg import CONVERSION_TIMEOUT
 from karachur.media.policy import Action
+from karachur.tg import handlers
 
 SOFFICE_MISSING = shutil.which("soffice") is None
 needs_soffice = pytest.mark.skipif(SOFFICE_MISSING, reason="в системе нет LibreOffice")
@@ -430,3 +441,175 @@ def test_bot_made_bin_extension_falls_through_to_content(tmp_path):
 
     assert policy.decide(None, str(text)) == (Action.RETAG, "text/plain")
     assert policy.decide(None, str(binary)) == (Action.SKIP, None)
+
+
+# --- БАРЬЕР ПЕРЕД ВЫГРУЗКОЙ В FILES API ---
+
+# Сообщение с вложением в том виде, в каком его отдает база: сборке запроса нужны от
+# строки только автор, текст и три колонки про файл.
+def media_message(path, mime):
+    """Собирает строку messages с вложением - ровно то, что читает build_message_parts."""
+    return {
+        "username": "tester",
+        "content": "лови файл",
+        "file_id": "FILEID",
+        "mime_type": mime,
+        "media_path": str(path),
+    }
+
+
+def watch_uploads(monkeypatch):
+    """
+    Подменяет выгрузку в Files API и возвращает список путей, которые до нее дошли.
+
+    Подменяются атрибуты самого karachur.gemini.files: сборка запроса зовет выгрузку
+    через модуль, а не по импортированному имени, - иначе подмена бы ее не достала.
+    """
+    seen = []
+    monkeypatch.setattr(files, "check_file_validity", lambda c, k, p: seen.append(p))
+    monkeypatch.setattr(files, "upload_file", lambda c, k, p: seen.append(p))
+    return seen
+
+
+def test_unsupported_format_never_reaches_files_api(tmp_path, monkeypatch):
+    """
+    Файл с mime вне белого списка не выгружается, а превращается в текстовую пометку.
+
+    Так в контекст попадает архив, доживший в базе до сборки запроса: раньше он уезжал
+    в Files API и возвращался неустранимой ошибкой 400, глушившей чат целиком.
+    """
+    source = tmp_path / "архив.zip"
+    source.write_bytes(b"PK\x03\x04\x00\x00")
+    uploaded = watch_uploads(monkeypatch)
+
+    parts = contents.build_message_parts(
+        None, "ключ", media_message(source, "application/zip")
+    )
+
+    assert not uploaded
+    assert parts[-1].text == "[Файл формата application/zip модель не читает - пропущено]"
+
+
+def test_failed_pdf_conversion_also_stops_at_the_barrier(tmp_path, monkeypatch):
+    """
+    Docx, который не удалось перевести в PDF, до выгрузки тоже не доходит.
+
+    Ради этого случая барьер и дублирует политику: политика отправила документ в PDF, но
+    без LibreOffice решение не исполнилось, и docx остался docx.
+    """
+    monkeypatch.setattr(documents.shutil, "which", lambda name: None)
+    source = tmp_path / "отчёт.docx"
+    make_docx(source)
+
+    path, mime = media.normalize(str(source), DOCX_MIME)
+    # Конвертация не удалась - файл и mime остались прежними.
+    assert (path, mime) == (str(source), DOCX_MIME)
+
+    uploaded = watch_uploads(monkeypatch)
+    parts = contents.build_message_parts(None, "ключ", media_message(path, mime))
+
+    assert not uploaded
+    assert parts[-1].text == f"[Файл формата {DOCX_MIME} модель не читает - пропущено]"
+
+
+def test_supported_format_still_goes_up(tmp_path, monkeypatch):
+    """Барьер выборочный: готовый pdf по-прежнему уезжает в Files API."""
+    source = tmp_path / "инструкция.pdf"
+    source.write_bytes(b"%PDF-1.7 ")
+    uploaded = watch_uploads(monkeypatch)
+
+    contents.build_message_parts(
+        None, "ключ", media_message(source, "application/pdf")
+    )
+
+    assert uploaded == [str(source), str(source)]
+
+
+# --- РАННИЙ ОТКАЗ ДО СКАЧИВАНИЯ ---
+
+
+def run_handle_message(cfg, db, monkeypatch, mime, file_name):
+    """
+    Гоняет handle_message на сообщении с вложением и возвращает, что скачалось.
+
+    Разбор объекта Telegram здесь не проверяется, поэтому save_message_to_db подменяется
+    и сразу отдает описание вложения. Триггера в тексте нет - обработчик доходит до
+    работы с файлом и возвращается, не трогая ни замок, ни модель.
+
+    :return: (пути скачанного, пути перекодированного)
+    :rtype: tuple[list, list]
+    """
+    downloaded = []
+    normalized = []
+
+    async def fake_download(_application, _file_id, file_path):
+        """Запоминает попытку скачивания вместо похода в Telegram."""
+        downloaded.append(file_path)
+
+    async def fake_normalize(_conn, _message, file_path, _mime):
+        """Запоминает попытку перекодирования."""
+        normalized.append(file_path)
+
+    monkeypatch.setattr(
+        handlers.messages,
+        "save_message_to_db",
+        lambda conn, message, is_bot: ("FILEID", mime, file_name),
+    )
+    monkeypatch.setattr(handlers.paths, "download_media_file", fake_download)
+    monkeypatch.setattr(handlers, "normalize_media", fake_normalize)
+
+    message = SimpleNamespace(
+        chat=SimpleNamespace(type="private"),
+        chat_id=-100,
+        message_id=1,
+        text="файл без обращения к боту",
+        caption=None,
+        voice=None,
+    )
+    update = SimpleNamespace(effective_message=message)
+    context = SimpleNamespace(bot_data={"cfg": cfg, "db_conn": db}, application=None)
+    asyncio.run(handlers.handle_message(update, context))
+    return downloaded, normalized
+
+
+def test_archive_is_not_even_downloaded(cfg, db, monkeypatch):
+    """Архив не качается вовсе: до модели он все равно не доедет."""
+    downloaded, normalized = run_handle_message(
+        cfg, db, monkeypatch, "application/zip", "архив.zip"
+    )
+
+    assert not downloaded
+    assert not normalized
+
+
+def test_unknown_mime_with_binary_extension_is_refused_by_name(cfg, db, monkeypatch):
+    """
+    Телеграм прислал octet-stream - решение принимается по расширению имени.
+
+    Содержимого до скачивания нет, и единственное, что отличает установщик от текста, -
+    его имя.
+    """
+    downloaded, _ = run_handle_message(
+        cfg, db, monkeypatch, "application/octet-stream", "установщик.exe"
+    )
+
+    assert not downloaded
+
+
+@pytest.mark.parametrize(
+    "mime, file_name",
+    [
+        ("application/pdf", "инструкция.pdf"),
+        # Ни mime, ни имя ничего не говорят: такой файл надо скачать и разобрать по
+        # содержимому - иначе присланный без mime текст молча пропадет из контекста.
+        ("application/octet-stream", None),
+    ],
+)
+def test_files_that_may_still_be_useful_are_downloaded(
+    cfg, db, monkeypatch, mime, file_name
+):
+    """Отказ выборочный: все, что политика не отвергла заранее, качается как раньше."""
+    downloaded, normalized = run_handle_message(cfg, db, monkeypatch, mime, file_name)
+
+    assert len(downloaded) == 1
+    assert normalized == downloaded

@@ -15,6 +15,17 @@ karachur.media.ffmpeg: там же объяснено, почему даже ф�
 application/octet-stream, а то и вовсе ничего не присылает. В этом случае решение
 принимается по расширению файла, а если и оно ничего не говорит - по первым байтам
 содержимого.
+
+Спрашивают отсюда три разные вещи, и у каждой свой вход:
+    decide                 - полное решение по уже скачанному файлу, с подглядыванием
+                             в содержимое; им пользуется karachur.media.normalize
+    decide_without_content - то же, но пока файла ещё нет на диске: только mime и имя.
+                             Нужно karachur.tg.handlers, чтобы не качать то, что всё
+                             равно не поедет к модели
+    is_supported           - последний барьер перед выгрузкой в Files API
+                             (karachur.gemini.contents): возьмёт ли Gemini этот mime
+                             вообще. Барьер намеренно дублирует политику - конвертация
+                             могла не задаться, и тогда docx так и остался docx
 """
 
 import codecs
@@ -40,6 +51,10 @@ WHITELIST = frozenset({
     "video/mp4", "video/mpeg", "video/mov", "video/avi", "video/x-flv",
     "video/mpg", "video/webm", "video/wmv", "video/3gpp",
     "audio/wav", "audio/mp3", "audio/aiff", "audio/aac", "audio/ogg", "audio/flac",
+    # Документация Gemini называет форматы вольно ("audio/mp3", "video/mov"), а Telegram
+    # присылает стандартные имена тех же форматов. Без этих синонимов mp3 и mov упрутся
+    # в барьер на машине без ffmpeg, хотя модель их читает.
+    "audio/mpeg", "video/quicktime",
     "application/pdf",
     "text/plain", "text/markdown", "text/html", "text/xml", "text/csv",
 })
@@ -262,6 +277,29 @@ def _normalize_mime(mime_type: str | None) -> str:
     return mime_type.lower().split(";")[0].strip()
 
 
+def is_supported(mime_type: str | None) -> bool:
+    """
+    Отвечает, возьмёт ли Gemini файл с таким mime как есть.
+
+    Вопрос не о том, что с файлом собирались делать, а о том, чем он в итоге стал:
+    именно этот mime уходит в Files API. Ответ читается прямо из WHITELIST, второго
+    списка поддерживаемых форматов в проекте быть не должно.
+
+    Строгость тут намеренная. Формат, который не попал в белый список, до модели
+    добираться не должен вообще - даже если это mp3, который живая Gemini, может быть, и
+    съела бы. Файл под таким mime означает, что подготовка не сработала (не нашлось
+    ffmpeg или LibreOffice, конвертация упала), а неподготовленный файл - это ровно тот
+    случай, ради которого барьер и заводится: 400 от модели неустраним, и один такой
+    файл в истории глушит чат целиком.
+
+    :param mime_type: mime файла в том виде, в каком он уйдёт модели
+    :type mime_type: str | None
+    :return: True, если формат из белого списка Gemini
+    :rtype: bool
+    """
+    return _normalize_mime(mime_type) in WHITELIST
+
+
 def _classify_mime(mime: str) -> Action | None:
     """
     Определяет действие по нормализованному mime - лестница в точности из правил 2-7.
@@ -379,3 +417,36 @@ def decide(mime_type: str | None, path: str) -> tuple[Action, str | None]:
     if looks_like_text(path):
         return Action.RETAG, "text/plain"
     return Action.SKIP, None
+
+
+def decide_without_content(mime_type: str | None, file_name: str | None) -> Action | None:
+    """
+    Решает то же, что decide, но по одним mime и имени - когда файла ещё нет на диске.
+
+    Это первые две ступени той же лестницы, без третьей: заглянуть в первые байты
+    нечего, файл ещё не скачан. Поэтому у функции есть ответ, которого нет у decide, -
+    None: "по mime и имени не понять, нужен сам файл". Ответом на None должно быть
+    скачивание, а не отказ, иначе присланный без mime текст молча пропадёт из контекста.
+
+    Действующий mime тут не возвращается: звать функцию имеет смысл ровно ради SKIP,
+    а остальные действия всё равно исполняются потом, над скачанным файлом.
+
+    :param mime_type: mime, присланный Телеграмом
+    :type mime_type: str | None
+    :param file_name: имя вложения, как его прислал Телеграм
+    :type file_name: str | None
+    :return: действие или None, если без содержимого решить нельзя
+    :rtype: Action | None
+    """
+    mime = _normalize_mime(mime_type)
+    if mime:
+        by_mime = _by_mime(mime)
+        if by_mime is not None:
+            return by_mime[0]
+
+    if file_name:
+        by_extension = _by_extension(file_name)
+        if by_extension is not None:
+            return by_extension[0]
+
+    return None
