@@ -19,6 +19,10 @@ replace_placeholder уходит в ветку original.reply_text), а возв
 и подставляет - его содержимое save_message_to_db все равно не смотрит, она подменена.
 """
 
+# Подделка повторяет форму настоящего telegram.Message: отсюда класс с одним методом и
+# аргументы, которые тесту не нужны, но есть в исходной сигнатуре.
+# pylint: disable=too-few-public-methods,unused-argument
+
 import asyncio
 import time
 
@@ -103,4 +107,4 @@ def test_no_pause_for_four_or_fewer_chunks(monkeypatch):
         delivery.deliver_response(None, _FakeMessage(), None, "неважно что тут", False)
     )
 
-    assert sleeps == []
+    assert not sleeps
