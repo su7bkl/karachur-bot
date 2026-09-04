@@ -10,8 +10,9 @@ import sqlite3
 
 import pytest
 
-import bot
 from conftest import CHAT_ONE, CHAT_TWO
+from karachur.storage import messages, schema, summaries
+from karachur.text import notes
 
 
 def test_same_message_id_in_two_chats(db, add_message):
@@ -29,9 +30,9 @@ def test_context_is_limited_to_its_chat(db, add_message):
     add_message(CHAT_TWO, 1, "первое сообщение чата Б")
     add_message(CHAT_ONE, 2, "второе сообщение чата А")
 
-    _, messages = bot.get_context(db, CHAT_ONE)
+    _, context = messages.get_context(db, CHAT_ONE)
 
-    assert [msg["content"] for msg in messages] == [
+    assert [msg["content"] for msg in context] == [
         "первое сообщение чата А",
         "второе сообщение чата А",
     ]
@@ -43,8 +44,8 @@ def test_reply_target_comes_from_the_same_chat(db, add_message):
     add_message(CHAT_TWO, 1, "вопрос чата Б")
     add_message(CHAT_TWO, 5, "ответ чата Б", reply_to=1)
 
-    _, messages = bot.get_context(db, CHAT_TWO)
-    target = messages[-1]["reply_target"]
+    _, context = messages.get_context(db, CHAT_TWO)
+    target = context[-1]["reply_target"]
 
     assert target["content"] == "вопрос чата Б"
 
@@ -53,8 +54,8 @@ def test_missing_reply_target_is_described(db, add_message):
     """Ответ на сообщение старше бота помечается как отсутствующее в истории."""
     add_message(CHAT_ONE, 7, "ответ на что-то древнее", reply_to=1)
 
-    _, messages = bot.get_context(db, CHAT_ONE)
-    note = bot.build_service_note(messages[-1]) or ""
+    _, context = messages.get_context(db, CHAT_ONE)
+    note = notes.build_service_note(context[-1]) or ""
 
     assert "которого нет в истории" in note
 
@@ -65,10 +66,10 @@ def test_summary_belongs_to_one_chat(db, add_message):
     add_message(CHAT_ONE, 2, "свежее сообщение чата А")
     add_message(CHAT_TWO, 1, "сообщение чата Б")
 
-    bot.save_summary(db, CHAT_ONE, "пересказ чата А", [1])
+    summaries.save_summary(db, CHAT_ONE, "пересказ чата А", [1])
 
-    summary_one, messages_one = bot.get_context(db, CHAT_ONE)
-    summary_two, messages_two = bot.get_context(db, CHAT_TWO)
+    summary_one, messages_one = messages.get_context(db, CHAT_ONE)
+    summary_two, messages_two = messages.get_context(db, CHAT_TWO)
 
     assert summary_one == "пересказ чата А"
     assert [msg["content"] for msg in messages_one] == ["свежее сообщение чата А"]
@@ -81,23 +82,25 @@ def test_summary_marks_only_its_own_messages(db, add_message):
     add_message(CHAT_ONE, 1, "сообщение чата А")
     add_message(CHAT_TWO, 1, "сообщение чата Б")
 
-    bot.save_summary(db, CHAT_ONE, "пересказ чата А", [1])
+    summaries.save_summary(db, CHAT_ONE, "пересказ чата А", [1])
 
     marked = db.execute(
         "SELECT chat_id FROM messages WHERE summarized = 1"
     ).fetchall()
-    assert marked == [(CHAT_ONE,)]
+    # row_factory отдает sqlite3.Row, а не кортеж - он с кортежем не равен даже при
+    # совпадении значений, поэтому сравниваем приведенные к tuple() строки.
+    assert [tuple(row) for row in marked] == [(CHAT_ONE,)]
 
 
 def test_latest_summary_wins(db):
     """Из нескольких пересказов чата берется самый свежий."""
-    bot.save_summary(db, CHAT_ONE, "первый пересказ", [])
-    bot.save_summary(db, CHAT_ONE, "второй пересказ", [])
+    summaries.save_summary(db, CHAT_ONE, "первый пересказ", [])
+    summaries.save_summary(db, CHAT_ONE, "второй пересказ", [])
 
-    assert bot.get_latest_summary(db, CHAT_ONE) == "второй пересказ"
+    assert summaries.get_latest_summary(db, CHAT_ONE) == "второй пересказ"
 
 
-def test_legacy_database_is_rejected(tmp_path, monkeypatch):
+def test_legacy_database_is_rejected(tmp_path):
     """База прошлой версии не открывается: в ней истории чатов вперемешку."""
     legacy_path = tmp_path / "legacy.db"
     legacy = sqlite3.connect(legacy_path)
@@ -107,11 +110,8 @@ def test_legacy_database_is_rejected(tmp_path, monkeypatch):
     legacy.commit()
     legacy.close()
 
-    monkeypatch.setattr(bot, "DB_FILE", str(legacy_path))
-    monkeypatch.setattr(bot, "MEDIA_DIR", str(tmp_path / "media"))
-
     with pytest.raises(RuntimeError, match="Удалите или переименуйте"):
-        bot.init_db()
+        schema.init_db(str(legacy_path), str(tmp_path / "media"))
 
 
 @pytest.mark.parametrize(
@@ -139,8 +139,8 @@ def test_attachment_kind_reaches_the_model(db, kind, expected):
     )
     db.commit()
 
-    _, messages = bot.get_context(db, CHAT_ONE)
-    note = bot.build_service_note(messages[0]) or ""
+    _, context = messages.get_context(db, CHAT_ONE)
+    note = notes.build_service_note(context[0]) or ""
 
     assert f"Вложение: {expected}" in note
 
@@ -149,11 +149,58 @@ def test_message_without_attachment_has_no_note(db, add_message):
     """Обычной реплике без вложения помечать нечего."""
     add_message(CHAT_ONE, 1, "просто текст")
 
-    _, messages = bot.get_context(db, CHAT_ONE)
+    _, context = messages.get_context(db, CHAT_ONE)
 
-    assert bot.build_service_note(messages[0]) is None
+    assert notes.build_service_note(context[0]) is None
 
 
 def test_copied_attachment_note_is_stripped():
     """Если модель скопирует пометку о вложении, она срезается."""
-    assert bot.strip_service_prefixes("[Вложение: гифка] ответ") == "ответ"
+    assert notes.strip_service_prefixes("[Вложение: гифка] ответ") == "ответ"
+
+
+def test_context_stops_at_the_asking_message(db, add_message):
+    """
+    Запрос видит историю по свое сообщение, а не все, что накопилось потом.
+
+    Сообщения кладутся в базу сразу, не дожидаясь очереди на ответ, а ответ с повторами
+    тянется минутами. Без границы бот отвечал бы на вопрос, подглядывая в написанное
+    уже после этого вопроса.
+    """
+    add_message(CHAT_ONE, 1, "что было раньше")
+    add_message(CHAT_ONE, 2, "Карачур, вопрос")
+    add_message(CHAT_ONE, 3, "написали, пока бот думал")
+
+    _, context = messages.get_context(db, CHAT_ONE, up_to_message_id=2)
+
+    assert [msg["content"] for msg in context] == ["что было раньше", "Карачур, вопрос"]
+
+
+def test_bound_keeps_neighbours_of_the_same_second(db, add_message):
+    """
+    Сообщения с той же меткой времени отсекаются по номеру, а не заодно с ней.
+
+    Время у Telegram с точностью до секунды, поэтому соседи по секунде - обычное дело, и
+    граница обязана различать их. Оснастка выводит метку из номера, так что 5 и 65
+    делят одну секунду.
+    """
+    add_message(CHAT_ONE, 5, "спросили")
+    add_message(CHAT_ONE, 65, "в ту же секунду написали еще")
+
+    _, context = messages.get_context(db, CHAT_ONE, up_to_message_id=5)
+
+    assert [msg["content"] for msg in context] == ["спросили"]
+
+
+def test_unknown_bound_falls_back_to_the_whole_history(db, add_message):
+    """
+    Сообщения-границы нет в базе - отдаем всю историю, а не пустоту.
+
+    Пустой контекст означал бы отказ отвечать, а это хуже лишней реплики в запросе.
+    """
+    add_message(CHAT_ONE, 1, "первое")
+    add_message(CHAT_ONE, 2, "второе")
+
+    _, context = messages.get_context(db, CHAT_ONE, up_to_message_id=999)
+
+    assert [msg["content"] for msg in context] == ["первое", "второе"]

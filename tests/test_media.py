@@ -4,6 +4,11 @@
 Правила подбора формата проверяются без ffmpeg, а сама перекодировка - настоящим
 вызовом на файлах, которые ffmpeg тут же и создает. Если ffmpeg в системе нет, эти
 тесты пропускаются: бот без него тоже работает, просто отдает файлы как есть.
+
+Вход в перекодирование - по-прежнему media.normalize, а вот сам движок переехал в
+karachur.media.ffmpeg: подменять и спрашивать про кодеки надо теперь его, потому что
+encode зовет run_ffmpeg через глобальные имена своего модуля. Что делать с форматами,
+которые ffmpeg не касается, проверяется отдельно в test_formats.py.
 """
 
 import asyncio
@@ -14,8 +19,11 @@ from types import SimpleNamespace
 
 import pytest
 
-import bot
-import media
+from karachur import media
+from karachur.gemini import contents, files
+from karachur.media import ffmpeg, paths
+from karachur.storage import messages
+from karachur.tg import handlers
 
 FFMPEG_MISSING = shutil.which("ffmpeg") is None
 needs_ffmpeg = pytest.mark.skipif(FFMPEG_MISSING, reason="в системе нет ffmpeg")
@@ -41,13 +49,13 @@ needs_ffmpeg = pytest.mark.skipif(FFMPEG_MISSING, reason="в системе не
 )
 def test_conversion_rules(mime, expected):
     """Каждому типу подбирается свой формат, а лишнее не трогается."""
-    rule = media.conversion_for(mime)
+    rule = ffmpeg.conversion_for(mime)
     assert (rule[1] if rule else None) == expected
 
 
 def test_mime_with_parameters_is_understood():
     """Mime с довеском разбирается наравне с чистым."""
-    rule = media.conversion_for("VIDEO/WEBM; codecs=vp9")
+    rule = ffmpeg.conversion_for("VIDEO/WEBM; codecs=vp9")
     assert rule is not None and rule[1] == "video/mp4"
 
 
@@ -60,7 +68,7 @@ def test_missing_file_is_left_alone(tmp_path):
 def test_untouched_types_skip_ffmpeg(tmp_path, monkeypatch):
     """Для jpeg ffmpeg вообще не зовется."""
     called = []
-    monkeypatch.setattr(media, "run_ffmpeg", lambda *a: called.append(a) or True)
+    monkeypatch.setattr(ffmpeg, "run_ffmpeg", lambda *a: called.append(a) or True)
     photo = tmp_path / "фото.jpg"
     photo.write_bytes(b"not a real jpeg")
 
@@ -70,7 +78,7 @@ def test_untouched_types_skip_ffmpeg(tmp_path, monkeypatch):
 
 def test_failed_conversion_keeps_the_original(tmp_path, monkeypatch):
     """Если ffmpeg не справился, остается исходный файл и исходный mime."""
-    monkeypatch.setattr(media, "run_ffmpeg", lambda *a: False)
+    monkeypatch.setattr(ffmpeg, "run_ffmpeg", lambda *a: False)
     source = tmp_path / "стикер.webm"
     source.write_bytes(b"broken webm")
 
@@ -81,7 +89,7 @@ def test_failed_conversion_keeps_the_original(tmp_path, monkeypatch):
 
 def test_missing_ffmpeg_keeps_the_original(tmp_path, monkeypatch):
     """Без ffmpeg бот работает по-прежнему, просто без перекодирования."""
-    monkeypatch.setattr(media.shutil, "which", lambda name: None)
+    monkeypatch.setattr(ffmpeg.shutil, "which", lambda name: None)
     source = tmp_path / "стикер.webm"
     source.write_bytes(b"webm")
 
@@ -232,11 +240,13 @@ def test_stored_media_path_wins(db, tmp_path, monkeypatch):
     db.commit()
 
     used = []
-    monkeypatch.setattr(bot, "check_file_validity", lambda c, k, p: used.append(p))
-    monkeypatch.setattr(bot, "upload_file", lambda c, k, p: used.append(p))
+    # Подменяем атрибуты самого karachur.gemini.files: сборка запроса зовет выгрузку
+    # через модуль, а не по импортированному имени, - иначе подмена бы ее не достала.
+    monkeypatch.setattr(files, "check_file_validity", lambda c, k, p: used.append(p))
+    monkeypatch.setattr(files, "upload_file", lambda c, k, p: used.append(p))
 
-    _, messages = bot.get_context(db, -100)
-    bot.build_message_parts(None, "ключ", messages[0])
+    _, context = messages.get_context(db, -100)
+    contents.build_message_parts(None, "ключ", context[0])
 
     assert used == [str(converted), str(converted)]
 
@@ -258,12 +268,14 @@ def test_normalize_media_records_the_result(db, tmp_path, monkeypatch):
     monkeypatch.setattr(media, "normalize", lambda p, m: (str(tmp_path / "и.mp4"), "video/mp4"))
     message = SimpleNamespace(chat_id=-100, message_id=7)
 
-    asyncio.run(bot.normalize_media(db, message, str(source), "video/webm"))
+    asyncio.run(handlers.normalize_media(db, message, str(source), "video/webm"))
 
     stored = db.execute(
         "SELECT media_path, mime_type FROM messages WHERE message_id = 7"
     ).fetchone()
-    assert stored == (str(tmp_path / "и.mp4"), "video/mp4")
+    # tuple() нужен, потому что соединение отдает строки sqlite3.Row, а Row не равен
+    # кортежу даже с теми же значениями.
+    assert tuple(stored) == (str(tmp_path / "и.mp4"), "video/mp4")
 
 
 @needs_ffmpeg
@@ -286,5 +298,42 @@ def test_audio_codec_is_detected(tmp_path):
     make_video(source, ["-f", "lavfi", "-i", "sine=frequency=440:duration=1",
                         "-c:a", "libopus"])
 
-    assert media.audio_codec(str(source)) == "opus"
-    assert media.audio_attempts(str(source))[0] == media.AUDIO_COPY
+    assert ffmpeg.audio_codec(str(source)) == "opus"
+    assert ffmpeg.audio_attempts(str(source))[0] == ffmpeg.AUDIO_COPY
+
+
+def test_get_media_path_avoids_name_collisions():
+    """
+    Два документа с одинаковым original_name не должны лечь по одному пути.
+
+    Раньше путь строился как <media_dir>/<очищенное имя>, и второй report.pdf в чате
+    получал ровно тот же путь, что и первый - download_media_file существующий файл
+    повторно не качает, так что модели вместо второго файла уходило содержимое первого.
+    """
+    first = paths.get_media_path("/media", "AAA111", "application/pdf", "report.pdf")
+    second = paths.get_media_path("/media", "BBB222", "application/pdf", "report.pdf")
+
+    assert first != second
+    # Читаемая часть имени и расширение остаются на месте - по каталогу media все равно
+    # видно, что это за файл, даже когда лезешь туда руками.
+    assert os.path.basename(first) == "report.AAA111.pdf"
+    assert os.path.basename(second) == "report.BBB222.pdf"
+
+
+def test_get_media_path_keeps_readable_name_and_extension():
+    """Читаемая часть имени и расширение сохраняются при подмешивании file_id."""
+    path = paths.get_media_path(
+        "/media", "FILE_ID_XYZ", "application/pdf", "annual report.pdf"
+    )
+
+    assert os.path.basename(path) == "annual report.FILE_ID_XYZ.pdf"
+
+
+def test_get_media_path_non_ascii_name_uses_file_id_branch():
+    """
+    Не-ascii имя по-прежнему обрабатывается прежней веткой - собирается из file_id и
+    расширения по mime, само имя вложения в пути не участвует вовсе.
+    """
+    path = paths.get_media_path("/media", "FILE1", "application/pdf", "отчет.pdf")
+
+    assert path == os.path.join("/media", "FILE1.pdf")

@@ -1,10 +1,10 @@
 """
-Общая оснастка тестов: конфиг, база и подделки Gemini с Telegram.
+Общая оснастка тестов: настройки, база и подделки Gemini с Telegram.
 
-bot.py читает конфиг на импорте, поэтому тестовый конфиг готовится прямо здесь, до
-всяких фикстур: conftest.py pytest импортирует раньше самих тестов. Путь передается
-через KARACHUR_CONFIG, так что рабочий config.cfg тесты не трогают и даже не требуют -
-на чистой машине с одним склонированным репозиторием они все равно проходят.
+Настройки собираются фикстурой cfg прямо в памяти: рабочий config.cfg тесты не трогают
+и даже не требуют - на чистой машине с одним склонированным репозиторием они все равно
+проходят. Раньше на это уходил временный config.cfg на диске, потому что bot.py читал
+конфиг на импорте; теперь конфиг читает только main(), и подкладывать файл незачем.
 
 Ни один тест не ходит в сеть: клиент Gemini подменяется подделкой, которая отвечает по
 заранее заданному сценарию, а Telegram сводится к паре объектов, запоминающих отправку.
@@ -12,36 +12,23 @@ bot.py читает конфиг на импорте, поэтому тесто�
 
 # Подделки повторяют форму настоящих объектов Gemini и Telegram: отсюда классы с одним
 # методом и аргументы вроде model, которые тесту не нужны, но есть в исходной сигнатуре.
-# pylint: disable=too-few-public-methods,unused-argument
+# Атрибутов у FakeGemini много по той же причине: она не только отвечает по сценарию, но
+# и ведет журналы всего, о чем ее спросили, - на них и держатся проверки тестов.
+# pylint: disable=too-few-public-methods,unused-argument,too-many-instance-attributes
 
 import asyncio
-import os
-import tempfile
-from pathlib import Path
+import datetime
+import types
 
 import pytest
 
-TEST_CONFIG = """[SETTINGS]
-BOT_TOKEN = 123456:TEST
-GEMINI_API_KEY =
-DB_FILE = tests.db
-MEDIA_DIR = media
-TRIGGER_WORD = Карачур
-MODEL = gemini-2.5-flash-lite
-MAX_CONTEXT_TOKENS = 200000
-KEY_RPD_LIMIT = 250
-SYSTEM_PROMPT = Тестовый системный промпт.
-"""
+from karachur import config
+from karachur.gemini import files
 
-_CONFIG_PATH = Path(tempfile.mkdtemp(prefix="karachur-tests-")) / "config.cfg"
-_CONFIG_PATH.write_text(TEST_CONFIG, encoding="utf-8")
-os.environ["KARACHUR_CONFIG"] = str(_CONFIG_PATH)
-
-# Модули бота импортируются только после того, как конфиг оказался на месте.
-# pylint: disable=wrong-import-position
-import api_keys  # noqa: E402
-import bot  # noqa: E402
-import commands  # noqa: E402
+# Модуль зовется key_pool, а не pool: имя pool в тестах занято самим пулом чата.
+from karachur.gemini import pool as key_pool
+from karachur.storage import schema
+from karachur.tg import commands
 
 # Ключи в тестах намеренно непохожи на настоящие, но той же длины и формы.
 KEY_ONE = "AIzaTEST0000000000000000000000000000001"
@@ -52,9 +39,9 @@ SHARED_KEY = "AIzaSHARED000000000000000000000000000001"
 CHAT_ONE = -1001110000
 CHAT_TWO = -1002220000
 
-# Модель из тестового конфига. Квоты считаются на пару "ключ и модель", поэтому почти
+# Модель тестовых настроек. Квоты считаются на пару "ключ и модель", поэтому почти
 # всякая работа с пулом требует назвать модель.
-MODEL = bot.MODEL
+MODEL = "gemini-2.5-flash-lite"
 OTHER_MODEL = "gemini-3-pro"
 
 
@@ -97,6 +84,109 @@ class ApiError(Exception):
     def bad_key(cls) -> "ApiError":
         """Возвращает отказ по ключу."""
         return cls(403, "PERMISSION_DENIED: API key expired")
+
+    @classmethod
+    def stale_file(cls, name: str = "files/protuhla") -> "ApiError":
+        """
+        Возвращает отказ по ссылке на файл - слово в слово как настоящий.
+
+        Код тот же 403, что и у отвергнутого ключа: на этом сходстве бот и хоронил
+        собственные ключи за чужую вину.
+
+        :param name: имя ресурса в Files API
+        :type name: str
+        :return: ошибка про недоступный файл
+        :rtype: ApiError
+        """
+        return cls(
+            403,
+            "PERMISSION_DENIED. You do not have permission to access the File "
+            f"{name} or it may not exist.",
+        )
+
+
+class FakeFile:
+    """
+    Объект File из Files API: кэшу выгрузок нужны имя, ссылка, mime, состояние и срок.
+
+    Срок задается смещением от текущего момента - так тест говорит "выгрузка протухла
+    час назад" или "живет еще сутки", не подменяя часы.
+    """
+
+    def __init__(
+        self,
+        name: str = "files/test",
+        mime_type: str = "image/png",
+        state: str = "ACTIVE",
+        expires_in: float | None = 48 * 60 * 60,
+    ):
+        """
+        :param name: имя ресурса в Files API
+        :type name: str
+        :param mime_type: mime выгруженного файла
+        :type mime_type: str
+        :param state: состояние выгрузки - ACTIVE, PROCESSING или FAILED
+        :type state: str
+        :param expires_in: через сколько секунд Files API удалит файл; None - срок не
+            назван, как у настоящего File без expiration_time
+        :type expires_in: float | None
+        """
+        self.name = name
+        self.uri = f"https://files.example/{name}"
+        self.mime_type = mime_type
+        self.state = types.SimpleNamespace(name=state)
+        self.expiration_time = None
+        if expires_in is not None:
+            self.expiration_time = datetime.datetime.now(
+                datetime.timezone.utc
+            ) + datetime.timedelta(seconds=expires_in)
+
+
+class _FakeFiles:
+    """
+    Подделка client.files: помнит, что лежит на стороне Google, и считает обращения.
+
+    Счет обращений тут не для красоты: главное свойство кэша выгрузок - не спрашивать
+    Files API попусту, а доказывается оно только счетчиком.
+    """
+
+    def __init__(self, gemini: "FakeGemini"):
+        """
+        :param gemini: общий держатель состояния подделки
+        :type gemini: FakeGemini
+        """
+        self.gemini = gemini
+
+    def get(self, name):
+        """
+        Отдает выгрузку, если она еще существует.
+
+        :param name: имя ресурса в Files API
+        :return: поддельный File
+        :rtype: FakeFile
+        :raises ApiError: если файла на стороне Google нет
+        """
+        self.gemini.file_gets.append(name)
+        remote = self.gemini.remote_files.get(name)
+        if remote is None:
+            raise ApiError.stale_file(name)
+        return remote
+
+    def upload(self, file):
+        """
+        Выгружает файл и запоминает его как существующий на стороне Google.
+
+        :param file: путь к файлу на диске
+        :return: поддельный File
+        :rtype: FakeFile
+        """
+        self.gemini.file_uploads.append(file)
+        remote = self.gemini.next_upload or FakeFile(
+            name=f"files/upload{len(self.gemini.file_uploads)}"
+        )
+        self.gemini.next_upload = None
+        self.gemini.remote_files[remote.name] = remote
+        return remote
 
 
 class _FakeResponse:
@@ -183,6 +273,7 @@ class _FakeClient:
         :type gemini: FakeGemini
         """
         self.models = _FakeModels(api_key, gemini)
+        self.files = _FakeFiles(gemini)
 
 
 class FakeGemini:
@@ -191,6 +282,9 @@ class FakeGemini:
 
     Сценарий на ключ - список шагов. Строка означает успешный ответ, исключение -
     ошибку с этой попытки.
+
+    Files API живет в тех же объектах: remote_files - то, что якобы лежит на стороне
+    Google, file_gets и file_uploads - обращения к нему.
     """
 
     def __init__(self):
@@ -200,6 +294,25 @@ class FakeGemini:
         self.models_used = []
         self.contents_sent = []
         self.built_for = []
+        # Что лежит в Files API: имя ресурса - объект FakeFile.
+        self.remote_files = {}
+        # Имена, о состоянии которых спрашивали, и пути, которые выгружали.
+        self.file_gets = []
+        self.file_uploads = []
+        # Чем ответить на следующую выгрузку, если тесту нужен особенный файл.
+        self.next_upload = None
+
+    def publish(self, remote: FakeFile) -> FakeFile:
+        """
+        Кладет готовый файл в Files API, минуя выгрузку.
+
+        :param remote: поддельный File
+        :type remote: FakeFile
+        :return: он же, чтобы тест мог сослаться на него дальше
+        :rtype: FakeFile
+        """
+        self.remote_files[remote.name] = remote
+        return remote
 
     def script(self, api_key: str, *steps):
         """
@@ -287,33 +400,31 @@ class _FakeUpdate:
 class _FakeContext:
     """Контекст обработчика с общими данными бота."""
 
-    def __init__(self, conn, args: list, runner: "CommandRunner"):
+    def __init__(self, args: list, runner: "CommandRunner"):
         """
-        :param conn: соединение с базой
         :param args: аргументы команды
         :type args: list
-        :param runner: оснастка команд
+        :param runner: оснастка команд - у нее же берутся база и настройки
         :type runner: CommandRunner
         """
         self.bot = _RecordingBot(runner)
         self.args = args
-        self.bot_data = {
-            "db_conn": conn,
-            "default_model": bot.MODEL,
-            "key_rpd_limit": bot.KEY_RPD_LIMIT,
-        }
+        self.bot_data = {"db_conn": runner.conn, "cfg": runner.cfg}
 
 
 class CommandRunner:
     """Гоняет обработчики команд на поддельном контексте Telegram."""
 
-    def __init__(self, conn, chat_id: int = CHAT_ONE):
+    def __init__(self, conn, cfg: config.Config, chat_id: int = CHAT_ONE):
         """
         :param conn: соединение с базой
+        :param cfg: настройки бота, которые обработчики найдут в bot_data
+        :type cfg: config.Config
         :param chat_id: чат, от имени которого идут команды
         :type chat_id: int
         """
         self.conn = conn
+        self.cfg = cfg
         self.chat_id = chat_id
         self.sent = []
         self.deleted = 0
@@ -329,23 +440,45 @@ class CommandRunner:
         """
         self.sent = []
         update = _FakeUpdate(self.chat_id, self)
-        context = _FakeContext(self.conn, list(args), self)
+        context = _FakeContext(list(args), self)
         asyncio.run(handler(update, context))
         return self.sent[-1][1] if self.sent else ""
 
 
+@pytest.fixture(name="cfg")
+def cfg_fixture(tmp_path):
+    """
+    Настройки тестового бота: своя база и свой каталог медиа на каждый тест.
+
+    Паузы между попытками укорочены до неразличимых: ждать настоящие две, четыре и
+    восемь секунд тесту незачем, а зависший сценарий должен падать быстро.
+
+    :param tmp_path: временная директория теста
+    :return: настройки, с которыми работают остальные фикстуры
+    :rtype: config.Config
+    """
+    return config.Config(
+        bot_token="123456:TEST",
+        db_file=str(tmp_path / "test.db"),
+        media_dir=str(tmp_path / "media"),
+        trigger_word="Карачур",
+        system_prompt="Тестовый системный промпт.",
+        model=MODEL,
+        max_retries=4,
+        retry_base_delay=0.01,
+        retry_max_delay=0.05,
+    )
+
+
 @pytest.fixture(name="db")
-def db_fixture(tmp_path, monkeypatch):
+def db_fixture(cfg):  # pylint: disable=redefined-outer-name
     """
     Свежая база со схемой бота, своя на каждый тест.
 
-    :param tmp_path: временная директория теста
-    :param monkeypatch: штатная подмена атрибутов pytest
+    :param cfg: настройки теста - из них берутся пути к базе и каталогу медиа
     :return: открытое соединение с базой
     """
-    monkeypatch.setattr(bot, "DB_FILE", str(tmp_path / "test.db"))
-    monkeypatch.setattr(bot, "MEDIA_DIR", str(tmp_path / "media"))
-    conn = bot.init_db()
+    conn = schema.init_db(cfg.db_file, cfg.media_dir)
     yield conn
     conn.close()
 
@@ -353,19 +486,39 @@ def db_fixture(tmp_path, monkeypatch):
 @pytest.fixture(name="gemini")
 def gemini_fixture(monkeypatch):
     """
-    Подменяет клиента Gemini подделкой и укорачивает паузы между попытками.
+    Подменяет клиента Gemini подделкой.
+
+    Подменяется именно атрибут модуля karachur.gemini.pool: и бот, и сам пул зовут
+    client_for_key через модуль, а не по импортированному имени, поэтому подмена
+    работает для всех, кто им пользуется. Если где-то появится
+    "from karachur.gemini.pool import client_for_key", это имя будет указывать на
+    настоящую функцию, подмена его не достанет, и тест молча уйдет в сеть.
 
     :param monkeypatch: штатная подмена атрибутов pytest
     :return: держатель сценариев ответов
     :rtype: FakeGemini
     """
     fake = FakeGemini()
-    monkeypatch.setattr(api_keys, "client_for_key", fake.client_for_key)
-    # Ждать настоящие паузы незачем, а зависший сценарий должен падать быстро.
-    monkeypatch.setattr(bot, "MAX_RETRIES", 4)
-    monkeypatch.setattr(bot, "RETRY_BASE_DELAY", 0.01)
-    monkeypatch.setattr(bot, "RETRY_MAX_DELAY", 0.05)
+    monkeypatch.setattr(key_pool, "client_for_key", fake.client_for_key)
     return fake
+
+
+@pytest.fixture(name="uploads_cache", autouse=True)
+def uploads_cache_fixture():
+    """
+    Держит кэш выгрузок Files API пустым на входе в каждый тест и на выходе из него.
+
+    Кэш - глобальный словарь модуля, и таким он и должен быть: его смысл в том, чтобы
+    переживать запросы. Но переживать чужие тесты он не должен, поэтому фикстура
+    автоматическая - иначе один тест, положивший туда выгрузку, менял бы поведение
+    соседнего.
+
+    :return: сам словарь кэша
+    :rtype: dict
+    """
+    files.uploaded_files.clear()
+    yield files.uploaded_files
+    files.uploaded_files.clear()
 
 
 @pytest.fixture(name="api_error")
@@ -412,7 +565,7 @@ def add_message_fixture(db):  # pylint: disable=redefined-outer-name
 
 
 @pytest.fixture(name="run_command")
-def run_command_fixture(db, monkeypatch):  # pylint: disable=redefined-outer-name
+def run_command_fixture(db, cfg, monkeypatch):  # pylint: disable=redefined-outer-name
     """
     Отдает оснастку для команд с подмененным списком моделей.
 
@@ -420,11 +573,10 @@ def run_command_fixture(db, monkeypatch):  # pylint: disable=redefined-outer-nam
     в сеть и не зависеть от того, что Google выкатил сегодня.
 
     :param db: соединение с базой
+    :param cfg: настройки теста - обработчики найдут их в bot_data
     :param monkeypatch: штатная подмена атрибутов pytest
     :return: оснастка запуска команд
     :rtype: CommandRunner
     """
-    monkeypatch.setattr(
-        commands, "list_models", lambda api_key: ["gemini-2.5-flash-lite", "gemini-3-pro"]
-    )
-    return CommandRunner(db)
+    monkeypatch.setattr(commands, "list_models", lambda api_key: [MODEL, OTHER_MODEL])
+    return CommandRunner(db, cfg)
