@@ -188,28 +188,80 @@ def attach_reply_targets(conn: sqlite3.Connection, chat_id: int, messages: list)
             msg["reply_target"] = targets.get(reply_to_id)
 
 
-def get_context(conn: sqlite3.Connection, chat_id: int) -> tuple[str | None, list]:
+def context_bound(
+    conn: sqlite3.Connection, chat_id: int, message_id: int
+) -> tuple | None:
+    """
+    Находит место сообщения в порядке истории, чтобы обрезать по нему контекст.
+
+    Возвращается пара, а не один message_id, потому что история сортируется по паре:
+    время у Telegram с точностью до секунды, и несколько сообщений сплошь и рядом делят
+    одну метку.
+
+    :param conn: соединение с базой данных
+    :type conn: sqlite3.Connection
+    :param chat_id: идентификатор чата
+    :type chat_id: int
+    :param message_id: идентификатор сообщения, по которое нужен контекст
+    :type message_id: int
+    :return: пара (время, message_id) или None, если такого сообщения в базе нет
+    :rtype: tuple | None
+    """
+    row = conn.execute(
+        "SELECT timestamp, message_id FROM messages WHERE chat_id = ? AND message_id = ?",
+        (chat_id, message_id),
+    ).fetchone()
+    return tuple(row) if row else None
+
+
+def get_context(
+    conn: sqlite3.Connection, chat_id: int, up_to_message_id: int | None = None
+) -> tuple[str | None, list]:
     """
     Получает контекст чата: пересказ старой части истории и сообщения после нее.
 
     Пока сжатия не было, пересказ пуст и возвращается вся история чата. Чужие чаты в
     контекст не попадают: у каждого своя история, свой пересказ и свои ключи.
 
+    Про верхнюю границу. Сообщения кладутся в базу сразу, не дожидаясь очереди на ответ,
+    - иначе история отставала бы от чата. А ответ с повторами тянется минутами, и запрос,
+    дождавшийся своей очереди, увидел бы в истории то, что написали уже после него: бот
+    отвечал бы на вопрос, подглядывая в будущее относительно этого вопроса. Поэтому
+    вызывающий называет свое сообщение, и все, что легло после него, в контекст не идет.
+    Граница ставится по той же паре, по какой история сортируется.
+
     :param conn: соединение с базой данных
     :type conn: sqlite3.Connection
     :param chat_id: идентификатор чата
     :type chat_id: int
+    :param up_to_message_id: по какое сообщение включительно нужен контекст; None -
+        вся несжатая история, как ее видно прямо сейчас
+    :type up_to_message_id: int | None
     :return: (текст пересказа или None, список словарей с информацией о сообщениях;
         у реплик-ответов в ключе "reply_target" лежит сообщение, которому они отвечают)
     :rtype: tuple[str | None, list]
     """
+    where = "chat_id = ? AND summarized = 0"
+    params = [chat_id]
+
+    bound = (
+        context_bound(conn, chat_id, up_to_message_id)
+        if up_to_message_id is not None
+        else None
+    )
+    if bound is not None:
+        where += " AND (timestamp, message_id) <= (?, ?)"
+        params.extend(bound)
+    # Границы может не быть: сообщения с таким номером в базе нет. Тогда отдаем всю
+    # историю - это ровно прежнее поведение, и оно точно не хуже пустого контекста.
+
     cursor = conn.cursor()
     cursor.execute(
-        """
-        SELECT * FROM messages WHERE chat_id = ? AND summarized = 0
+        f"""
+        SELECT * FROM messages WHERE {where}
         ORDER BY timestamp ASC, message_id ASC
     """,
-        (chat_id,),
+        params,
     )
     messages = db.fetch_dicts(cursor)
     attach_reply_targets(conn, chat_id, messages)

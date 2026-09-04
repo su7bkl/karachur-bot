@@ -117,7 +117,11 @@ async def answer_chat(
     """
     db_conn = context.bot_data["db_conn"]
     chat_id = message.chat_id
-    summary, context_messages = messages.get_context(db_conn, chat_id)
+    # По свое сообщение включительно: пока этот запрос ждал очереди и ответа модели, в
+    # чат могли написать еще, и эти реплики к заданному вопросу отношения не имеют.
+    summary, context_messages = messages.get_context(
+        db_conn, chat_id, up_to_message_id=message.message_id
+    )
 
     if transcribe_only:
         # Расшифровке чужая история не нужна - ни сообщения, ни пересказ.

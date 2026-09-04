@@ -157,3 +157,50 @@ def test_message_without_attachment_has_no_note(db, add_message):
 def test_copied_attachment_note_is_stripped():
     """Если модель скопирует пометку о вложении, она срезается."""
     assert notes.strip_service_prefixes("[Вложение: гифка] ответ") == "ответ"
+
+
+def test_context_stops_at_the_asking_message(db, add_message):
+    """
+    Запрос видит историю по свое сообщение, а не все, что накопилось потом.
+
+    Сообщения кладутся в базу сразу, не дожидаясь очереди на ответ, а ответ с повторами
+    тянется минутами. Без границы бот отвечал бы на вопрос, подглядывая в написанное
+    уже после этого вопроса.
+    """
+    add_message(CHAT_ONE, 1, "что было раньше")
+    add_message(CHAT_ONE, 2, "Карачур, вопрос")
+    add_message(CHAT_ONE, 3, "написали, пока бот думал")
+
+    _, context = messages.get_context(db, CHAT_ONE, up_to_message_id=2)
+
+    assert [msg["content"] for msg in context] == ["что было раньше", "Карачур, вопрос"]
+
+
+def test_bound_keeps_neighbours_of_the_same_second(db, add_message):
+    """
+    Сообщения с той же меткой времени отсекаются по номеру, а не заодно с ней.
+
+    Время у Telegram с точностью до секунды, поэтому соседи по секунде - обычное дело, и
+    граница обязана различать их. Оснастка выводит метку из номера, так что 5 и 65
+    делят одну секунду.
+    """
+    add_message(CHAT_ONE, 5, "спросили")
+    add_message(CHAT_ONE, 65, "в ту же секунду написали еще")
+
+    _, context = messages.get_context(db, CHAT_ONE, up_to_message_id=5)
+
+    assert [msg["content"] for msg in context] == ["спросили"]
+
+
+def test_unknown_bound_falls_back_to_the_whole_history(db, add_message):
+    """
+    Сообщения-границы нет в базе - отдаем всю историю, а не пустоту.
+
+    Пустой контекст означал бы отказ отвечать, а это хуже лишней реплики в запросе.
+    """
+    add_message(CHAT_ONE, 1, "первое")
+    add_message(CHAT_ONE, 2, "второе")
+
+    _, context = messages.get_context(db, CHAT_ONE, up_to_message_id=999)
+
+    assert [msg["content"] for msg in context] == ["первое", "второе"]
