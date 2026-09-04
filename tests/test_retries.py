@@ -4,6 +4,12 @@
 Каждый сценарий - это заранее расписанные ответы Gemini на каждый ключ. Проверяется не
 только итог, но и то, каким ключом бот ходил и пересобирал ли запрос: ссылки на
 выгруженные файлы принадлежат ключу, и после ротации запрос обязан собраться заново.
+
+Отдельная кучка тестов в конце - про рассказ наружу: цикл сообщает об этапах колбэком
+progress, и проверяется именно структура (номер попытки, пауза, вид ошибки), а не текст.
+Текста тут и не должно быть: во что этапы превратятся в чате, решает karachur.tg.status,
+и его тесты живут отдельно, в test_status.py. Колбэк необязателен, поэтому все остальные
+тесты файла заодно проверяют и второе обещание - без него все работает как раньше.
 """
 
 import asyncio
@@ -13,7 +19,7 @@ import time
 import pytest
 
 from conftest import CHAT_ONE, KEY_ONE, KEY_TWO, ApiError, FakeFile
-from karachur.gemini import compress, files
+from karachur.gemini import compress, errors, files, stages
 
 # Модуль зовется request_contents, а не contents: имя contents тут занято самими
 # собираемыми списками содержимого запроса - ровно как в karachur.gemini.answer.
@@ -38,9 +44,27 @@ def prepared_pool(conn, *keys, start_with=None, daily_limit=250, model="gemini-t
     return key_pool.KeyPool(conn, CHAT_ONE, model, daily_limit)
 
 
-def ask(cfg, pool, gemini):
+def ask(cfg, pool, gemini, progress=None):
     """Прогоняет запрос через цикл повторов. Модель берется из самого пула."""
-    return asyncio.run(retries.generate_with_retries(cfg, pool, gemini.make_contents))
+    return asyncio.run(
+        retries.generate_with_retries(cfg, pool, gemini.make_contents, progress)
+    )
+
+
+def stage_recorder():
+    """
+    Отдает колбэк этапов и список, куда он их складывает.
+
+    :return: (список этапов по порядку, сам колбэк)
+    :rtype: tuple[list, typing.Callable]
+    """
+    seen = []
+
+    async def record(stage):
+        """Запоминает этап вместо того, чтобы что-то с ним делать."""
+        seen.append(stage)
+
+    return seen, record
 
 
 def test_daily_quota_switches_key_and_rebuilds_request(cfg, db, gemini, api_error):
@@ -313,3 +337,116 @@ def test_small_context_is_left_alone(cfg, db, gemini, add_message):
     assert kept == context
     assert summary is None
     assert not gemini.calls
+
+
+def test_progress_tells_about_each_attempt_and_pause(cfg, db, gemini, api_error):
+    """
+    Наружу уходят и сам запрос, и повтор после него - с номером попытки и паузой.
+
+    Именно эти две цифры человек в чате и ждет: без них "бот думает" неотличимо от
+    "бот завис".
+    """
+    pool = prepared_pool(db, KEY_ONE, start_with=KEY_ONE)
+    gemini.script(KEY_ONE, api_error.rate_limit(), "получилось со второй")
+    seen, progress = stage_recorder()
+
+    ask(cfg, pool, gemini, progress)
+
+    assert [stage.name for stage in seen] == [
+        stages.ASKING,
+        stages.RETRY,
+        stages.ASKING,
+    ]
+    retry = seen[1]
+    assert (retry.number, retry.total) == (2, cfg.max_retries)
+    assert retry.delay > 0
+    # Причина уезжает константой, а не текстом: переводить ее на человеческий - работа
+    # слоя tg, и слой gemini в это не лезет.
+    assert retry.error_kind == errors.ERROR_KIND_RATE
+
+
+def test_progress_does_not_promise_a_pause_before_key_change(
+    cfg, db, gemini, api_error
+):
+    """
+    Смена выдохшегося ключа идет без паузы, и в этапе ее нет.
+
+    Обещать в чате ожидание, которого не будет, - тот же обман, что и молчание.
+    """
+    pool = prepared_pool(db, KEY_ONE, KEY_TWO, start_with=KEY_ONE)
+    gemini.script(KEY_ONE, api_error.daily_quota())
+    gemini.script(KEY_TWO, "ответ со второго ключа")
+    seen, progress = stage_recorder()
+
+    ask(cfg, pool, gemini, progress)
+
+    retry = next(stage for stage in seen if stage.name == stages.RETRY)
+    assert retry.delay is None
+    assert retry.error_kind == errors.ERROR_KIND_DAILY
+
+
+def test_progress_does_not_promise_an_attempt_that_never_comes(
+    cfg, db, gemini, api_error
+):
+    """
+    После последней попытки повтор не обещается: следующей не будет, будет ошибка.
+
+    Иначе заглушка застыла бы на "попытке 5 из 4", пока доставка не заменит ее текстом
+    отказа.
+    """
+    pool = prepared_pool(db, KEY_ONE, start_with=KEY_ONE)
+    gemini.script(KEY_ONE, *[api_error(500, "INTERNAL")] * cfg.max_retries)
+    seen, progress = stage_recorder()
+
+    with pytest.raises(retries.GeminiRetryError):
+        ask(cfg, pool, gemini, progress)
+
+    retries_reported = [stage for stage in seen if stage.name == stages.RETRY]
+    assert len(retries_reported) == cfg.max_retries - 1
+    assert seen[-1].name == stages.ASKING
+    assert max(stage.number for stage in retries_reported) == cfg.max_retries
+
+
+def test_progress_is_optional(cfg, db, gemini, api_error):
+    """
+    Без колбэка цикл работает ровно как раньше - ни лишних движений, ни падений.
+
+    Так его зовут тесты и любой не-телеграмный вызов, и добавление этапов их не касается.
+    """
+    pool = prepared_pool(db, KEY_ONE, start_with=KEY_ONE)
+    gemini.script(KEY_ONE, api_error.rate_limit(), "получилось со второй")
+
+    assert ask(cfg, pool, gemini) == "получилось со второй"
+    assert gemini.calls == [KEY_ONE, KEY_ONE]
+
+
+def test_progress_tells_about_compression_rounds(cfg, db, gemini, add_message):
+    """
+    Сжатие называет свой проход: это отдельный полноценный запрос к модели, и молчать
+    о нем - значит оставить человека без объяснения самой долгой части ожидания.
+
+    Заодно видно и соседние этапы: выгрузку вложений (build_history) и точный подсчет
+    токенов - оба ходят в сеть и оба идут до самого пересказа.
+    """
+    # Настройки замороженные, поэтому лимит не подменяется, а задается своей копией.
+    cfg = dataclasses.replace(cfg, max_context_tokens=1000)
+    for number in range(1, 16):
+        add_message(CHAT_ONE, number, f"сообщение номер {number} " + "текст " * 40)
+
+    pool = prepared_pool(db, KEY_ONE, start_with=KEY_ONE)
+    # Первый подсчет не влезает в лимит, после сжатия - влезает.
+    gemini.token_counts = [2000, 400]
+    gemini.script(KEY_ONE, "пересказ старой части")
+    seen, progress = stage_recorder()
+
+    _, context = messages.get_context(db, CHAT_ONE)
+    asyncio.run(
+        compress.compress_context(cfg, pool, db, CHAT_ONE, context, None, progress)
+    )
+
+    names = [stage.name for stage in seen]
+    assert names[:3] == [stages.ATTACHMENTS, stages.MEASURING, stages.COMPRESS]
+    round_stage = seen[2]
+    assert (round_stage.number, round_stage.total) == (1, cfg.max_compression_rounds)
+    # Пересказ - такой же запрос к модели, и о нем тоже рассказывают.
+    assert stages.ASKING in names

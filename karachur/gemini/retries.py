@@ -15,6 +15,12 @@ karachur.gemini.errors, состояние ключей ведет karachur.gemi
 которой в Files API уже нет. Ключ такая ошибка не тратит и не портит, зато требует двух
 вещей сразу: отправить кэш выгрузок на перепроверку (karachur.gemini.files) и заставить
 собрать запрос заново тем же ключом, иначе на следующем витке уйдут те же мертвые ссылки.
+
+Про свои витки цикл рассказывает наружу необязательным колбэком progress
+(karachur.gemini.stages): пятнадцать попыток с растущей паузой - это до восемнадцати
+минут тишины, и человеку в чате стоит знать, что бот все это время не спит, а ждет.
+Наружу уходит структура с номером попытки, паузой и видом ошибки; во что это
+превратится в чате, решает уже karachur.tg.status.
 """
 
 import asyncio
@@ -24,7 +30,7 @@ import re
 import typing
 
 from karachur import config
-from karachur.gemini import errors, files
+from karachur.gemini import errors, files, stages
 
 # Модуль зовется key_pool, а не pool: имя pool по всему коду занято самим пулом чата
 # (аргументы обработчиков, поле сессии), и модуль под тем же именем ими бы перекрывался.
@@ -54,10 +60,14 @@ class RetryPlan(typing.NamedTuple):
     :ivar wait_for: исключение, по которому считается пауза перед повтором; None -
         ждать нечего (ключ уже помечен негодным и на следующем витке сменится сам)
     :ivar rebuild_contents: собрать запрос заново, даже если ключ не менялся
+    :ivar error_kind: разобранный вид ошибки (errors.ERROR_KIND_*) - сам цикл им не
+        распоряжается, а передает наружу в этап повтора, чтобы человеку в чате написали
+        причину словами; None - ошибки не было вовсе (модель вернула пустой текст)
     """
 
     wait_for: Exception | None
     rebuild_contents: bool = False
+    error_kind: str | None = None
 
 
 def get_backoff_delay(
@@ -147,10 +157,10 @@ def handle_api_failure(
 
     if kind == errors.ERROR_KIND_DAILY:
         pool.mark_daily_exhausted(key)
-        return RetryPlan(None)
+        return RetryPlan(None, error_kind=kind)
     if kind == errors.ERROR_KIND_KEY:
         pool.mark_broken(key, exc)
-        return RetryPlan(None)
+        return RetryPlan(None, error_kind=kind)
 
     if kind == errors.ERROR_KIND_FILE:
         # Ключ ни при чем: протухла ссылка на выгрузку, и это наша беда, а не его.
@@ -167,14 +177,51 @@ def handle_api_failure(
         # если ошибка почему-то повторяется (например, выгрузка падает раз за разом),
         # без паузы цикл прожег бы все попытки за доли секунды - с паузой у него хотя бы
         # остается шанс, что временная беда успеет пройти.
-        return RetryPlan(exc, rebuild_contents=True)
+        return RetryPlan(exc, rebuild_contents=True, error_kind=kind)
 
     # Минутный лимит и временные сбои: ключ живой, надо просто подождать.
-    return RetryPlan(exc)
+    return RetryPlan(exc, error_kind=kind)
+
+
+async def wait_before_retry(
+    cfg: config.Config, plan: RetryPlan, attempt: int, progress: stages.Progress | None
+):
+    """
+    Выжидает паузу перед следующей попыткой и рассказывает о ней наружу.
+
+    Пауза и рассказ о ней - одно и то же событие с двух сторон: человеку в чате нужно
+    знать не только что бот повторит запрос, но и сколько он собирается ждать. Поэтому
+    и живут они вместе, а не порознь.
+
+    :param cfg: настройки бота - отсюда берется длина паузы
+    :type cfg: config.Config
+    :param plan: план витка: по нему считается пауза и берется причина повтора
+    :type plan: RetryPlan
+    :param attempt: номер только что провалившейся попытки
+    :type attempt: int
+    :param progress: кому рассказывать об этапах; None - рассказывать некому
+    :type progress: stages.Progress | None
+    """
+    delay = get_backoff_delay(
+        attempt, cfg.retry_base_delay, cfg.retry_max_delay, plan.wait_for
+    )
+    logger.info("Повтор через %.1f с.", delay)
+    # Номер называем у следующей попытки, а не у провалившейся: человек в чате ждет
+    # именно ее, и обратный счет идет тоже до нее.
+    await stages.report(
+        progress,
+        stages.Stage(
+            stages.RETRY, attempt + 1, cfg.max_retries, delay, plan.error_kind
+        ),
+    )
+    await asyncio.sleep(delay)
 
 
 async def generate_with_retries(
-    cfg: config.Config, pool: key_pool.KeyPool, make_contents
+    cfg: config.Config,
+    pool: key_pool.KeyPool,
+    make_contents,
+    progress: stages.Progress | None = None,
 ) -> str:
     """
     Запрашивает ответ у Gemini, повторяя попытки при сбоях и меняя выдохшиеся ключи.
@@ -197,6 +244,8 @@ async def generate_with_retries(
     :param pool: пул ключей чата, он же задает модель запроса
     :type pool: key_pool.KeyPool
     :param make_contents: корутина, собирающая содержимое запроса под переданный ключ
+    :param progress: кому рассказывать об этапах; None - рассказывать некому
+    :type progress: stages.Progress | None
     :return: текст ответа модели
     :rtype: str
     :raises GeminiRetryError: если попытки исчерпаны
@@ -217,6 +266,7 @@ async def generate_with_retries(
         # Пустой ответ разбирается ниже сам и в плане не нуждается: ключ живой, запрос
         # цел, ждать перед повтором нечего сверх обычной паузы.
         plan = RetryPlan(None)
+        await stages.report(progress, stages.Stage(stages.ASKING))
         try:
             # Вызов синхронный, уводим его в поток, чтобы не морозить event loop.
             response = await asyncio.to_thread(
@@ -256,16 +306,24 @@ async def generate_with_retries(
             # отправило бы ровно те же ссылки, на которых мы только что споткнулись.
             contents = None
 
+        if attempt >= cfg.max_retries:
+            # Это была последняя попытка: ни ждать, ни обещать следующую уже незачем.
+            break
+
         # Ключ уже помечен негодным - ждать нечего, следующий виток возьмет другой.
         if not pool.is_usable(key, ignore_local_limit=True):
+            await stages.report(
+                progress,
+                stages.Stage(
+                    stages.RETRY,
+                    attempt + 1,
+                    cfg.max_retries,
+                    error_kind=plan.error_kind,
+                ),
+            )
             continue
 
-        if attempt < cfg.max_retries:
-            delay = get_backoff_delay(
-                attempt, cfg.retry_base_delay, cfg.retry_max_delay, plan.wait_for
-            )
-            logger.info("Повтор через %.1f с.", delay)
-            await asyncio.sleep(delay)
+        await wait_before_retry(cfg, plan, attempt, progress)
 
     raise GeminiRetryError(
         f"Не удалось получить ответ за {cfg.max_retries} попыток. "

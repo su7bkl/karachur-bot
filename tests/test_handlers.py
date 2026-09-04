@@ -19,6 +19,12 @@ key_pool.NoUsableKeys и retries.GeminiRetryError - ожидаемые исхо�
 только запись в базу (save_message_to_db) подменяется по образцу test_delivery.py -
 самим текстам это не мешает, а разбирать полноценный объект telegram.Message тестам
 незачем.
+
+Вторая половина файла - про живую заглушку: сюда доходит то, что слой gemini рассказал о
+себе колбэком progress. Сам механизм правки разобран в test_status.py, здесь проверяется
+только проводка - что колбэк вообще доехал до заглушки и что беда с ним не стоила ответа.
+Этапов на такой тест хватает одного: между правками выдерживается промежуток в три
+секунды, и второй этап того же ответа в чат уже не пойдет.
 """
 
 # Подделка повторяет форму настоящего telegram.Message: отсюда parse_mode в сигнатуре,
@@ -29,10 +35,12 @@ import asyncio
 import logging
 from types import SimpleNamespace
 
+from telegram.error import TelegramError
+
 from conftest import CHAT_ONE
 
 from karachur.gemini import pool as key_pool
-from karachur.gemini import retries
+from karachur.gemini import retries, stages
 from karachur.tg import delivery, handlers
 
 
@@ -165,3 +173,94 @@ def test_unexpected_error_full_text_goes_to_log(cfg, db, monkeypatch, caplog):
     exception_records = [r for r in caplog.records if r.exc_info]
     assert exception_records, "стек ошибки не попал в лог через logger.exception"
     assert str(exception_records[0].exc_info[1]) == secret
+
+
+class _UneditableMessage(_FakeMessage):
+    """Сообщение, у которого Telegram отбивает любую правку."""
+
+    def __init__(self, chat_id: int):
+        super().__init__(chat_id)
+        self.deleted = False
+
+    async def edit_text(self, text, parse_mode=None):
+        """Как настоящий edit_text на удаленном сообщении - отказом."""
+        raise TelegramError("сообщение для правки не найдено")
+
+    async def delete(self):
+        """Заглушку, которую не вышло исправить, доставка убирает из чата."""
+        self.deleted = True
+
+
+def _run_with_stages(cfg, db, monkeypatch, message, *reported, transcribe_only=False):
+    """
+    Гоняет answer_chat с подменой, которая по дороге сообщает об этапах.
+
+    :param message: подделка сообщения, на которое отвечаем
+    :param reported: этапы, о которых подмена расскажет через progress
+    :param transcribe_only: гоним ли ветку расшифровки голосового
+    """
+
+    async def _fake_generate(*_args, progress=None, **_kwargs):
+        """Вместо разговора с моделью рассказывает об этапах и отдает готовый текст."""
+        for stage in reported:
+            await stages.report(progress, stage)
+        return "готовый ответ"
+
+    monkeypatch.setattr(handlers.answer, "generate_gemini_response", _fake_generate)
+    monkeypatch.setattr(
+        handlers.messages, "save_message_to_db", lambda *a, **k: (None, None, None)
+    )
+
+    context = SimpleNamespace(bot_data={"db_conn": db})
+    asyncio.run(handlers.answer_chat(cfg, context, message, transcribe_only))
+
+
+def test_stage_reaches_the_placeholder(cfg, db, monkeypatch):
+    """
+    Этап, о котором сообщил слой gemini, виден в заглушке до прихода ответа.
+
+    Ради этого все и затевалось: между заглушкой и ответом могут пройти минуты, и все
+    это время человеку нужно видеть, что бот занят делом, а не завис.
+    """
+    message = _FakeMessage(CHAT_ONE)
+
+    _run_with_stages(cfg, db, monkeypatch, message, stages.Stage(stages.CONTEXT))
+
+    assert message.sent == [
+        delivery.GENERATING_PLACEHOLDER,
+        "⏳ Собираю контекст чата...",
+        "готовый ответ",
+    ]
+
+
+def test_transcription_says_so_in_the_placeholder(cfg, db, monkeypatch):
+    """
+    Расшифровка голосового называет себя сама: слой gemini о ней знать не может.
+
+    Для него это такой же запрос, как всякий другой, и отличить его можно только здесь,
+    по transcribe_only.
+    """
+    message = _FakeMessage(CHAT_ONE)
+
+    _run_with_stages(cfg, db, monkeypatch, message, transcribe_only=True)
+
+    assert message.sent == [
+        delivery.GENERATING_PLACEHOLDER,
+        "⏳ Расшифровываю голосовое...",
+        "готовый ответ",
+    ]
+
+
+def test_broken_status_does_not_cost_the_answer(cfg, db, monkeypatch):
+    """
+    Заглушку, которую нельзя править, статус переживает молча - ответ доходит до чата.
+
+    Человеку нужен ответ, а не красивый статус: если заглушку удалили или чат закрыли,
+    доставка убирает ее и отвечает обычным сообщением, как и без всякого статуса.
+    """
+    message = _UneditableMessage(CHAT_ONE)
+
+    _run_with_stages(cfg, db, monkeypatch, message, stages.Stage(stages.ASKING))
+
+    assert message.sent[-1] == "готовый ответ"
+    assert message.deleted

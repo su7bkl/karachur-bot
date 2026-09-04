@@ -10,6 +10,11 @@
 боту ответить. Не посчитались токены, не вышел пересказ - контекст уходит как есть, и
 дальше с ним разбирается обычный механизм повторов.
 
+Сжатие - самая незаметная часть долгого ожидания: снаружи оно ничем не отличается от
+обычного запроса, а стоит целого разговора с моделью, да еще и с повторами. Поэтому и
+проход сжатия, и подсчет токенов, и выгрузка вложений сообщаются наружу колбэком progress
+(karachur.gemini.stages) - человек в чате видит, что бот занят делом.
+
 Размер контекста меряется двумя разными способами, и это не дублирование. Дешевая
 прикидка по длине текста стоит на входе: обычный чат до лимита не дотягивает, и платить
 за это лишним запросом к API незачем. Внутри цикла считает уже токенайзер - ошибись там
@@ -32,7 +37,7 @@ from karachur.gemini import contents as request_contents
 # Ровно та же история с пулом: имя pool по всему коду занято самим пулом чата
 # (аргументы обработчиков, поле сессии), и модуль под тем же именем ими бы перекрывался.
 from karachur.gemini import pool as key_pool
-from karachur.gemini import retries
+from karachur.gemini import retries, stages
 from karachur.storage import summaries
 
 logger = logging.getLogger(__name__)
@@ -162,6 +167,7 @@ async def summarize_history(
     pool: key_pool.KeyPool,
     context_messages: list,
     previous_summary: str | None,
+    progress: stages.Progress | None = None,
 ) -> str:
     """
     Просит модель пересказать кусок истории одним текстом.
@@ -177,6 +183,8 @@ async def summarize_history(
     :type context_messages: list
     :param previous_summary: прошлый пересказ или None, если сжимаем впервые
     :type previous_summary: str | None
+    :param progress: кому рассказывать об этапах; None - рассказывать некому
+    :type progress: stages.Progress | None
     :return: текст нового пересказа
     :rtype: str
     :raises retries.GeminiRetryError: если модель так и не ответила
@@ -184,6 +192,9 @@ async def summarize_history(
 
     async def make_contents(key: dict) -> list:
         """Собирает запрос на пересказ под конкретный ключ."""
+        # Про выгрузку вложений говорим до, а не внутри: build_history крутится в
+        # отдельном потоке, и await оттуда недоступен.
+        await stages.report(progress, stages.Stage(stages.ATTACHMENTS))
         entries = await asyncio.to_thread(
             request_contents.build_history, key, context_messages, cfg.media_dir
         )
@@ -218,7 +229,9 @@ async def summarize_history(
     logger.info(
         "Сжимаем %d самых старых сообщений в пересказ...", len(context_messages)
     )
-    return (await retries.generate_with_retries(cfg, pool, make_contents)).strip()
+    return (
+        await retries.generate_with_retries(cfg, pool, make_contents, progress)
+    ).strip()
 
 
 async def compress_context(  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -228,6 +241,7 @@ async def compress_context(  # pylint: disable=too-many-arguments,too-many-posit
     chat_id: int,
     context_messages: list,
     summary: str | None,
+    progress: stages.Progress | None = None,
 ) -> tuple[list, str | None]:
     """
     Ужимает контекст чата до лимита и возвращает то, что в него уложилось.
@@ -253,10 +267,15 @@ async def compress_context(  # pylint: disable=too-many-arguments,too-many-posit
     :type context_messages: list
     :param summary: пересказ сжатой ранее части истории или None
     :type summary: str | None
+    :param progress: кому рассказывать об этапах; None - рассказывать некому
+    :type progress: stages.Progress | None
     :return: (оставшиеся дословно сообщения, актуальный пересказ)
     :rtype: tuple[list, str | None]
     """
     key = pool.active()
+    # Про выгрузку вложений говорим до сборки, а не внутри нее: build_history уходит в
+    # отдельный поток, и await оттуда недоступен.
+    await stages.report(progress, stages.Stage(stages.ATTACHMENTS))
     history = await asyncio.to_thread(
         request_contents.build_history, key, context_messages, cfg.media_dir
     )
@@ -269,16 +288,18 @@ async def compress_context(  # pylint: disable=too-many-arguments,too-many-posit
     ):
         return context_messages, summary
 
-    for _ in range(cfg.max_compression_rounds):
+    for round_number in range(1, cfg.max_compression_rounds + 1):
         # Пересказ мог упереться в квоту и сменить ключ: ссылки на выгруженные файлы
         # принадлежат прежнему ключу, поэтому историю приходится пересобрать.
         current_key = pool.active()
         if current_key["id"] != key["id"]:
             key = current_key
+            await stages.report(progress, stages.Stage(stages.ATTACHMENTS))
             history = await asyncio.to_thread(
                 request_contents.build_history, key, context_messages, cfg.media_dir
             )
 
+        await stages.report(progress, stages.Stage(stages.MEASURING))
         total_tokens = await count_context_tokens(
             pool,
             key,
@@ -307,8 +328,12 @@ async def compress_context(  # pylint: disable=too-many-arguments,too-many-posit
             cfg.max_context_tokens,
         )
         compressed = [entry["source"] for entry in history[:cut]]
+        await stages.report(
+            progress,
+            stages.Stage(stages.COMPRESS, round_number, cfg.max_compression_rounds),
+        )
         try:
-            summary = await summarize_history(cfg, pool, compressed, summary)
+            summary = await summarize_history(cfg, pool, compressed, summary, progress)
         except retries.GeminiRetryError as e:
             logger.error("Не удалось сжать контекст, отправляем как есть: %s", e)
             return context_messages, summary

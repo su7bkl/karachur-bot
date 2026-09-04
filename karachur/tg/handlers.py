@@ -21,6 +21,12 @@ delivery. Сам модуль не решает ни одной из этих з
 скачивается вовсе. Сообщение при этом сохраняется как обычно - пропадает только файл,
 которому все равно нечего делать в запросе к модели.
 
+Четвертое: заглушка на время генерации не молчит. Ответ может собираться минутами, и
+все это время слой gemini рассказывает о своих этапах колбэком progress - им же и
+работает объект karachur.tg.status.StatusMessage, заведенный тут же, поверх заглушки.
+Ошибка внутри него до ответа не доходит (см. karachur.gemini.stages.report): статус -
+украшение, ответ - работа.
+
 Настройки обработчики берут из context.bot_data: сигнатуру задает telegram.ext, передать
 в нее что-то свое нельзя, а bot_data - штатное место для общих данных бота.
 """
@@ -39,11 +45,11 @@ from karachur.gemini import answer
 # Модуль зовется key_pool, а не pool: имя pool по всему коду занято самим пулом чата
 # (аргументы обработчиков, поле сессии), и модуль под тем же именем ими бы перекрывался.
 from karachur.gemini import pool as key_pool
-from karachur.gemini import retries
+from karachur.gemini import retries, stages
 from karachur.media import paths, policy
 from karachur.session import ChatSession
 from karachur.storage import messages
-from karachur.tg import delivery
+from karachur.tg import delivery, status
 
 logger = logging.getLogger(__name__)
 
@@ -129,11 +135,17 @@ async def answer_chat(
     pool = ChatSession.create(cfg, db_conn, chat_id).pool
 
     placeholder = await delivery.send_placeholder(message)
+    # Заглушка дальше живет сама: слой gemini сообщает ей об этапах, она их показывает.
+    live_status = status.StatusMessage(placeholder)
+    if transcribe_only:
+        # Единственный этап, о котором слой gemini знать не может: расшифровка для него
+        # такой же запрос, как всякий другой, а разница видна только отсюда.
+        await stages.report(live_status, stages.Stage(stages.TRANSCRIBE))
     err = False
 
     try:
         response_text = await answer.generate_gemini_response(
-            cfg, pool, db_conn, chat_id, context_messages, summary
+            cfg, pool, db_conn, chat_id, context_messages, summary, progress=live_status
         )
     except key_pool.NoUsableKeys as e:
         # Не поломка, а исчерпанный пул: человеку нужен не трейсбек, а что делать дальше.
@@ -159,6 +171,10 @@ async def answer_chat(
         logger.exception("Непредвиденная ошибка при ответе чату %s.", chat_id)
         response_text = "Не могу ответить: внутренняя ошибка бота, подробности в логе."
         err = True
+
+    # Гасим отложенную правку статуса до отправки ответа: проснувшись после нее, она
+    # переписала бы готовый ответ обратно в служебную строку.
+    live_status.close()
 
     await delivery.deliver_response(db_conn, message, placeholder, response_text, err)
 
