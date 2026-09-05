@@ -201,8 +201,11 @@ async def keys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # /keys не пометил бы активным никого.
         active_id = pool.active()["id"]
     except key_pool.NoUsableKeys:
-        # Все ключи выбыли - помечать активным нечего.
-        active_id = None
+        # Все ключи выбыли на этой модели, и выбирать active() не из чего. Но показать,
+        # на чем чат остановился, все равно надо: /keys открывают именно в такой момент,
+        # и список без единой пометки читается как "бот забыл, чем работал". Записанный
+        # указатель никуда не делся - его и берем.
+        active_id = pool.active_key_id()
 
     lines = [
         describe_key(key, index, active_id, pool.daily_limit)

@@ -37,6 +37,11 @@ def save_message_to_db(
     Скачивание и перекодирование идут потом и дописывают в ту же строку путь к файлу
     (см. set_media_path).
 
+    Правка сообщения приходит сюда повторным сохранением той же пары (chat_id,
+    message_id) и обновляет строку, а не подменяет ее целиком: пометка summarized
+    относится не к сообщению, а к сжатию истории, и правка текста сбрасывать ее не
+    должна.
+
     :param conn: соединение с базой данных
     :type conn: sqlite3.Connection
     :param message: объект сообщения Telegram
@@ -83,13 +88,40 @@ def save_message_to_db(
     else:
         user_prompt = "Bot"
 
+    # Правка сообщения приходит сюда вторым сохранением той же пары (chat_id, message_id),
+    # и раньше тут стоял INSERT OR REPLACE. Он не обновляет строку, а сносит ее и кладет
+    # новую, поэтому все колонки, которых нет в списке ниже, возвращались к значениям по
+    # умолчанию - в том числе summarized. А это не свойство сообщения, а бухгалтерия
+    # сжатия: сообщение, уже ушедшее в пересказ, помечено единицей и в контекст больше не
+    # попадает. Обнулившись, оно возвращалось в контекст дословно - и оставалось там
+    # вместе со своим же пересказом, то есть правка одной старой реплики молча
+    # раскручивала сжатие назад. Поэтому обновляем поименно то, что действительно
+    # пришло из Telegram, а бухгалтерию не трогаем.
     cursor.execute(
         """
-        INSERT OR REPLACE INTO messages (
+        INSERT INTO messages (
             message_id, chat_id, user_id, username, content, media_type,
             mime_type, file_id, file_name, timestamp, reply_to_message_id,
             quote_text, forward_origin, is_bot
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id, message_id) DO UPDATE SET
+            user_id = excluded.user_id,
+            username = excluded.username,
+            content = excluded.content,
+            media_type = excluded.media_type,
+            mime_type = excluded.mime_type,
+            file_id = excluded.file_id,
+            file_name = excluded.file_name,
+            timestamp = excluded.timestamp,
+            reply_to_message_id = excluded.reply_to_message_id,
+            quote_text = excluded.quote_text,
+            forward_origin = excluded.forward_origin,
+            is_bot = excluded.is_bot,
+            -- Путь к перекодированному файлу идет в паре с mime_type, который мы только
+            -- что перезаписали телеграмным. Разъехаться им нельзя (получился бы pdf на
+            -- диске под mime докса), поэтому сбрасываем: обработчик сразу за этим заново
+            -- скачает вложение и проставит обе колонки через set_media_path.
+            media_path = NULL
     """,
         (
             message.message_id,

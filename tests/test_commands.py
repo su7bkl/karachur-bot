@@ -196,6 +196,18 @@ def test_model_without_a_key_is_still_settable(run_command, db):
     assert settings.get_model(db, CHAT_ONE, "запасная") == "gemini-3-pro"
 
 
+def test_key_list_marks_the_active_key_on_the_exhausted_model(run_command, db):
+    """С выбранной квотой /keys все равно показывает, на чем чат остановился."""
+    run_command.run(commands.add_key_command, KEY_ONE)
+    pool = key_pool.KeyPool(db, CHAT_ONE, MODEL, 250)
+    pool.mark_daily_exhausted(pool.active())
+
+    answer = run_command.run(commands.keys_command)
+
+    assert "активный" in answer
+    assert "квота на эту модель выбрана" in answer
+
+
 def test_model_list_survives_the_exhausted_model(run_command, db):
     """Список моделей виден и тогда, когда на текущей модели квота выбрана.
 

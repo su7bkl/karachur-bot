@@ -6,7 +6,9 @@
 разговоры или затирает чужие сообщения.
 """
 
+import datetime
 import sqlite3
+import types
 
 import pytest
 
@@ -204,3 +206,87 @@ def test_unknown_bound_falls_back_to_the_whole_history(db, add_message):
     _, context = messages.get_context(db, CHAT_ONE, up_to_message_id=999)
 
     assert [msg["content"] for msg in context] == ["первое", "второе"]
+
+
+class _TelegramMessage:
+    """
+    Сообщение Telegram в объеме, который читает save_message_to_db.
+
+    Настоящий telegram.Message для этого не собрать: у него нужны и Bot, и полный набор
+    полей вложений. Здесь хватает того, что обработчик действительно спрашивает, - и
+    edit_date, по которому видно, что это правка уже отправленного сообщения.
+    """
+
+    # Поля вложений перечислены пустыми: extract_attachment перебирает их все подряд.
+    photo = sticker = animation = video = video_note = voice = audio = document = None
+    caption = None
+    reply_to_message = None
+    quote = None
+    forward_origin = None
+
+    def __init__(self, chat_id: int, message_id: int, text: str, edited: bool = False):
+        """
+        :param chat_id: идентификатор чата
+        :type chat_id: int
+        :param message_id: номер сообщения в чате
+        :type message_id: int
+        :param text: текст реплики
+        :type text: str
+        :param edited: это правка ранее отправленного сообщения
+        :type edited: bool
+        """
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.text = text
+        self.date = datetime.datetime(2026, 8, 15, 10, 0, 0)
+        self.edit_date = (
+            datetime.datetime(2026, 8, 15, 10, 5, 0) if edited else None
+        )
+        self.from_user = types.SimpleNamespace(
+            id=1, full_name="tester", username="tester"
+        )
+
+
+def test_edit_does_not_undo_compression(db):
+    """
+    Правка сжатого сообщения не возвращает его в контекст.
+
+    Пометка summarized - бухгалтерия сжатия, а не свойство самого сообщения: сброси ее,
+    и реплика поедет в запрос дословно, оставаясь при этом в пересказе. Правка одной
+    старой реплики так молча раскручивала сжатие назад.
+    """
+    messages.save_message_to_db(db, _TelegramMessage(CHAT_ONE, 1, "старое"))
+    messages.save_message_to_db(db, _TelegramMessage(CHAT_ONE, 2, "свежее"))
+    summaries.save_summary(db, CHAT_ONE, "пересказ старого", [1])
+
+    messages.save_message_to_db(
+        db, _TelegramMessage(CHAT_ONE, 1, "старое (исправлено)", edited=True)
+    )
+
+    summary, context = messages.get_context(db, CHAT_ONE)
+
+    assert summary == "пересказ старого"
+    assert [msg["content"] for msg in context] == ["свежее"]
+
+
+def test_edit_updates_the_text(db):
+    """Правка все-таки доезжает до базы - обновляется то, что и должно."""
+    messages.save_message_to_db(db, _TelegramMessage(CHAT_ONE, 1, "как было"))
+    messages.save_message_to_db(
+        db, _TelegramMessage(CHAT_ONE, 1, "как стало", edited=True)
+    )
+
+    _, context = messages.get_context(db, CHAT_ONE)
+
+    assert [msg["content"] for msg in context] == ["как стало"]
+
+
+def test_edit_does_not_duplicate_the_message(db):
+    """Повторное сохранение той же пары (чат, номер) не плодит строк."""
+    messages.save_message_to_db(db, _TelegramMessage(CHAT_ONE, 1, "как было"))
+    messages.save_message_to_db(
+        db, _TelegramMessage(CHAT_ONE, 1, "как стало", edited=True)
+    )
+
+    stored = db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    assert stored == 1
