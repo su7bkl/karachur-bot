@@ -5,7 +5,7 @@
 /addkey: команда доступна всем участникам, и ключ не должен оставаться в истории.
 """
 
-from conftest import CHAT_ONE, KEY_ONE, KEY_TWO, MODEL, SHARED_KEY
+from conftest import CHAT_ONE, KEY_ONE, KEY_TWO, MODEL, OTHER_MODEL, SHARED_KEY
 
 # Модуль зовется key_pool, а не pool: имя pool в тестах занято самим пулом чата.
 from karachur.gemini import pool as key_pool
@@ -194,6 +194,61 @@ def test_model_without_a_key_is_still_settable(run_command, db):
 
     run_command.run(commands.model_command, "gemini-3-pro")
     assert settings.get_model(db, CHAT_ONE, "запасная") == "gemini-3-pro"
+
+
+def test_model_list_survives_the_exhausted_model(run_command, db):
+    """Список моделей виден и тогда, когда на текущей модели квота выбрана.
+
+    Это единственный выход из тупика: квота считается на пару "ключ и модель", и уйти
+    на модель со своей квотой человек хочет именно в тот момент, когда текущая уже
+    исчерпана. Пока список брали активным ключом, /model в этот момент замолкал, и имя
+    модели оставалось задавать вслепую.
+    """
+    run_command.run(commands.add_key_command, KEY_ONE)
+    pool = key_pool.KeyPool(db, CHAT_ONE, MODEL, 250)
+    pool.mark_daily_exhausted(pool.active())
+
+    answer = run_command.run(commands.model_command)
+
+    assert "получить не удалось" not in answer
+    assert OTHER_MODEL in answer
+
+
+def test_model_switch_is_checked_on_the_exhausted_model(run_command, db):
+    """На исчерпанной модели имя новой модели по-прежнему проверяется."""
+    run_command.run(commands.add_key_command, KEY_ONE)
+    pool = key_pool.KeyPool(db, CHAT_ONE, MODEL, 250)
+    pool.mark_daily_exhausted(pool.active())
+
+    answer = run_command.run(commands.model_command, "gemini-выдуманная")
+
+    assert "нет среди доступных" in answer
+    # Своей модели у чата так и не появилось - остался конфиг.
+    assert settings.get_model(db, CHAT_ONE, MODEL) == MODEL
+
+
+def test_model_list_is_asked_of_the_next_key(run_command, monkeypatch):
+    """Отказ одного ключа не лишает чат списка: спрашиваем следующий."""
+    run_command.run(commands.add_key_command, KEY_ONE)
+    run_command.run(commands.add_key_command, KEY_TWO)
+
+    def answer_only_for_the_second(api_key):
+        if api_key == KEY_ONE:
+            raise RuntimeError("403 PERMISSION_DENIED")
+        return [MODEL, OTHER_MODEL]
+
+    monkeypatch.setattr(commands, "list_models", answer_only_for_the_second)
+
+    assert OTHER_MODEL in run_command.run(commands.model_command)
+
+
+def test_model_list_needs_a_key_that_api_has_not_rejected(run_command, db):
+    """Отвергнутым ключом за списком не ходим - спросить некого."""
+    run_command.run(commands.add_key_command, KEY_ONE)
+    pool = key_pool.KeyPool(db, CHAT_ONE, MODEL, 250)
+    pool.mark_broken(pool.active(), "403 PERMISSION_DENIED: API key expired")
+
+    assert "получить не удалось" in run_command.run(commands.model_command)
 
 
 def test_help_lists_every_command(run_command):

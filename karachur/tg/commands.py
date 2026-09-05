@@ -413,7 +413,13 @@ async def _available_models(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int
 ) -> list[str] | None:
     """
-    Возвращает список моделей, доступных активному ключу чата.
+    Возвращает список моделей, доступных ключам чата.
+
+    Спрашиваем любым не отвергнутым ключом, а не active(): список моделей дневную
+    квоту не тратит и от модели чата не зависит вовсе, а active() как раз на
+    исчерпанной модели не отдает ничего - и список оказывался недоступен ровно тогда,
+    когда он нужен, чтобы уйти на модель со своей квотой. Ключи перебираем по очереди:
+    отказать может и тот, которого мы еще не считаем отвергнутым.
 
     :param context: контекст обработчика
     :type context: ContextTypes.DEFAULT_TYPE
@@ -422,18 +428,23 @@ async def _available_models(
     :return: имена моделей или None, если спросить не у кого или не вышло
     :rtype: list[str] | None
     """
-    pool = _pool(context, chat_id)
-    try:
-        key = pool.active()
-    except key_pool.NoUsableKeys as e:
-        logger.info("Список моделей для чата %s недоступен: %s", chat_id, e)
+    keys = _pool(context, chat_id).live_keys()
+    if not keys:
+        logger.info(
+            "Список моделей для чата %s недоступен: живых ключей у чата нет.", chat_id
+        )
         return None
 
-    try:
-        return await asyncio.to_thread(list_models, key["api_key"])
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        logger.warning("Не удалось получить список моделей: %s", e)
-        return None
+    for key in keys:
+        try:
+            return await asyncio.to_thread(list_models, key["api_key"])
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "Ключ %s не отдал список моделей: %s",
+                key_store.mask_key(key["api_key"]),
+                e,
+            )
+    return None
 
 
 async def _describe_models(
