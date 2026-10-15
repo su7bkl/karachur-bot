@@ -110,6 +110,13 @@ def _build_media_part(
     if uploaded is None:
         return genai.types.Part(text="[Ошибка обработки файла - не удалось активировать]")
 
+    logger.info(
+        "Gemini media path=%s bytes=%s expected_mime=%s uploaded_mime=%s uri=%s",
+        media_path, file_size, mime_type, uploaded.mime_type, uploaded.uri,
+    )
+    if uploaded.mime_type != mime_type:
+        logger.warning("Gemini media MIME mismatch path=%s: %s -> %s",
+                       media_path, mime_type, uploaded.mime_type)
     return genai.types.Part(
         file_data=genai.types.FileData(
             file_uri=uploaded.uri, mime_type=uploaded.mime_type
@@ -156,6 +163,8 @@ def build_message_parts(
         )
         media_path = os.path.abspath(raw_path) if raw_path else None
         if media_path and os.path.exists(media_path):
+            logger.info("Gemini attachment message_id=%s path=%s mime=%s",
+                        msg.get("message_id"), media_path, msg["mime_type"])
             try:
                 parts.append(
                     _build_media_part(client, api_key, media_path, msg["mime_type"])
@@ -175,6 +184,9 @@ def build_message_parts(
                     media_path,
                     e,
                 )
+        else:
+            logger.warning("Gemini attachment missing message_id=%s path=%s mime=%s",
+                           msg.get("message_id"), media_path, msg["mime_type"])
     return parts
 
 

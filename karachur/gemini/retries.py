@@ -28,9 +28,11 @@ import logging
 import random
 import re
 import typing
+import time
+import uuid
 
 from karachur import config
-from karachur.gemini import errors, files, stages
+from karachur.gemini import diagnostics, errors, files, stages
 
 # Модуль зовется key_pool, а не pool: имя pool по всему коду занято самим пулом чата
 # (аргументы обработчиков, поле сессии), и модуль под тем же именем ими бы перекрывался.
@@ -254,6 +256,7 @@ async def generate_with_retries(
     last_reason = "причина неизвестна"
     contents = None
     contents_key_id = None
+    request_id = uuid.uuid4().hex[:12]
 
     for attempt in range(1, cfg.max_retries + 1):
         key = pool.active()
@@ -267,6 +270,12 @@ async def generate_with_retries(
         # цел, ждать перед повтором нечего сверх обычной паузы.
         plan = RetryPlan(None)
         await stages.report(progress, stages.Stage(stages.ASKING))
+        logger.info(
+            "Gemini request=%s chat=%s model=%s key_id=%s attempt=%s: %s",
+            request_id, pool.chat_id, pool.model, key["id"], attempt,
+            diagnostics.describe_contents(contents),
+        )
+        started = time.monotonic()
         try:
             # Вызов синхронный, уводим его в поток, чтобы не морозить event loop.
             response = await asyncio.to_thread(
@@ -275,9 +284,22 @@ async def generate_with_retries(
                 contents=contents,
             )
         except Exception as e:  # pylint: disable=broad-exception-caught
+            response = getattr(e, "response", None)
+            headers = getattr(response, "headers", {}) or {}
+            logger.error(
+                "Gemini request=%s failed elapsed=%.2fs exception=%s code=%s "
+                "status=%s request_headers=%s",
+                request_id, time.monotonic() - started, type(e).__name__,
+                errors.get_error_code(e), getattr(e, "status", None),
+                {name: headers[name] for name in
+                 ("x-request-id", "x-goog-request-id", "content-type")
+                 if name in headers},
+            )
             last_reason = f"ошибка API {errors.get_error_code(e)}: {e}"
             plan = handle_api_failure(pool, key, e, attempt, cfg.max_retries)
         else:
+            logger.info("Gemini request=%s completed elapsed=%.2fs",
+                        request_id, time.monotonic() - started)
             pool.note_request(key)
             text, reason, can_retry = extract_response_text(response)
             if text:

@@ -35,6 +35,8 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+# INFO у httpx содержит Telegram URL с токеном бота.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # --- ТОЧКА ВХОДА ---
 
