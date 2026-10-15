@@ -24,7 +24,9 @@
 шансы, но не должно ломать работу бота.
 """
 
+import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -38,6 +40,9 @@ CONVERSION_TIMEOUT = 180
 
 # H.264 не умеет нечетные стороны, а Telegram присылает и 489x512. Округляем вниз.
 EVEN_SIDES = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+# Обход отказа Gemini на валидных видео-стикерах из нескольких кадров.
+# Это выбранная нами защитная длительность, а не документированный лимит API.
+MIN_VIDEO_DURATION = 2.0
 
 # Видео пересобираем целиком: именно здесь чинятся рассогласованные заголовки.
 VIDEO_ARGS = [
@@ -58,6 +63,69 @@ AUDIO_COPY = ["-vn", "-c:a", "copy", "-f", "ogg"]
 AUDIO_OPUS = ["-vn", "-c:a", "libopus", "-b:a", "64k", "-f", "ogg"]
 # Из анимированного webp берем первый кадр: смысла в нем ровно на одну картинку.
 IMAGE_ARGS = ["-frames:v", "1"]
+
+
+def video_duration(path: str) -> float | None:
+    """Читает длительность дорожки и контейнера, сохраняя более длинное значение."""
+    try:
+        done = subprocess.run(
+            [FFPROBE, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=duration:format=duration", "-of", "json", path],
+            capture_output=True, timeout=CONVERSION_TIMEOUT, check=False,
+        )
+        if done.returncode:
+            return None
+        data = json.loads(done.stdout)
+        stream = next(iter(data.get("streams", [])), {})
+        durations = []
+        for value in (stream.get("duration"), data.get("format", {}).get("duration")):
+            if value in (None, "N/A"):
+                continue
+            duration = float(value)
+            if math.isfinite(duration) and duration > 0:
+                durations.append(duration)
+        # Не обрезаем длинную аудиодорожку у файла с короткой видеодорожкой.
+        return max(durations) if durations else None
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return None
+
+
+def video_attempts(path: str) -> list[list[str]]:
+    """Короткие видео дополняет последним кадром до двух секунд."""
+    duration = video_duration(path)
+    args = list(VIDEO_ARGS)
+    if duration is not None and duration < MIN_VIDEO_DURATION:
+        args[args.index("-vf") + 1] += (
+            f",tpad=stop_mode=clone:stop_duration={MIN_VIDEO_DURATION}"
+        )
+        args.extend(["-t", str(MIN_VIDEO_DURATION)])
+        logger.info("Продлеваем короткое видео %s: %.3fs -> %.1fs",
+                    path, duration, MIN_VIDEO_DURATION)
+    return [args]
+
+
+def prepare_history_video(path: str) -> str:
+    """Готовит отдельную копию короткого видео из уже сохраненной истории."""
+    if shutil.which(FFMPEG) is None:
+        return path
+    target = f"{os.path.splitext(path)[0]}.gemini-min2.mp4"
+    if (os.path.exists(target)
+            and os.path.getmtime(target) >= os.path.getmtime(path)):
+        return target
+    duration = video_duration(path)
+    if duration is None or duration >= MIN_VIDEO_DURATION:
+        return path
+    staging = f"{target}.converting.mp4"
+    if not run_ffmpeg(path, staging, video_attempts(path)[0]):
+        remove_quietly(staging)
+        return path
+    try:
+        os.replace(staging, target)
+    except OSError:
+        remove_quietly(staging)
+        return path
+    logger.info("Короткое видео истории подготовлено: %s -> %s", path, target)
+    return target
 
 
 def audio_codec(path: str) -> str | None:
@@ -101,8 +169,8 @@ def audio_attempts(path: str) -> list[list[str]]:
 # Во что переводить каждый тип. Ключ - начало mime, значение - (расширение, mime,
 # способы). Способы задаются списком или функцией от пути, если выбор зависит от файла.
 CONVERSIONS = {
-    "video/": ("mp4", "video/mp4", [VIDEO_ARGS]),
-    "image/gif": ("mp4", "video/mp4", [VIDEO_ARGS]),
+    "video/": ("mp4", "video/mp4", video_attempts),
+    "image/gif": ("mp4", "video/mp4", video_attempts),
     "audio/": ("ogg", "audio/ogg", audio_attempts),
     "image/webp": ("png", "image/png", [IMAGE_ARGS]),
     "image/heic": ("png", "image/png", [IMAGE_ARGS]),

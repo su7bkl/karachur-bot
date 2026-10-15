@@ -29,7 +29,7 @@ from karachur.gemini import files
 # Модуль зовется key_pool, а не pool: имя pool по всему коду занято самим пулом чата
 # (аргументы обработчиков, поле сессии), и модуль под тем же именем ими бы перекрывался.
 from karachur.gemini import pool as key_pool
-from karachur.media import paths, policy
+from karachur.media import ffmpeg, paths, policy
 from karachur.text import notes
 
 logger = logging.getLogger(__name__)
@@ -78,6 +78,8 @@ def _build_media_part(
     :return: часть запроса - ссылка на файл или текстовая пометка
     :rtype: genai.types.Part
     """
+    if mime_type.startswith("video/"):
+        media_path = ffmpeg.prepare_history_video(media_path)
     file_size = os.path.getsize(media_path)
     if file_size >= MAX_UPLOAD_SIZE:
         logger.warning(

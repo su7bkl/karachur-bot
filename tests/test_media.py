@@ -106,6 +106,46 @@ def make_video(path, args):
 
 
 @needs_ffmpeg
+def test_five_frame_video_is_extended_on_download(tmp_path):
+    """Регрессия стикера 72159: пять кадров должны стать двумя секундами."""
+    source = tmp_path / "short.mp4"
+    make_video(source, ["-f", "lavfi", "-i",
+                        "testsrc=duration=0.166667:size=64x64:rate=30",
+                        "-frames:v", "5", "-c:v", "libx264"])
+    assert ffmpeg.video_duration(str(source)) < 0.2
+    path, mime = media.normalize(str(source), "video/mp4")
+    assert mime == "video/mp4"
+    assert ffmpeg.video_duration(path) == pytest.approx(2, abs=0.05)
+
+
+@needs_ffmpeg
+def test_old_short_video_gets_reusable_copy(tmp_path):
+    """История чинится без изменения исходника и повторного перекодирования."""
+    source = tmp_path / "old.mp4"
+    make_video(source, ["-f", "lavfi", "-i",
+                        "testsrc=duration=0.166667:size=64x64:rate=30",
+                        "-frames:v", "5", "-c:v", "libx264"])
+    original = source.read_bytes()
+    path = ffmpeg.prepare_history_video(str(source))
+    assert path != str(source)
+    assert source.read_bytes() == original
+    assert ffmpeg.video_duration(path) == pytest.approx(2, abs=0.05)
+    modified = os.stat(path).st_mtime_ns
+    assert ffmpeg.prepare_history_video(str(source)) == path
+    assert os.stat(path).st_mtime_ns == modified
+
+
+def test_history_video_conversion_failure_preserves_source(tmp_path, monkeypatch):
+    source = tmp_path / "old.mp4"
+    source.write_bytes(b"original")
+    monkeypatch.setattr(ffmpeg.shutil, "which", lambda _: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(ffmpeg, "video_duration", lambda _: 0.167)
+    monkeypatch.setattr(ffmpeg, "run_ffmpeg", lambda *args: False)
+    assert ffmpeg.prepare_history_video(str(source)) == str(source)
+    assert source.read_bytes() == b"original"
+
+
+@needs_ffmpeg
 def test_video_becomes_mp4(tmp_path):
     """Видео перекодируется в mp4, исходник убирается."""
     source = tmp_path / "стикер.webm"
