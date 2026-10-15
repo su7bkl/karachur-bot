@@ -13,7 +13,9 @@ original_name при этом не уникально: два разных до�
 report.pdf, а download_media_file существующий файл повторно не качает - поэтому к
 читаемому имени подмешивается file_id (report.<file_id>.pdf), который как раз уникален.
 Все остальные случаи - имени нет или оно не ascii - собирают имя из file_id и расширения,
-выведенного по mime: file_id уникален сам по себе, и гадать с ним не о чем.
+выведенного по mime. Для новых файлов к file_id добавляется ID чата: совпавшие вложения
+разных чатов сохраняются отдельно. Без chat_id функция возвращает прежнее имя для
+чтения старой истории; сами старые файлы не переименовываются.
 
 Дальше файл уходит в karachur.media.normalize, которая может его перекодировать и тем
 самым сменить и расширение, и путь. Поэтому итоговый путь пишется в базу
@@ -25,6 +27,7 @@ report.pdf, а download_media_file существующий файл повто�
 import logging
 import os
 
+from telegram.error import TelegramError
 from telegram.ext import Application
 
 logger = logging.getLogger(__name__)
@@ -63,7 +66,8 @@ def get_extension_from_mime(mime: str | None) -> str:
 
 
 def get_media_path(
-    media_dir: str, file_id: str, mime_type: str | None, original_name: str | None
+    media_dir: str, file_id: str, mime_type: str | None, original_name: str | None,
+    *, chat_id: int | None = None,
 ) -> str | None:
     """
     Формирует путь к файлу для сохранения медиа.
@@ -76,9 +80,14 @@ def get_media_path(
     :type mime_type: str | None
     :param original_name: оригинальное имя файла
     :type original_name: str | None
+    :param chat_id: для новых файлов добавляется к имени; None сохраняет старую схему
+        имен для чтения истории без media_path
+    :type chat_id: int | None
     :return: путь к файлу или None, если файл не может быть сохранен
     :rtype: str | None
     """
+    if chat_id is not None and file_id:
+        file_id = f"{chat_id}_{file_id}"
     if original_name and original_name.isascii():
         safe_name = "".join(
             c for c in original_name if c.isalnum() or c in (" ", ".", "_", "-")
@@ -124,5 +133,5 @@ async def download_media_file(application: Application, file_id: str, file_path:
         tg_file = await application.bot.get_file(file_id)
         await tg_file.download_to_drive(file_path)
         logger.info("Файл успешно загружен: %s", file_path)  # lazy logging
-    except (OSError, IOError) as e:
+    except (OSError, TelegramError) as e:
         logger.error("Ошибка загрузки файла %s: %s", file_id, e)  # lazy logging

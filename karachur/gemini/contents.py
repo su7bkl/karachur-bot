@@ -189,6 +189,7 @@ def build_message_parts(
         else:
             logger.warning("Gemini attachment missing message_id=%s path=%s mime=%s",
                            msg.get("message_id"), media_path, msg["mime_type"])
+            parts.append(genai.types.Part(text="[Вложение недоступно: файл не загружен]"))
     return parts
 
 

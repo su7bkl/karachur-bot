@@ -16,7 +16,10 @@
 """
 
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
@@ -243,3 +246,56 @@ def test_expired_upload_is_replaced_before_the_request(gemini, tmp_path):
     assert gemini.file_uploads == [str(photo)]
     assert parts[1].file_data.file_uri != stale.file.uri
     assert parts[1].file_data.file_uri == "https://files.example/files/новая"
+
+
+def test_two_chats_can_recheck_the_same_legacy_file(gemini, uploads_cache):
+    """Параллельные отказы API удаляют общую старую запись без KeyError."""
+    remember(gemini, expires_in=CLOSE)
+    barrier = threading.Barrier(2, timeout=3)
+    checked = []
+
+    def get(name):
+        barrier.wait()
+        checked.append(name)
+        raise OSError("remote file is gone")
+
+    client = SimpleNamespace(files=SimpleNamespace(get=get))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(files.check_file_validity, client, KEY_ONE, MEDIA_PATH)
+                   for _ in range(2)]
+        for future in futures:
+            future.result(timeout=5)
+
+    assert len(checked) == 2  # Сетевые проверки действительно шли параллельно.
+    assert not uploads_cache
+
+
+@pytest.mark.parametrize("old_file_exists", [False, True])
+def test_late_check_does_not_remove_or_overwrite_a_new_upload(
+    gemini, uploads_cache, old_file_exists
+):
+    """Поздний результат проверки старой выгрузки не меняет уже заменившую ее новую."""
+    old = remember(gemini, expires_in=CLOSE)
+    fresh = FakeFile(name="files/new")
+    checking = threading.Event()
+    finish_check = threading.Event()
+
+    def get(_name=None, **_kwargs):
+        checking.set()
+        if not finish_check.wait(timeout=3):
+            raise TimeoutError("test did not release the check")
+        if old_file_exists:
+            return old.file
+        raise OSError("old remote file is gone")
+
+    client = SimpleNamespace(files=SimpleNamespace(get=get, upload=lambda **_kwargs: fresh))
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(files.check_file_validity, client, KEY_ONE, MEDIA_PATH)
+        try:
+            assert checking.wait(timeout=3)
+            files.upload_file(client, KEY_ONE, MEDIA_PATH)
+        finally:
+            finish_check.set()
+        future.result(timeout=5)
+
+    assert uploads_cache[(KEY_ONE, MEDIA_PATH)].file is fresh

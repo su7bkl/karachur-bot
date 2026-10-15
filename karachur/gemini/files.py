@@ -39,6 +39,7 @@ karachur.gemini.errors, но сама причина - несвежий кэш -
 import dataclasses
 import datetime
 import logging
+import threading
 import time
 
 from google import genai
@@ -103,6 +104,9 @@ class Upload:
 # принадлежит проекту того ключа, которым ее делали, и после ротации ссылка на нее
 # становится чужой. Поэтому для каждого ключа файл выгружается заново.
 uploaded_files: dict[tuple[str, str], Upload] = {}
+# Сборка истории разных чатов идет в потоках. Замок защищает только кэш;
+# сетевые вызовы остаются снаружи. Старые файлы еще могут быть общими для чатов.
+_CACHE_LOCK = threading.Lock()
 
 
 def _expires_at(uploaded_file) -> float:
@@ -136,8 +140,9 @@ def cached_file(api_key: str, media_path: str):
     :type media_path: str
     :return: объект File из google-genai или None, если файл надо выгружать
     """
-    entry = uploaded_files.get((api_key, media_path))
-    return entry.file if entry else None
+    with _CACHE_LOCK:
+        entry = uploaded_files.get((api_key, media_path))
+        return entry.file if entry else None
 
 
 def forget_expired() -> int:
@@ -152,9 +157,10 @@ def forget_expired() -> int:
     :rtype: int
     """
     now = time.time()
-    dead = [key for key, entry in uploaded_files.items() if entry.is_dead(now)]
-    for key in dead:
-        del uploaded_files[key]
+    with _CACHE_LOCK:
+        dead = [key for key, entry in uploaded_files.items() if entry.is_dead(now)]
+        for key in dead:
+            del uploaded_files[key]
     if dead:
         logger.info("Из кэша выгрузок убрано %d записей с истекшим сроком.", len(dead))
     return len(dead)
@@ -179,10 +185,11 @@ def recheck_uploads(api_key: str | None = None) -> int:
     :rtype: int
     """
     marked = 0
-    for (key, _), entry in uploaded_files.items():
-        if api_key is None or key == api_key:
-            entry.suspect = True
-            marked += 1
+    with _CACHE_LOCK:
+        for (key, _), entry in uploaded_files.items():
+            if api_key is None or key == api_key:
+                entry.suspect = True
+                marked += 1
     logger.info("Кэш выгрузок помечен на перепроверку: %d записей.", marked)
     return marked
 
@@ -204,11 +211,13 @@ def check_file_validity(client: genai.Client, api_key: str, media_path: str):
     forget_expired()
 
     cache_key = (api_key, media_path)
-    entry = uploaded_files.get(cache_key)
-    if entry is None or not entry.needs_check(time.time()):
-        # Записи нет вовсе (выгрузит upload_file) либо ей еще верим.
-        return
+    with _CACHE_LOCK:
+        entry = uploaded_files.get(cache_key)
+        if entry is None or not entry.needs_check(time.time()):
+            # Записи нет вовсе (выгрузит upload_file) либо ей еще верим.
+            return
 
+    replacement = None
     try:
         remote_file = client.files.get(name=entry.file.name)
         state = getattr(remote_file.state, "name", None)
@@ -219,22 +228,23 @@ def check_file_validity(client: genai.Client, api_key: str, media_path: str):
         logger.warning(
             "Не удалось проверить статус файла %s, перевыгружаем: %s", media_path, e
         )
-        del uploaded_files[cache_key]
-        return
+    else:
+        if state == "ACTIVE":
+            replacement = Upload(file=remote_file, expires_at=_expires_at(remote_file))
+            if replacement.is_dead(time.time()):
+                logger.info("Срок файла %s на исходе, перевыгружаем заранее", media_path)
+                replacement = None
+        else:
+            logger.info("Файл %s в состоянии %s, требуется перевыгрузка", media_path, state)
 
-    if state != "ACTIVE":
-        logger.info("Файл %s в состоянии %s, требуется перевыгрузка", media_path, state)
-        del uploaded_files[cache_key]
-        return
-
-    # Ответ API свежее нашей записи: берем из него и сам объект, и срок.
-    entry.file = remote_file
-    entry.expires_at = _expires_at(remote_file)
-    entry.suspect = False
-    if entry.is_dead(time.time()):
-        # Файл пока жив, но умрет раньше, чем им успеют воспользоваться.
-        logger.info("Срок файла %s на исходе, перевыгружаем заранее", media_path)
-        del uploaded_files[cache_key]
+    with _CACHE_LOCK:
+        # Пока ждали API, другой чат мог удалить запись или выгрузить файл заново.
+        # Результат проверки старой выгрузки не должен менять новую.
+        if uploaded_files.get(cache_key) is entry:
+            if replacement is None:
+                del uploaded_files[cache_key]
+            else:
+                uploaded_files[cache_key] = replacement
 
 
 def upload_file(client: genai.Client, api_key: str, media_path):
@@ -256,9 +266,11 @@ def upload_file(client: genai.Client, api_key: str, media_path):
         uploaded_file = client.files.get(name=uploaded_file.name)
 
     if uploaded_file.state.name == "ACTIVE":
-        uploaded_files[(api_key, media_path)] = Upload(
+        entry = Upload(
             file=uploaded_file, expires_at=_expires_at(uploaded_file)
         )
+        with _CACHE_LOCK:
+            uploaded_files[(api_key, media_path)] = entry
     else:
         logger.error(
             "Файл %s после загрузки перешел в состояние %s",

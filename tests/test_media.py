@@ -15,6 +15,7 @@ import asyncio
 import os
 import shutil
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +25,7 @@ from karachur.gemini import contents, files
 from karachur.media import ffmpeg, paths
 from karachur.storage import messages
 from karachur.tg import handlers
+from conftest import CHAT_ONE, CHAT_TWO, KEY_ONE
 
 FFMPEG_MISSING = shutil.which("ffmpeg") is None
 needs_ffmpeg = pytest.mark.skipif(FFMPEG_MISSING, reason="в системе нет ffmpeg")
@@ -417,3 +419,39 @@ def test_get_media_path_non_ascii_name_uses_file_id_branch():
     path = paths.get_media_path("/media", "FILE1", "application/pdf", "отчет.pdf")
 
     assert path == os.path.join("/media", "FILE1.pdf")
+
+
+@pytest.mark.parametrize("name", [None, "report.pdf", "отчет.pdf"])
+def test_new_media_paths_include_chat_id(name):
+    """Общий file_id получает разные имена в разных чатах, включая документы."""
+    first = paths.get_media_path("/media", "FILE", "application/pdf", name, chat_id=CHAT_ONE)
+    second = paths.get_media_path("/media", "FILE", "application/pdf", name, chat_id=CHAT_TWO)
+    legacy = paths.get_media_path("/media", "FILE", "application/pdf", name)
+    assert len({first, second, legacy}) == 3
+    assert str(CHAT_ONE) in os.path.basename(first)
+    assert str(CHAT_TWO) in os.path.basename(second)
+    assert first.endswith(".pdf")
+
+
+@pytest.mark.parametrize("has_stored_path", [False, True])
+def test_old_media_is_read_without_renaming(tmp_path, gemini, has_stored_path):
+    """Старый путь из БД и старое вычисляемое имя работают рядом с новыми файлами."""
+    legacy = tmp_path / ("converted.png" if has_stored_path else "FILE.png")
+    legacy.write_bytes(b"legacy")
+    new_path = Path(paths.get_media_path(
+        str(tmp_path), "FILE", "image/png", None, chat_id=CHAT_ONE
+    ))
+    new_path.write_bytes(b"new")
+    message = {
+        "chat_id": CHAT_ONE, "file_id": "FILE", "mime_type": "image/png",
+        "media_path": str(legacy) if has_stored_path else None,
+    }
+
+    parts = contents.build_message_parts(
+        gemini.client_for_key(KEY_ONE), KEY_ONE, message, str(tmp_path)
+    )
+
+    assert any(part.file_data for part in parts)
+    assert gemini.file_uploads == [str(legacy)]
+    assert legacy.read_bytes() == b"legacy"
+    assert new_path.read_bytes() == b"new"

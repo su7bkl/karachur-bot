@@ -6,16 +6,15 @@ karachur.gemini, перекодирование вложений в karachur.med
 delivery. Сам модуль не решает ни одной из этих задач, он только выстраивает их в
 порядок и определяет, кому сейчас отвечать.
 
-Порядок этот не произволен, и два его свойства держатся здесь намеренно.
+Порядок этот не произволен, и его свойства держатся здесь намеренно.
 
 Первое: сообщение попадает в базу ДО очереди за замком чата. Ждать своей очереди запрос
 может минутами (повторы, смена ключей), и если бы запись шла после, история отставала бы
 от чата ровно на это время - а следующий ответ собирался бы по неполной картине.
 
-Второе: замок свой на каждый чат, а не один на бота. Внутри чата ответы обязаны идти по
-очереди, иначе две реплики соберут контекст до того, как в него ляжет ответ на первую. А
-вот разным чатам ждать друг друга незачем: один долгий запрос не должен превращаться в
-очередь для всех остальных.
+Второе: замок свой на каждый чат, а не один на бота. Под ним готовятся вложения и
+отправляются ответы: вопрос о только что присланном файле должен дождаться его
+скачивания и конвертации. Разные чаты работают параллельно.
 
 Третье: вложение, которое karachur.media.policy отвергает уже по mime и имени, сюда не
 скачивается вовсе. Сообщение при этом сохраняется как обычно - пропадает только файл,
@@ -209,34 +208,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_id, mime_type, file_name = messages.save_message_to_db(
         db_conn, message, is_bot=False
     )
-    if file_id:
-        # Само сообщение в базе уже есть - пропустить можно только скачивание. Если
-        # политика форматов отвергает вложение (архив, установщик, двоичный мусор),
-        # качать его незачем: до модели оно все равно не доедет, а место на диске и
-        # время на перекодирование займет. Решение тут принимается по одним mime и
-        # имени - содержимого, по которому политика умеет разбираться дальше, до
-        # скачивания просто нет, и ответ "не знаю" (None) означает "качай".
-        if policy.decide_without_content(mime_type, file_name) is policy.Action.SKIP:
-            logger.info(
-                "Вложение %s (%s) модели не годится - не скачиваем.",
-                file_name or file_id,
-                mime_type,
-            )
-        else:
-            file_path = paths.get_media_path(
-                cfg.media_dir, file_id, mime_type, file_name
-            )
-            if file_path:
-                await paths.download_media_file(context.application, file_id, file_path)
-                await normalize_media(db_conn, message, file_path, mime_type)
-
-    if not (triggered_by_text or message.voice):
+    if not (file_id or triggered_by_text or message.voice):
         return
 
-    # Внутри чата ответы идут по очереди, а разные чаты друг друга не ждут: запрос к
-    # модели с повторами растягивается на минуты, и одному чату незачем держать все
-    # остальные. Сообщения при этом сохраняются сразу, до очереди, - история не отстает.
+    # Берем замок до первого await подготовки файла: следующий вопрос в этом чате
+    # должен увидеть уже готовое вложение. Обычный текст выше только сохраняется.
     async with chat_lock(context, message.chat_id):
-        await answer_chat(
-            cfg, context, message, bool(message.voice) and not triggered_by_text
-        )
+        if file_id:
+            if policy.decide_without_content(mime_type, file_name) is policy.Action.SKIP:
+                logger.info(
+                    "Вложение %s (%s) модели не годится - не скачиваем.",
+                    file_name or file_id,
+                    mime_type,
+                )
+            else:
+                file_path = paths.get_media_path(
+                    cfg.media_dir, file_id, mime_type, file_name, chat_id=message.chat_id
+                )
+                if file_path:
+                    # Даже при неудаче скачивания это новый путь. Оставив NULL, мы
+                    # разрешили бы сборке контекста подхватить старый общий файл.
+                    messages.set_media_path(
+                        db_conn, message.chat_id, message.message_id, file_path, mime_type
+                    )
+                    await paths.download_media_file(context.application, file_id, file_path)
+                    await normalize_media(db_conn, message, file_path, mime_type)
+
+        if triggered_by_text or message.voice:
+            await answer_chat(
+                cfg, context, message, bool(message.voice) and not triggered_by_text
+            )
