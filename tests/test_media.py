@@ -126,23 +126,63 @@ def test_old_short_video_gets_reusable_copy(tmp_path):
                         "testsrc=duration=0.166667:size=64x64:rate=30",
                         "-frames:v", "5", "-c:v", "libx264"])
     original = source.read_bytes()
-    path = ffmpeg.prepare_history_video(str(source))
+    path = ffmpeg.ensure_video_duration(str(source))
     assert path != str(source)
     assert source.read_bytes() == original
     assert ffmpeg.video_duration(path) == pytest.approx(2, abs=0.05)
     modified = os.stat(path).st_mtime_ns
-    assert ffmpeg.prepare_history_video(str(source)) == path
+    assert ffmpeg.ensure_video_duration(str(source)) == path
     assert os.stat(path).st_mtime_ns == modified
 
 
 def test_history_video_conversion_failure_preserves_source(tmp_path, monkeypatch):
+    """При ошибке ffmpeg история продолжает ссылаться на целый исходник."""
     source = tmp_path / "old.mp4"
     source.write_bytes(b"original")
     monkeypatch.setattr(ffmpeg.shutil, "which", lambda _: "/usr/bin/ffmpeg")
     monkeypatch.setattr(ffmpeg, "video_duration", lambda _: 0.167)
     monkeypatch.setattr(ffmpeg, "run_ffmpeg", lambda *args: False)
-    assert ffmpeg.prepare_history_video(str(source)) == str(source)
+    assert ffmpeg.ensure_video_duration(str(source)) == str(source)
     assert source.read_bytes() == b"original"
+
+
+def test_conversion_publish_failure_cleans_temporary_file(tmp_path, monkeypatch):
+    """Сбой замены файла не повреждает исходник и не оставляет временную копию."""
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"original")
+    monkeypatch.setattr(ffmpeg.shutil, "which", lambda _: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(ffmpeg, "video_duration", lambda _: 0.167)
+
+    def converted(_source, target, _args):
+        """Изображает успешно записанный результат ffmpeg."""
+        with open(target, "wb") as output:
+            output.write(b"converted")
+        return True
+
+    def cannot_replace(*_args):
+        """Изображает ошибку публикации результата."""
+        raise OSError("disk error")
+
+    monkeypatch.setattr(ffmpeg, "run_ffmpeg", converted)
+    monkeypatch.setattr(ffmpeg.os, "replace", cannot_replace)
+    assert ffmpeg.ensure_video_duration(str(source)) == str(source)
+    assert source.read_bytes() == b"original"
+    assert list(tmp_path.iterdir()) == [source]
+
+
+def test_long_history_video_is_not_reencoded(tmp_path, monkeypatch):
+    """Старые длинные ролики проходят проверку без перекодирования."""
+    source = tmp_path / "long.mp4"
+    source.write_bytes(b"original")
+    monkeypatch.setattr(ffmpeg.shutil, "which", lambda _: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(ffmpeg, "video_duration", lambda _: 10.0)
+
+    def unexpected_conversion(*_args):
+        """Запрещает лишнюю работу ffmpeg."""
+        pytest.fail("Длинное видео не должно перекодироваться")
+
+    monkeypatch.setattr(ffmpeg, "run_ffmpeg", unexpected_conversion)
+    assert ffmpeg.ensure_video_duration(str(source)) == str(source)
 
 
 @needs_ffmpeg

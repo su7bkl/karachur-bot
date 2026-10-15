@@ -79,7 +79,7 @@ def _build_media_part(
     :rtype: genai.types.Part
     """
     if mime_type.startswith("video/"):
-        media_path = ffmpeg.prepare_history_video(media_path)
+        media_path = ffmpeg.ensure_video_duration(media_path)
     file_size = os.path.getsize(media_path)
     if file_size >= MAX_UPLOAD_SIZE:
         logger.warning(

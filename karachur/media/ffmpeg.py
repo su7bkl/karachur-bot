@@ -12,6 +12,13 @@
 пишет заново, уже с согласованными заголовками. Заодно приводим пестрый набор форматов к
 короткому списку тех, что Gemini принимает наверняка.
 
+Короткие видео дополняем последним кадром до двух секунд: валидный пятикадровый
+стикер длительностью 0,167 секунды Gemini отвергала тем же 400. Это защитная мера,
+проверенная на таком файле, а не документированный минимум API. Новые файлы проходят
+ее при encode, старые — при ensure_video_duration перед выгрузкой. Для старых файлов
+сохраняем отдельную копию, чтобы не менять исходник и не использовать его старую
+ссылку из кэша Files API.
+
 Что во что переводится:
     видео и gif  -> mp4  (H.264 + AAC)
     аудио и голос -> ogg/opus (голосовые - переливкой, без пересжатия)
@@ -30,6 +37,7 @@ import math
 import os
 import shutil
 import subprocess
+import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +58,6 @@ VIDEO_ARGS = [
     "-preset", "veryfast",
     "-crf", "28",
     "-pix_fmt", "yuv420p",
-    "-vf", EVEN_SIDES,
     "-c:a", "aac",
     "-b:a", "96k",
     "-movflags", "+faststart",
@@ -90,22 +97,29 @@ def video_duration(path: str) -> float | None:
         return None
 
 
-def video_attempts(path: str) -> list[list[str]]:
-    """Короткие видео дополняет последним кадром до двух секунд."""
-    duration = video_duration(path)
-    args = list(VIDEO_ARGS)
+def _video_args(duration: float | None) -> list[str]:
+    """Общие параметры видео для скачанных файлов и старой истории."""
+    filters = [EVEN_SIDES]
+    duration_args = []
     if duration is not None and duration < MIN_VIDEO_DURATION:
-        args[args.index("-vf") + 1] += (
-            f",tpad=stop_mode=clone:stop_duration={MIN_VIDEO_DURATION}"
+        filters.append(
+            f"tpad=stop_mode=clone:stop_duration={MIN_VIDEO_DURATION}"
         )
-        args.extend(["-t", str(MIN_VIDEO_DURATION)])
+        duration_args = ["-t", str(MIN_VIDEO_DURATION)]
+    return [*VIDEO_ARGS, "-vf", ",".join(filters), *duration_args]
+
+
+def video_attempts(path: str) -> list[list[str]]:
+    """Подбирает параметры видео, продлевая короткие клипы последним кадром."""
+    duration = video_duration(path)
+    if duration is not None and duration < MIN_VIDEO_DURATION:
         logger.info("Продлеваем короткое видео %s: %.3fs -> %.1fs",
                     path, duration, MIN_VIDEO_DURATION)
-    return [args]
+    return [_video_args(duration)]
 
 
-def prepare_history_video(path: str) -> str:
-    """Готовит отдельную копию короткого видео из уже сохраненной истории."""
+def ensure_video_duration(path: str) -> str:
+    """Возвращает пригодную по длительности копию старого видео либо исходник."""
     if shutil.which(FFMPEG) is None:
         return path
     target = f"{os.path.splitext(path)[0]}.gemini-min2.mp4"
@@ -115,14 +129,7 @@ def prepare_history_video(path: str) -> str:
     duration = video_duration(path)
     if duration is None or duration >= MIN_VIDEO_DURATION:
         return path
-    staging = f"{target}.converting.mp4"
-    if not run_ffmpeg(path, staging, video_attempts(path)[0]):
-        remove_quietly(staging)
-        return path
-    try:
-        os.replace(staging, target)
-    except OSError:
-        remove_quietly(staging)
+    if not _convert(path, target, [_video_args(duration)]):
         return path
     logger.info("Короткое видео истории подготовлено: %s -> %s", path, target)
     return target
@@ -262,19 +269,7 @@ def encode(path: str, mime_type: str | None) -> tuple[str, str | None]:
 
     base = os.path.splitext(path)[0]
     target = f"{base}.{extension}"
-    # Пишем во временный файл: исходник еще понадобится, если ffmpeg не справится, а
-    # цель может совпадать с ним по имени (mp4 в mp4 мы тоже пересобираем).
-    staging = f"{base}.converting.{extension}"
-
-    if not any(run_ffmpeg(path, staging, args) for args in attempts):
-        remove_quietly(staging)
-        return path, mime_type
-
-    try:
-        os.replace(staging, target)
-    except OSError as e:
-        logger.warning("Не удалось положить перекодированный файл %s: %s", target, e)
-        remove_quietly(staging)
+    if not _convert(path, target, attempts):
         return path, mime_type
 
     if target != path:
@@ -283,6 +278,29 @@ def encode(path: str, mime_type: str | None) -> tuple[str, str | None]:
 
     logger.info("Медиа перекодировано: %s (%s) -> %s (%s)", path, mime_type, target, new_mime)
     return target, new_mime
+
+
+def _convert(source: str, target: str, attempts: list[list[str]]) -> bool:
+    """Публикует результат только после успешного ffmpeg, сохраняя исходник при сбое."""
+    staging = None
+    try:
+        # У параллельных чатов могут быть общие вложения. Каждый вызов пишет в свой
+        # временный файл рядом с целью, чтобы os.replace оставался атомарным.
+        with tempfile.NamedTemporaryFile(
+            prefix=".converting.", suffix=os.path.splitext(target)[1],
+            dir=os.path.dirname(os.path.abspath(target)), delete=False,
+        ) as temporary:
+            staging = temporary.name
+        if not any(run_ffmpeg(source, staging, args) for args in attempts):
+            return False
+        os.replace(staging, target)
+        return True
+    except OSError as exc:
+        logger.warning("Не удалось сохранить перекодированный файл %s: %s", target, exc)
+        return False
+    finally:
+        if staging is not None:
+            remove_quietly(staging)
 
 
 def remove_quietly(path: str):
